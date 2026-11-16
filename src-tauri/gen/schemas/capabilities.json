@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Capability for Buddy Dynamic Island and Snip overlay windows","local":true,"windows":["main","snip"],"permissions":["core:default","core:event:default","core:window:allow-set-focus","updater:default"]}}

@@ -1,0 +1,45 @@
+# Dependencies & Build Outputs
+node_modules/
+dist/
+dist-ssr/
+*.local
+src-tauri/target/
+
+# Compiled Binaries & Installer Artifacts (publish via GitHub Releases instead)
+Buddy.exe
+*.exe
+*.dll
+*.msi
+*.nsis
+*.zip
+*.tar.gz
+*.AppImage
+*.dmg
+*.sig
+
+# Secrets, Keys, Config & Local Databases
+.env
+.env.*
+*.key
+*.key.pub
+*.pem
+*.p12
+*.pfx
+*.dpapi
+secret.dpapi
+config.json
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Logs & OS Files
+logs/
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/
