@@ -35,6 +35,81 @@ export interface UpdateInfo {
   date: string | null;
 }
 
+export interface PluginInfo {
+  id: string;
+  kind: "native" | "engine" | string;
+  name_en: string;
+  name_zh: string;
+  desc_en: string;
+  desc_zh: string;
+  enabled: boolean;
+  installed: boolean;
+  version: string;
+  size_bytes: number;
+  sha256: string | null;
+  engine_hint: string | null;
+}
+
+export interface PluginListResponse {
+  plugins: PluginInfo[];
+  mirror_prefix: string;
+  total_size_bytes: number;
+}
+
+export interface PluginProgressPayload {
+  plugin_id: string;
+  stage: string;
+  percent: number;
+  detail: string;
+}
+
+export interface OcrResult {
+  text: string;
+  line_count: number;
+  language: string;
+}
+
+export interface ClipboardParseItem {
+  kind: string;
+  label: string;
+  value: string;
+}
+
+export interface ClipboardParseResult {
+  raw_length: number;
+  items: ClipboardParseItem[];
+  cleaned_text: string;
+}
+
+export interface LockProcessInfo {
+  pid: number;
+  app_name: string;
+  service_name: string;
+  app_type: string;
+  restartable: boolean;
+}
+
+export interface ColorPickedPayload {
+  hex: string;
+  rgb: string;
+  hsl: string;
+  r: number;
+  g: number;
+  b: number;
+}
+
+export interface TimerTickPayload {
+  active: boolean;
+  remaining_sec: number;
+  total_sec: number;
+  label: string;
+}
+
+export interface PluginToolOutput {
+  outputs: string[];
+  summary: string;
+}
+
 export interface MemoryItem {
   id: number;
   kind: "screenshot" | "clipboard_text" | "clipboard_image" | string;
@@ -126,4 +201,31 @@ export interface AppSettings {
   dock_cx?: number | null;
   dock_cy?: number | null;
   update_endpoint?: string;
+}
+
+export interface SkillInfo {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  source: string;
+  dir_path: string;
+  has_scripts: boolean;
+  file_count: number;
+  installed_at: number;
+}
+
+export interface SkillDetail {
+  info: SkillInfo;
+  skill_md: string;
+  files: string[];
+}
+
+export interface GithubSkillCandidate {
+  title: string;
+  description: string;
+  install_spec: string;
+  html_url: string;
+  stars: number;
+  is_repo: boolean;
 }

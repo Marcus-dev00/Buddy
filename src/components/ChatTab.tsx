@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import Markdown from "react-markdown";
+import { invoke } from "@tauri-apps/api/core";
 import {
   Bot,
   Brain,
@@ -8,14 +9,20 @@ import {
   ChevronDown,
   ChevronRight,
   FileText,
+  Film,
   Folder,
   History,
+  ImageDown,
   Loader2,
+  Lock,
   MessageSquare,
   Paperclip,
+  Pin,
   Plus,
+  ScanText,
   Search,
   ShieldAlert,
+  Sparkles,
   Square,
   Trash2,
   X,
@@ -29,6 +36,7 @@ import type {
   ChatMessage,
   ConversationSummary,
   MemoryItem,
+  SkillInfo,
   ThinkingLevel,
   UiLang,
 } from "../types";
@@ -58,6 +66,11 @@ interface ChatTabProps {
   onSelectConversation: (id: number) => void;
   onDeleteConversation: (id: number) => void;
   onOpenSettings: () => void;
+  enabledPlugins?: Record<string, boolean>;
+  installedPlugins?: Record<string, boolean>;
+  skills?: SkillInfo[];
+  onOpenPlugin?: (pluginId: string, paths?: string[]) => void;
+  onQuickOcr?: (source: string) => void;
 }
 
 export function memoryToAttachment(m: MemoryItem): AttachmentPayload {
@@ -382,14 +395,56 @@ export default function ChatTab({
   onSelectConversation,
   onDeleteConversation,
   onOpenSettings,
+  enabledPlugins = {},
+  installedPlugins = {},
+  skills = [],
+  onOpenPlugin,
+  onQuickOcr,
 }: ChatTabProps) {
   const [showHistory, setShowHistory] = useState(false);
   const [historySearch, setHistorySearch] = useState("");
   const [activeUserIdx, setActiveUserIdx] = useState(0);
+  const [slashDismissed, setSlashDismissed] = useState(false);
+  const [slashSelIdx, setSlashSelIdx] = useState(0);
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const scrollBoxRef = useRef<HTMLDivElement | null>(null);
   const msgRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const s = getStrings(lang).chat;
+  const sp = getStrings(lang).plugins;
+
+  const enabledSkills = skills.filter((sk) => sk.enabled);
+  const slashMatch = !slashDismissed ? chatInput.match(/^\/([^\s]*)$/) : null;
+  const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : "";
+  const slashMenuOpen = Boolean(slashMatch);
+  const slashMatches = slashMenuOpen
+    ? enabledSkills.filter(
+        (sk) =>
+          !slashQuery ||
+          sk.id.toLowerCase().includes(slashQuery) ||
+          sk.name.toLowerCase().includes(slashQuery) ||
+          sk.description.toLowerCase().includes(slashQuery)
+      )
+    : [];
+
+  // Detect any `/skill-id` explicitly typed in the draft
+  const activeSlashSkill = (() => {
+    for (const tok of chatInput.trim().split(/\s+/)) {
+      if (!tok.startsWith("/") || tok.length < 2) continue;
+      const q = tok.slice(1).toLowerCase();
+      const hit = enabledSkills.find(
+        (sk) => sk.id.toLowerCase() === q || sk.name.toLowerCase() === q
+      );
+      if (hit) return hit;
+    }
+    return null;
+  })();
+
+  const applySlashSkill = (sk: SkillInfo) => {
+    onChangeInput(`/${sk.id} `);
+    setSlashDismissed(true);
+    window.setTimeout(() => inputRef.current?.focus(), 0);
+  };
 
   const userMessages = messages.filter((m) => m.role === "user");
 
@@ -466,6 +521,25 @@ export default function ChatTab({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    const raw = chatInput.trim();
+    const m = /^\/timer\s+(.+)$/i.exec(raw);
+    if (m && enabledPlugins.keep_awake_timer !== false) {
+      const arg = m[1].trim().toLowerCase();
+      if (arg === "stop" || arg === "cancel" || arg === "off") {
+        void invoke("plugin_cancel_timer");
+        onChangeInput("");
+        return;
+      }
+      const numMatch = /^(\d+)\s*(s|sec|m|min|h|hr)?$/i.exec(arg);
+      if (numMatch) {
+        const val = Math.max(1, Number(numMatch[1]));
+        const unit = (numMatch[2] ?? "m").toLowerCase();
+        const seconds = unit.startsWith("s") ? val : unit.startsWith("h") ? val * 3600 : val * 60;
+        void invoke("plugin_start_timer", { seconds, label: arg });
+        onChangeInput("");
+        return;
+      }
+    }
     onSend();
   };
 
@@ -812,61 +886,309 @@ export default function ChatTab({
                     {action}
                   </button>
                 ))}
+                {(recentMemory.kind === "screenshot" || recentMemory.kind === "clipboard_image") &&
+                  recentMemory.file_path && (
+                    <>
+                      {enabledPlugins.offline_ocr !== false && onQuickOcr && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const fp = recentMemory.file_path!;
+                            onDismissRecent();
+                            onQuickOcr(fp);
+                          }}
+                          className="px-2 py-0.5 rounded-full bg-sky-500/20 hover:bg-sky-500/35 text-[10.5px] text-sky-200 flex items-center gap-1 transition"
+                        >
+                          <ScanText className="w-2.5 h-2.5" />
+                          <span>{sp.ocrAction}</span>
+                        </button>
+                      )}
+                      {enabledPlugins.pin_to_screen !== false && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const fp = recentMemory.file_path!;
+                            onDismissRecent();
+                            void invoke("plugin_pin_image", { source: fp }).catch(() => {});
+                          }}
+                          className="px-2 py-0.5 rounded-full bg-amber-500/20 hover:bg-amber-500/35 text-[10.5px] text-amber-200 flex items-center gap-1 transition"
+                        >
+                          <Pin className="w-2.5 h-2.5" />
+                          <span>{sp.pinAction}</span>
+                        </button>
+                      )}
+                    </>
+                  )}
+                {recentMemory.kind === "clipboard_text" &&
+                  recentMemory.content_text &&
+                  enabledPlugins.clipboard_parser !== false && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void invoke("plugin_clean_paste", {
+                          text: recentMemory.content_text,
+                        }).catch(() => {});
+                        onDismissRecent();
+                      }}
+                      className="px-2 py-0.5 rounded-full bg-emerald-500/20 hover:bg-emerald-500/35 text-[10.5px] text-emerald-200 flex items-center gap-1 transition"
+                    >
+                      <Sparkles className="w-2.5 h-2.5" />
+                      <span>{sp.cleanPaste}</span>
+                    </button>
+                  )}
               </div>
             </div>
           )}
 
-          {/* Pending Multi-Attachments Strip */}
+          {/* Pending Multi-Attachments Strip + Drop-to-Utility Plugin Bar */}
           {attachments.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1.5 shrink-0">
-              {attachments.map((att, idx) => (
-                <div
-                  key={idx}
-                  title={att.file_path ?? att.label}
-                  className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-sky-500/15 border border-sky-400/25 text-[11px] text-sky-200 max-w-[180px]"
-                >
-                  <AttachmentIcon kind={att.kind} />
-                  <span className="truncate font-mono">{att.label}</span>
-                  <button
-                    onClick={() => onRemoveAttachment(idx)}
-                    className="text-white/60 hover:text-white shrink-0"
+            <div className="mt-2 space-y-1 shrink-0">
+              <div className="flex flex-wrap gap-1.5">
+                {attachments.map((att, idx) => (
+                  <div
+                    key={idx}
+                    title={att.file_path ?? att.label}
+                    className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-sky-500/15 border border-sky-400/25 text-[11px] text-sky-200 max-w-[180px]"
                   >
-                    <X className="w-3 h-3" />
-                  </button>
-                </div>
-              ))}
+                    <AttachmentIcon kind={att.kind} />
+                    <span className="truncate font-mono">{att.label}</span>
+                    <button
+                      onClick={() => onRemoveAttachment(idx)}
+                      className="text-white/60 hover:text-white shrink-0"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+              {(() => {
+                const filePaths = attachments
+                  .map((a) => a.file_path)
+                  .filter((p): p is string => Boolean(p));
+                if (filePaths.length === 0) return null;
+                const hasImg = filePaths.some((p) => /\.(png|jpe?g|webp|bmp)$/i.test(p));
+                const hasVid = filePaths.some((p) => /\.(mp4|mov|mkv|webm|avi)$/i.test(p));
+                const hasDocOrImg = hasImg || filePaths.some((p) => /\.(pdf|md|txt|docx?|pptx?|xlsx?)$/i.test(p));
+                const hasSkillCand =
+                  attachments.some((a) => a.kind === "folder") ||
+                  filePaths.some((p) => /\.(zip)$/i.test(p) || /skill\.md$/i.test(p));
+                return (
+                  <div className="flex flex-wrap gap-1">
+                    {hasSkillCand && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          void invoke("import_local_skill", { path: filePaths[0] })
+                            .then(() => {
+                              if (onOpenPlugin) onOpenPlugin("__skills__", filePaths);
+                            })
+                            .catch(() => {});
+                        }}
+                        className="px-2 py-0.5 rounded-full bg-amber-500/20 hover:bg-amber-500/35 text-[10px] text-amber-200 flex items-center gap-1 transition"
+                      >
+                        <Sparkles className="w-2.5 h-2.5" />
+                        <span>{sp.installSkillAction}</span>
+                      </button>
+                    )}
+                    {hasImg && enabledPlugins.offline_ocr !== false && onQuickOcr && (
+                      <button
+                        type="button"
+                        onClick={() => onQuickOcr(filePaths[0])}
+                        className="px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-sky-500/30 text-[10px] text-sky-200 flex items-center gap-1 transition"
+                      >
+                        <ScanText className="w-2.5 h-2.5" />
+                        <span>{sp.ocrAction}</span>
+                      </button>
+                    )}
+                    {hasImg && enabledPlugins.pin_to_screen !== false && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void invoke("plugin_pin_image", { source: filePaths[0] }).catch(() => {})
+                        }
+                        className="px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-amber-500/30 text-[10px] text-amber-200 flex items-center gap-1 transition"
+                      >
+                        <Pin className="w-2.5 h-2.5" />
+                        <span>{sp.pinAction}</span>
+                      </button>
+                    )}
+                    {hasImg && enabledPlugins.image_optimizer !== false && onOpenPlugin && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenPlugin("image_optimizer", filePaths)}
+                        className="px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-cyan-500/30 text-[10px] text-cyan-200 flex items-center gap-1 transition"
+                      >
+                        <ImageDown className="w-2.5 h-2.5" />
+                        <span>{sp.optimizeBtn}</span>
+                      </button>
+                    )}
+                    {hasDocOrImg && enabledPlugins.pdf_suite !== false && onOpenPlugin && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenPlugin("pdf_suite", filePaths)}
+                        className="px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-indigo-500/30 text-[10px] text-indigo-200 flex items-center gap-1 transition"
+                      >
+                        <FileText className="w-2.5 h-2.5" />
+                        <span>PDF</span>
+                      </button>
+                    )}
+                    {hasVid && installedPlugins.media_gif && onOpenPlugin && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenPlugin("media_gif", filePaths)}
+                        className="px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-violet-500/30 text-[10px] text-violet-200 flex items-center gap-1 transition"
+                      >
+                        <Film className="w-2.5 h-2.5" />
+                        <span>{sp.toGif}</span>
+                      </button>
+                    )}
+                    {enabledPlugins.file_locksmith !== false && onOpenPlugin && (
+                      <button
+                        type="button"
+                        onClick={() => onOpenPlugin("file_locksmith", filePaths)}
+                        className="px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-rose-500/30 text-[10px] text-rose-200 flex items-center gap-1 transition"
+                      >
+                        <Lock className="w-2.5 h-2.5" />
+                        <span>{sp.checkLocks}</span>
+                      </button>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           )}
 
-          {/* Input Bar */}
-          <form onSubmit={handleSubmit} className="mt-2 flex items-center gap-2 shrink-0">
-            <input
-              type="text"
-              value={chatInput}
-              onChange={(e) => onChangeInput(e.target.value)}
-              onFocus={() => onFocusInput(true)}
-              onBlur={() => onFocusInput(false)}
-              placeholder={s.inputPlaceholder}
-              className="flex-1 rounded-xl bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-3 py-1.5 text-[12.5px] text-white placeholder:text-white/40"
-            />
-            {isThinking ? (
-              <button
-                type="button"
-                onClick={onStopStream}
-                className="px-3 py-1.5 rounded-xl bg-rose-500/80 hover:bg-rose-500 text-white font-semibold text-[12px] flex items-center gap-1 transition"
-              >
-                <Square className="w-3 h-3 fill-current" />
-                <span>{s.stop}</span>
-              </button>
-            ) : (
-              <button
-                type="submit"
-                className="px-3 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-[12px] transition"
-              >
-                {s.send}
-              </button>
+          {/* Input Bar + /skill Slash Popover */}
+          <div className="relative mt-2 shrink-0">
+            {slashMenuOpen && (
+              <div className="absolute bottom-full left-0 right-0 mb-1.5 rounded-xl bg-[#0e1017]/95 backdrop-blur-xl border border-white/15 shadow-2xl overflow-hidden z-30 max-h-48 flex flex-col">
+                <div className="px-2.5 py-1.5 border-b border-white/10 flex items-center justify-between text-[10px] text-white/50">
+                  <span className="flex items-center gap-1">
+                    <Sparkles className="w-3 h-3 text-amber-300" />
+                    <span>{s.slashSkillsTitle}</span>
+                  </span>
+                  {onOpenPlugin && (
+                    <button
+                      type="button"
+                      onMouseDown={(e) => {
+                        e.preventDefault();
+                        onOpenPlugin("__skills__");
+                      }}
+                      className="text-sky-300 hover:text-sky-200 transition"
+                    >
+                      {s.slashManage}
+                    </button>
+                  )}
+                </div>
+                <div className="overflow-y-auto p-1 space-y-0.5">
+                  {slashMatches.length === 0 ? (
+                    <div className="px-2.5 py-2 text-[11px] text-white/45 text-center">
+                      {s.slashNoSkills}
+                    </div>
+                  ) : (
+                    slashMatches.map((sk, idx) => {
+                      const active = idx === Math.min(slashSelIdx, slashMatches.length - 1);
+                      return (
+                        <button
+                          key={sk.id}
+                          type="button"
+                          onMouseDown={(e) => {
+                            e.preventDefault();
+                            applySlashSkill(sk);
+                          }}
+                          className={`w-full text-left px-2.5 py-1.5 rounded-lg flex items-start justify-between gap-2 transition ${
+                            active ? "bg-white/[0.12] text-white" : "hover:bg-white/[0.07] text-white/85"
+                          }`}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              <span className="font-mono text-[11.5px] font-semibold text-amber-200">
+                                /{sk.id}
+                              </span>
+                              <span className="text-[10.5px] text-white/55 truncate">
+                                {sk.name}
+                              </span>
+                            </div>
+                            <p className="text-[10px] text-white/50 truncate mt-0.5">
+                              {sk.description}
+                            </p>
+                          </div>
+                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-white/[0.07] text-white/50 shrink-0 mt-0.5">
+                            {sk.source === "builtin" ? "built-in" : "skill"}
+                          </span>
+                        </button>
+                      );
+                    })
+                  )}
+                </div>
+              </div>
             )}
-          </form>
+
+            {activeSlashSkill && !slashMenuOpen && (
+              <div className="mb-1 flex items-center gap-1.5 text-[10px] text-amber-200/90 px-1">
+                <Sparkles className="w-2.5 h-2.5 shrink-0" />
+                <span className="font-mono font-semibold">/{activeSlashSkill.id}</span>
+                <span className="text-white/45 truncate">{activeSlashSkill.name}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSubmit} className="flex items-center gap-2">
+              <input
+                ref={inputRef}
+                type="text"
+                value={chatInput}
+                onChange={(e) => {
+                  setSlashDismissed(false);
+                  setSlashSelIdx(0);
+                  onChangeInput(e.target.value);
+                }}
+                onKeyDown={(e) => {
+                  if (!slashMenuOpen || slashMatches.length === 0) return;
+                  const safeIdx = Math.min(slashSelIdx, slashMatches.length - 1);
+                  if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    setSlashSelIdx((safeIdx + 1) % slashMatches.length);
+                  } else if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    setSlashSelIdx((safeIdx - 1 + slashMatches.length) % slashMatches.length);
+                  } else if (e.key === "Tab") {
+                    e.preventDefault();
+                    applySlashSkill(slashMatches[safeIdx]);
+                  } else if (e.key === "Enter") {
+                    const picked = slashMatches[safeIdx];
+                    if (chatInput.trim().toLowerCase() !== `/${picked.id.toLowerCase()}`) {
+                      e.preventDefault();
+                      applySlashSkill(picked);
+                    }
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    setSlashDismissed(true);
+                  }
+                }}
+                onFocus={() => onFocusInput(true)}
+                onBlur={() => onFocusInput(false)}
+                placeholder={s.inputPlaceholder}
+                className="flex-1 rounded-xl bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-3 py-1.5 text-[12.5px] text-white placeholder:text-white/40"
+              />
+              {isThinking ? (
+                <button
+                  type="button"
+                  onClick={onStopStream}
+                  className="px-3 py-1.5 rounded-xl bg-rose-500/80 hover:bg-rose-500 text-white font-semibold text-[12px] flex items-center gap-1 transition"
+                >
+                  <Square className="w-3 h-3 fill-current" />
+                  <span>{s.stop}</span>
+                </button>
+              ) : (
+                <button
+                  type="submit"
+                  className="px-3 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-[12px] transition"
+                >
+                  {s.send}
+                </button>
+              )}
+            </form>
+          </div>
         </>
       )}
     </div>

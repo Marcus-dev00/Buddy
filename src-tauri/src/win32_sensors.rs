@@ -48,6 +48,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 pub const CANVAS_PAD: f64 = 8.0;
+pub const DOCK_EDGE_GAP_LOGICAL: f64 = 9.0;
 pub const EXPANDED_V_W: f64 = 420.0;
 pub const EXPANDED_H_W: f64 = 456.0;
 pub const WINDOW_CANVAS_W: f64 = EXPANDED_H_W + CANVAS_PAD * 2.0; // 472.0
@@ -284,7 +285,7 @@ pub fn apply_window_layout(
     expanded: bool,
 ) -> LayoutDims {
     let scale = window.scale_factor().unwrap_or(1.0);
-    let edge_gap = (2.0 * scale).round() as i32;
+    let edge_gap = (DOCK_EDGE_GAP_LOGICAL * scale).round() as i32;
 
     if !state.has_anchor.load(Ordering::Relaxed) {
         let (wx, wy, ww, _) = get_primary_work_area();
@@ -633,7 +634,7 @@ pub fn reset_dock_to_top(
     let scale = window.scale_factor().unwrap_or(1.0);
     let (wx, wy, ww, _) = get_primary_work_area();
     let cx = wx + ww / 2;
-    let cy = wy + ((2.0 + 21.0) * scale).round() as i32;
+    let cy = wy + ((DOCK_EDGE_GAP_LOGICAL + 21.0) * scale).round() as i32;
     state.set_dock_edge("top");
     state.anchor_cx.store(cx, Ordering::Relaxed);
     state.anchor_cy.store(cy, Ordering::Relaxed);

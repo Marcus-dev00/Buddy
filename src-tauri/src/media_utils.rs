@@ -13,7 +13,7 @@ use windows::core::PWSTR;
 use windows::Win32::Foundation::{CloseHandle, HGLOBAL};
 #[cfg(windows)]
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
 };
 
 #[cfg(windows)]
@@ -229,4 +229,29 @@ pub fn write_image_to_clipboard(img: &DynamicImage, guard: &SelfCopyGuard) -> Re
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+pub fn read_clipboard_text_only() -> Option<String> {
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let mut out = None;
+        if let Ok(handle) = GetClipboardData(CF_UNICODETEXT_FMT) {
+            let hmem = HGLOBAL(handle.0);
+            let ptr = GlobalLock(hmem) as *const u16;
+            if !ptr.is_null() {
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 && len < 262_144 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(ptr, len);
+                out = Some(String::from_utf16_lossy(slice));
+                let _ = GlobalUnlock(hmem);
+            }
+        }
+        let _ = CloseClipboard();
+        out
+    }
 }

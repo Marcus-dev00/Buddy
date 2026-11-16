@@ -408,6 +408,58 @@ fn raw_tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
                 "required": ["command"]
             }),
         ),
+        (
+            "list_installed_skills",
+            "List all Agent Skills installed in Buddy's local skill directory (`%LOCALAPPDATA%/Buddy/skills/`), including enabled state and descriptions.",
+            json!({
+                "type": "object",
+                "properties": {}
+            }),
+        ),
+        (
+            "read_skill",
+            "Load the full `SKILL.md` instructions and file list of an installed Agent Skill by its `id` or `name` before executing it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "skill_id": { "type": "string", "description": "Skill ID or name." }
+                },
+                "required": ["skill_id"]
+            }),
+        ),
+        (
+            "search_github_skills",
+            "Search GitHub for Agent Skill repositories (by keywords), or pass an `owner/repo` / GitHub URL to discover all `SKILL.md` subfolders inside that repo.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search keywords (e.g. 'pdf', 'ocr') OR GitHub repo (`owner/repo` / URL)." }
+                },
+                "required": ["query"]
+            }),
+        ),
+        (
+            "install_github_skill",
+            "Download and install an Agent Skill from GitHub (`owner/repo` or `https://github.com/owner/repo/tree/<branch>/<subpath>`) into Buddy's skills directory. Always requires user approval.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "GitHub repository or subfolder URL containing `SKILL.md`." }
+                },
+                "required": ["source"]
+            }),
+        ),
+        (
+            "offline_ocr",
+            "Extract text from a screenshot or image file using fast Windows native offline OCR (zero AI cost). Use this when the user asks to OCR/extract text from an image or invokes `/ocr`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "Path to the image file (or screenshot path from attachments)." }
+                },
+                "required": ["source"]
+            }),
+        ),
     ]
 }
 
@@ -673,6 +725,57 @@ pub fn plan_tool_execution(
                 requires_approval: true,
                 allow_approve_all: false,
                 is_destructive: true,
+            }
+        }
+        "list_installed_skills" => ToolExecutionPlan {
+            summary: "List installed Skills".to_string(),
+            preview: None,
+            requires_approval: false,
+            allow_approve_all: false,
+            is_destructive: false,
+        },
+        "read_skill" => {
+            let id = args["skill_id"].as_str().unwrap_or("");
+            ToolExecutionPlan {
+                summary: format!("Load Skill `{id}`"),
+                preview: None,
+                requires_approval: false,
+                allow_approve_all: false,
+                is_destructive: false,
+            }
+        }
+        "search_github_skills" => {
+            let q = args["query"].as_str().unwrap_or("");
+            ToolExecutionPlan {
+                summary: format!("Search GitHub Skills `{q}`"),
+                preview: None,
+                requires_approval: false,
+                allow_approve_all: false,
+                is_destructive: false,
+            }
+        }
+        "install_github_skill" => {
+            let src = args["source"].as_str().unwrap_or("");
+            ToolExecutionPlan {
+                summary: format!("Install GitHub Skill `{}`", truncate_chars(src, 42)),
+                preview: Some(format!("Source: {src}\nInstall into %LOCALAPPDATA%/Buddy/skills/")),
+                requires_approval: true,
+                allow_approve_all: false,
+                is_destructive: false,
+            }
+        }
+        "offline_ocr" => {
+            let src = args["source"].as_str().unwrap_or("");
+            let name = Path::new(src)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(src);
+            ToolExecutionPlan {
+                summary: format!("Offline OCR `{}`", truncate_chars(name, 36)),
+                preview: None,
+                requires_approval: false,
+                allow_approve_all: false,
+                is_destructive: false,
             }
         }
         other => ToolExecutionPlan {

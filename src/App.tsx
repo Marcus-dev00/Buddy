@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { Clock, Download, MessageSquare, Puzzle, Settings, X } from "lucide-react";
 import ChatTab, { memoryToAttachment } from "./components/ChatTab";
 import MemoryTab from "./components/MemoryTab";
+import PluginsTab from "./components/PluginsTab";
 import SettingsTab from "./components/SettingsTab";
 import { getStrings, makeWelcomeGreeting } from "./i18n";
 import type {
@@ -13,6 +14,7 @@ import type {
   AttachmentPayload,
   BuddyState,
   ChatMessage,
+  ColorPickedPayload,
   ConversationSummary,
   DockEdge,
   DockStatePayload,
@@ -20,8 +22,13 @@ import type {
   MemoryItem,
   MusicPayload,
   MusicStyle,
+  OcrResult,
+  PluginListResponse,
+  PluginProgressPayload,
+  SkillInfo,
   TabId,
   ThinkingLevel,
+  TimerTickPayload,
   UiLang,
   UpdateInfo,
 } from "./types";
@@ -80,7 +87,7 @@ const EYE_POSES: Record<EyePreset, EyePose> = {
   },
   happy: {
     pillW: 28, pillH: 8, pillOp: 0, glintOp: 0,
-    arcBend: -16, arcOp: 1.0, glowOp: 0.22, isHappyGreen: true,
+    arcBend: -15, arcOp: 1.0, glowOp: 0.14, isHappyGreen: false,
   },
 };
 
@@ -162,6 +169,17 @@ export default function App() {
   const [appVersion, setAppVersion] = useState<string>("0.1.0");
   const [availableUpdate, setAvailableUpdate] = useState<UpdateInfo | null>(null);
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
+  const [pluginsData, setPluginsData] = useState<PluginListResponse>({
+    plugins: [],
+    mirror_prefix: "",
+    total_size_bytes: 0,
+  });
+  const [pluginProgress, setPluginProgress] = useState<Record<string, PluginProgressPayload>>({});
+  const [lastPickedColor, setLastPickedColor] = useState<ColorPickedPayload | null>(null);
+  const [timerState, setTimerState] = useState<TimerTickPayload | null>(null);
+  const [droppedPathsHint, setDroppedPathsHint] = useState<string[]>([]);
+  const [focusedPluginId, setFocusedPluginId] = useState<string | null>(null);
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [refreshHz, setRefreshHz] = useState<number>(60);
   const [memoryRefresh, setMemoryRefresh] = useState(0);
   const [attachments, setAttachments] = useState<AttachmentPayload[]>([]);
@@ -332,7 +350,7 @@ export default function App() {
     ) => {
       if (glow) {
         glow.setAttribute("opacity", pose.glowOp.toFixed(2));
-        glow.setAttribute("fill", pose.isHappyGreen ? "#6ee7b7" : "#38bdf8");
+        glow.setAttribute("fill", "#ffffff");
       }
       if (pill) {
         pill.setAttribute("x", px.toFixed(2));
@@ -556,18 +574,18 @@ export default function App() {
       f.capturePhase = "inhale";
       f.wakeKind = "none";
       s.tEyeSize = 26;
-      setCapsuleSizeTarget(196, 76, 28, 76, false);
-      s.vCapScale = 1.6;
-      renderEyeSvg("open", 18.0);
+      setCapsuleSizeTarget(176, 58, 25, 58, false);
+      s.vCapScale = 1.25;
+      renderEyeSvg("open", 16.0);
       mouthSvgRef.current?.classList.remove("hidden");
       particlesRef.current?.classList.remove("hidden");
       if (mouthShapeRef.current) {
-        mouthShapeRef.current.innerHTML = `<rect x="6" y="4" width="24" height="16" rx="8" fill="#ffffff" />`;
+        mouthShapeRef.current.innerHTML = `<ellipse cx="18" cy="12" rx="4.5" ry="4.5" fill="#ffffff" opacity="0.95" />`;
       }
       const side = isSideDock(dockEdgeRef.current);
       void invoke("update_pill_bounds", {
-        width: side ? 78 : 250,
-        height: side ? 250 : 78,
+        width: side ? 64 : 230,
+        height: side ? 230 : 64,
       });
     } else if (next === "peek") {
       if (musicRef.current.playing) {
@@ -765,6 +783,18 @@ export default function App() {
       } catch {
         // ignore
       }
+      try {
+        const pl = await invoke<PluginListResponse>("list_plugins");
+        setPluginsData(pl);
+      } catch {
+        // ignore
+      }
+      try {
+        const sk = await invoke<SkillInfo[]>("list_skills");
+        setSkills(sk);
+      } catch {
+        // ignore
+      }
       let loadedLang: UiLang = "en";
       try {
         const cfg = await invoke<AppSettings>("get_settings");
@@ -870,6 +900,10 @@ export default function App() {
     unlisteners.push(
       listen<AttachmentPayload[]>("buddy://files-dropped", (event) => {
         setAttachments((prev) => [...prev, ...event.payload].slice(0, 6));
+        const paths = event.payload
+          .map((a) => a.file_path)
+          .filter((p): p is string => Boolean(p));
+        if (paths.length > 0) setDroppedPathsHint(paths);
         activeTabRef.current = "chat";
         setActiveTab("chat");
         if (stateRef.current !== "expanded") {
@@ -982,6 +1016,34 @@ export default function App() {
         } else {
           setUpdateProgress(0);
         }
+      }),
+      listen<PluginProgressPayload>("buddy://plugin-progress", (e) => {
+        setPluginProgress((prev) => ({ ...prev, [e.payload.plugin_id]: e.payload }));
+      }),
+      listen("buddy://skills-updated", () => {
+        void invoke<SkillInfo[]>("list_skills").then(setSkills).catch(() => {});
+      }),
+      listen<ColorPickedPayload>("buddy://color-picked", (e) => {
+        setLastPickedColor(e.payload);
+        activeTabRef.current = "plugins";
+        setActiveTab("plugins");
+        setFocusedPluginId("color_picker");
+        if (stateRef.current !== "expanded") {
+          transitionTo("expanded");
+        }
+      }),
+      listen<TimerTickPayload>("buddy://timer-tick", (e) => {
+        setTimerState(e.payload.active ? e.payload : null);
+      }),
+      listen<string>("buddy://timer-done", () => {
+        setTimerState(null);
+        renderEyeSvg("happy", 12);
+        springRef.current.vCapScale = 2.2;
+        window.setTimeout(() => {
+          if (stateRef.current !== "expanded") {
+            applyVisualTargets(stateRef.current);
+          }
+        }, 1600);
       })
     );
 
@@ -1260,38 +1322,38 @@ export default function App() {
         }
       } else if (st === "capture") {
         f.captureElapsed += dt;
-        if (f.captureElapsed < 0.56) {
-          const p = Math.min(1, f.captureElapsed / 0.56);
-          const easeIn = p * p;
+        if (f.captureElapsed < 0.48) {
+          const p = Math.min(1, f.captureElapsed / 0.48);
+          const easeIn = p * p * (3 - 2 * p);
           const openAmt = Math.sin(p * Math.PI);
-          const mw = 14 + openAmt * 15;
-          const mh = 6 + openAmt * 16;
+          const rx = 2.5 + openAmt * 3.8;
+          const ry = 2.5 + openAmt * 4.4;
           if (mouthShapeRef.current) {
-            mouthShapeRef.current.innerHTML = `<rect x="${(18 - mw / 2).toFixed(1)}" y="${(12 - mh / 2).toFixed(1)}" width="${mw.toFixed(1)}" height="${mh.toFixed(1)}" rx="${(mh / 2).toFixed(1)}" fill="#ffffff" />`;
+            mouthShapeRef.current.innerHTML = `<ellipse cx="18" cy="11" rx="${rx.toFixed(1)}" ry="${ry.toFixed(1)}" fill="#ffffff" opacity="${(0.65 + openAmt * 0.35).toFixed(2)}" />`;
           }
           const inv = 1 - easeIn;
-          const swirl = Math.sin(p * Math.PI * 2) * 8 * inv;
-          const cx = (isSideDock(dockEdgeRef.current) ? 64 : layoutDimsRef.current.v_w) / 2;
+          const swirl = Math.sin(p * Math.PI * 1.5) * 6 * inv;
+          const cx = (facePivotRef.current?.clientWidth || 176) / 2;
           const offsets: [number, number][] = [
-            [cx - 4 - inv * 58 + swirl, 48 + inv * 36],
-            [cx + inv * 60 - swirl, 50 + inv * 32],
-            [cx - 2 + swirl * 0.7, 49 + inv * 44],
-            [cx - 6 - inv * 34, 52 + inv * 40],
-            [cx + 2 + inv * 36, 52 + inv * 38],
+            [cx - 3 - inv * 54, 38 - inv * 12 + swirl],
+            [cx + inv * 54, 38 - inv * 10 - swirl],
+            [cx - 2 - inv * 32, 42 + inv * 18],
+            [cx + 3 + inv * 34, 42 + inv * 16],
+            [cx + swirl * 0.4, 40 + inv * 22],
           ];
           offsets.forEach(([ox, oy], idx) => {
             const el = particleElsRef.current[idx];
             if (el) {
               el.style.left = `${ox.toFixed(1)}px`;
               el.style.top = `${oy.toFixed(1)}px`;
-              el.style.opacity = `${(inv * (idx >= 3 ? 0.9 : 1)).toFixed(2)}`;
+              el.style.opacity = `${(inv * 0.92).toFixed(2)}`;
             }
           });
           s.tex = 0;
-          s.tey = -12;
-          s.tesx = 1.09;
-          s.tesy = 1.09;
-          s.tCapRot = Math.sin(p * Math.PI * 2) * 1.6;
+          s.tey = -5 * openAmt;
+          s.tesx = 1.05;
+          s.tesy = 1.05;
+          s.tCapRot = 0;
         } else if (f.capturePhase === "inhale") {
           f.capturePhase = "swallow";
           particlesRef.current?.classList.add("hidden");
@@ -1300,12 +1362,12 @@ export default function App() {
           if (!isSideDock(dockEdgeRef.current)) {
             captureToastRef.current?.classList.remove("hidden");
             captureToastRef.current?.classList.add("flex");
-            setCapsuleSizeTarget(248, 44, 22, 44, false);
+            setCapsuleSizeTarget(258, 44, 22, 44, false);
           } else {
-            setCapsuleSizeTarget(196, 44, 22, 44, false);
+            setCapsuleSizeTarget(176, 42, 21, 42, false);
           }
           s.tey = 0;
-          s.vCapScale = -2.6;
+          s.vCapScale = -1.8;
           s.tCapRot = 0;
           s.tesx = 1;
           s.tesy = 1;
@@ -1920,6 +1982,34 @@ export default function App() {
 
   const isExpanded = buddyState === "expanded";
   const sideDocked = isSideDock(dockEdge);
+  const enabledPluginsMap: Record<string, boolean> = {};
+  const installedPluginsMap: Record<string, boolean> = {};
+  for (const p of pluginsData.plugins) {
+    enabledPluginsMap[p.id] = p.enabled;
+    installedPluginsMap[p.id] = p.installed;
+  }
+
+  const handleQuickOcr = (source: string) => {
+    void invoke<OcrResult>("plugin_offline_ocr", { source })
+      .then((res) => {
+        const txt = res.text.trim() || "(no text detected)";
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now(),
+            role: "assistant",
+            text: `**Offline OCR (${res.language}):**\n\`\`\`\n${txt}\n\`\`\``,
+          },
+        ]);
+        switchTab("chat");
+      })
+      .catch((err) => {
+        setMessages((prev) => [
+          ...prev,
+          { id: Date.now(), role: "assistant", text: String(err), isError: true },
+        ]);
+      });
+  };
   const dims = layoutDims;
   const activeDims: [number, number] = sideDocked
     ? [dims.h_w, dims.h_h]
@@ -2040,6 +2130,17 @@ export default function App() {
             className="absolute flex"
             style={cardPosStyle}
           >
+            {/* Capsule Timer Luminous Edge Progress Bar */}
+            {timerState?.active && timerState.total_sec > 0 && (
+              <div className="pointer-events-none absolute inset-x-3 bottom-0.5 h-[2.5px] rounded-full bg-white/10 overflow-hidden z-30">
+                <div
+                  className="h-full bg-gradient-to-r from-sky-400 to-emerald-300 transition-all duration-500"
+                  style={{
+                    width: `${Math.max(2, Math.round((timerState.remaining_sec / timerState.total_sec) * 100))}%`,
+                  }}
+                />
+              </div>
+            )}
             {/* HERO EYES STAGE */}
             <div
               ref={eyesStageRef}
@@ -2094,11 +2195,11 @@ export default function App() {
                 </svg>
 
                 <div ref={particlesRef} className="hidden absolute inset-0 pointer-events-none">
-                  <span ref={(el) => { particleElsRef.current[0] = el; }} className="absolute w-2.5 h-2.5 rounded-sm bg-white" />
-                  <span ref={(el) => { particleElsRef.current[1] = el; }} className="absolute w-2 h-2 rounded-full bg-sky-300" />
-                  <span ref={(el) => { particleElsRef.current[2] = el; }} className="absolute w-3 h-2 rounded-sm bg-emerald-300" />
-                  <span ref={(el) => { particleElsRef.current[3] = el; }} className="absolute w-1.5 h-1.5 rounded-full bg-white/90" />
-                  <span ref={(el) => { particleElsRef.current[4] = el; }} className="absolute w-2 h-2 rounded-sm bg-sky-200" />
+                  <span ref={(el) => { particleElsRef.current[0] = el; }} className="absolute w-1.5 h-1.5 rounded-full bg-white shadow-[0_0_6px_rgba(255,255,255,0.8)]" />
+                  <span ref={(el) => { particleElsRef.current[1] = el; }} className="absolute w-1.5 h-1.5 rounded-full bg-white/85" />
+                  <span ref={(el) => { particleElsRef.current[2] = el; }} className="absolute w-2 h-2 rounded-full bg-white/95" />
+                  <span ref={(el) => { particleElsRef.current[3] = el; }} className="absolute w-1 h-1 rounded-full bg-white/75" />
+                  <span ref={(el) => { particleElsRef.current[4] = el; }} className="absolute w-1.5 h-1.5 rounded-full bg-white/80" />
                 </div>
 
                 <div
@@ -2134,8 +2235,11 @@ export default function App() {
 
                 <div
                   ref={captureToastRef}
-                  className="hidden items-center gap-1.5 text-[11px] text-emerald-300 font-medium ml-2 pr-1"
+                  className="hidden items-center gap-1.5 text-[11px] text-white/90 font-medium ml-2 pr-1 whitespace-nowrap"
                 >
+                  <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-white/15 text-[9px] text-white">
+                    ✓
+                  </span>
                   <span>{ui.captureToast}</span>
                 </div>
               </div>
@@ -2227,6 +2331,15 @@ export default function App() {
                   onSelectConversation={handleSelectConversation}
                   onDeleteConversation={(id) => void handleDeleteConversation(id)}
                   onOpenSettings={() => switchTab("settings")}
+                  enabledPlugins={enabledPluginsMap}
+                  installedPlugins={installedPluginsMap}
+                  skills={skills}
+                  onOpenPlugin={(pluginId, paths) => {
+                    if (paths && paths.length > 0) setDroppedPathsHint(paths);
+                    setFocusedPluginId(pluginId);
+                    switchTab("plugins");
+                  }}
+                  onQuickOcr={handleQuickOcr}
                 />
               )}
 
@@ -2234,19 +2347,41 @@ export default function App() {
                 <MemoryTab
                   lang={lang}
                   refreshTrigger={memoryRefresh}
+                  enabledPlugins={enabledPluginsMap}
                   onAskAi={(item) => {
                     setAttachments((prev) => [...prev, memoryToAttachment(item)].slice(0, 6));
+                    switchTab("chat");
+                  }}
+                  onOcrExtracted={(ocrText) => {
+                    setMessages((prev) => [
+                      ...prev,
+                      {
+                        id: Date.now(),
+                        role: "assistant",
+                        text: `**Offline OCR:**\n\`\`\`\n${ocrText}\n\`\`\``,
+                      },
+                    ]);
                     switchTab("chat");
                   }}
                 />
               )}
 
               {activeTab === "plugins" && (
-                <div className="flex-1 flex flex-col items-center justify-center text-center px-4 space-y-2">
-                  <Puzzle className="w-7 h-7 text-emerald-400/70" />
-                  <div className="text-[13px] font-medium text-white">{ui.plugins.title}</div>
-                  <p className="text-[11.5px] text-white/50">{ui.plugins.desc}</p>
-                </div>
+                <PluginsTab
+                  lang={lang}
+                  pluginsData={pluginsData}
+                  pluginProgress={pluginProgress}
+                  lastPickedColor={lastPickedColor}
+                  timerState={timerState}
+                  droppedPathsHint={droppedPathsHint}
+                  focusedPluginId={focusedPluginId}
+                  skills={skills}
+                  onRefreshPlugins={setPluginsData}
+                  onRefreshSkills={setSkills}
+                  onCopyText={(text) => {
+                    void navigator.clipboard?.writeText(text).catch(() => {});
+                  }}
+                />
               )}
 
               {activeTab === "settings" && (

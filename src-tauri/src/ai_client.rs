@@ -6,12 +6,14 @@
 
 use crate::agent_tools::{
     anthropic_tools_json, build_agent_system_appendix, execute_tool, gemini_tools_json,
-    openai_tools_json, plan_tool_execution, AgentApprovalManager, AgentStepEvent,
-    ApprovalDecision,
+    openai_tools_json, plan_tool_execution, resolve_user_path, AgentApprovalManager,
+    AgentStepEvent, ApprovalDecision,
 };
 use crate::db::MemoryDb;
+use crate::plugins::{run_offline_ocr, PluginManager};
 use crate::prompts::PromptsManager;
 use crate::settings::SettingsManager;
+use crate::skills::{search_github_skills, SkillsManager};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
 use serde::{Deserialize, Serialize};
@@ -1106,6 +1108,8 @@ fn derive_workspace_hint(configured: &str, attachments: &[AttachmentPayload]) ->
 async fn run_tool_with_approval(
     app: &AppHandle,
     approval_mgr: &AgentApprovalManager,
+    skills_mgr: &SkillsManager,
+    mirror_prefix: &str,
     stream_id: &str,
     turn_idx: usize,
     call_idx: usize,
@@ -1192,15 +1196,122 @@ async fn run_tool_with_approval(
         },
     );
 
-    let name_owned = call.name.clone();
-    let args_owned = call.args.clone();
-    let ws_owned = workspace_hint.map(|p| p.to_path_buf());
+    let (ok, output, detail) = match call.name.as_str() {
+        "list_installed_skills" => {
+            let list = skills_mgr.list();
+            if list.is_empty() {
+                (
+                    true,
+                    "No skills installed yet. You can find one via `search_github_skills` and propose installing it via `install_github_skill`.".into(),
+                    "0 skills".into(),
+                )
+            } else {
+                let count = list.len();
+                let formatted = list
+                    .into_iter()
+                    .map(|s| {
+                        format!(
+                            "- id=`{}` | enabled={} | name=\"{}\" | dir=`{}`\n  {}",
+                            s.id, s.enabled, s.name, s.dir_path, s.description
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (true, formatted, format!("{count} skills"))
+            }
+        }
+        "read_skill" => {
+            let sid = call.args["skill_id"].as_str().unwrap_or("");
+            match skills_mgr.get_detail(sid) {
+                Ok(det) => {
+                    let files_str = det.files.join(", ");
+                    let out = format!(
+                        "Skill `{}` ({})\nDir: `{}`\nFiles: [{}]\n\n{}",
+                        det.info.id, det.info.name, det.info.dir_path, files_str, det.skill_md
+                    );
+                    (true, out, format!("{} files", det.files.len()))
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "search_github_skills" => {
+            let q = call.args["query"].as_str().unwrap_or("");
+            match search_github_skills(q).await {
+                Ok(cands) if cands.is_empty() => (
+                    true,
+                    format!("No matching GitHub Skills found for `{q}`."),
+                    "0 results".into(),
+                ),
+                Ok(cands) => {
+                    let count = cands.len();
+                    let text = cands
+                        .into_iter()
+                        .map(|c| {
+                            format!(
+                                "- **{}** (★{}) -> install_spec: `{}`\n  {}",
+                                c.title, c.stars, c.install_spec, c.description
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (true, text, format!("{count} found"))
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "install_github_skill" => {
+            let src = call.args["source"].as_str().unwrap_or("");
+            match skills_mgr.install_from_github(src, mirror_prefix).await {
+                Ok(installed) => {
+                    let _ = app.emit("buddy://skills-updated", ());
+                    let count = installed.len();
+                    let lines = installed
+                        .into_iter()
+                        .map(|s| format!("- `{}` (**{}**) -> `{}`", s.id, s.name, s.dir_path))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (
+                        true,
+                        format!("Installed {count} skill(s):\n{lines}"),
+                        format!("{count} installed"),
+                    )
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "offline_ocr" => {
+            let raw_src = call.args["source"].as_str().unwrap_or("");
+            let resolved = resolve_user_path(raw_src, workspace_hint)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| raw_src.to_string());
+            match run_offline_ocr(resolved).await {
+                Ok(res) => {
+                    let text = if res.text.trim().is_empty() {
+                        "(No text detected in image)".to_string()
+                    } else {
+                        res.text.clone()
+                    };
+                    (
+                        true,
+                        format!("OCR ({}) result:\n{}", res.language, text),
+                        format!("{} lines", res.line_count),
+                    )
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        _ => {
+            let name_owned = call.name.clone();
+            let args_owned = call.args.clone();
+            let ws_owned = workspace_hint.map(|p| p.to_path_buf());
 
-    let (ok, output, detail) = tauri::async_runtime::spawn_blocking(move || {
-        execute_tool(&name_owned, &args_owned, ws_owned.as_deref())
-    })
-    .await
-    .unwrap_or_else(|e| (false, format!("Worker panic: {e}"), "Panic".to_string()));
+            tauri::async_runtime::spawn_blocking(move || {
+                execute_tool(&name_owned, &args_owned, ws_owned.as_deref())
+            })
+            .await
+            .unwrap_or_else(|e| (false, format!("Worker panic: {e}"), "Panic".to_string()))
+        }
+    };
 
     let step = AgentStepEvent {
         stream_id: stream_id.to_string(),
@@ -1221,6 +1332,8 @@ pub fn spawn_chat_stream(
     app: AppHandle,
     settings_mgr: Arc<SettingsManager>,
     prompts_mgr: Arc<PromptsManager>,
+    skills_mgr: Arc<SkillsManager>,
+    plugin_mgr: Arc<PluginManager>,
     db: Arc<MemoryDb>,
     controller: Arc<AiStreamController>,
     approval_mgr: Arc<AgentApprovalManager>,
@@ -1255,10 +1368,13 @@ pub fn spawn_chat_stream(
         }
 
         let thinking_level = normalize_thinking_level(&cfg.thinking_level);
+        let mirror_prefix = plugin_mgr.list().mirror_prefix;
         let mut sys_prompt = prompts_mgr.build_system_prompt(&cfg.persona_id);
         if cfg.agent_mode {
             sys_prompt.push_str(&build_agent_system_appendix(&cfg.agent_workspace));
+            sys_prompt.push_str(&skills_mgr.build_prompt_appendix());
         }
+        sys_prompt.push_str(&skills_mgr.build_explicit_slash_appendix(&prompt));
         sys_prompt.push_str(&build_thinking_appendix(thinking_level));
 
         let client = match reqwest::Client::builder()
@@ -1454,6 +1570,8 @@ pub fn spawn_chat_stream(
                         let (result_text, step_rec) = run_tool_with_approval(
                             &app,
                             &approval_mgr,
+                            &skills_mgr,
+                            &mirror_prefix,
                             &stream_id,
                             turn_idx,
                             call_idx,
