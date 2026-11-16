@@ -1,6 +1,12 @@
-# Buddy
+<p align="center">
+  <img src="src-tauri/icons/icon.png" width="96" alt="Buddy Logo" />
+</p>
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+<h1 align="center">Buddy</h1>
+
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 **Buddy** is a minimalist desktop AI companion for Windows. It lives quietly as a floating black pill on your screen—listening to your music, napping when you step away, and expanding into an AI chat & desktop assistant whenever you click it or drop a file.
 

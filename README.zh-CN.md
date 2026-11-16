@@ -1,6 +1,12 @@
-# Buddy
+<p align="center">
+  <img src="src-tauri/icons/icon.png" width="96" alt="Buddy Logo" />
+</p>
 
-[English](README.md) · [简体中文](README.zh-CN.md)
+<h1 align="center">Buddy</h1>
+
+<p align="center">
+  <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 **Buddy** 是一个轻量常驻 Windows 桌面的极简灵动岛 AI 伴侣。平时它是一枚安静悬浮在屏幕边缘的黑色胶囊，陪你听歌、打盹；点开或拖入文件，随时变成你的桌面 AI 助手。
 
