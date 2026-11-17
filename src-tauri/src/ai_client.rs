@@ -830,35 +830,77 @@ fn normalize_thinking_level(raw: &str) -> &'static str {
     }
 }
 
-fn build_thinking_appendix(level: &str) -> String {
+fn detect_thinking_language_hint(prompt: &str, ui_language: &str) -> &'static str {
+    let trimmed = prompt.trim();
+    let has_cjk = trimmed
+        .chars()
+        .any(|c| matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF));
+    if has_cjk {
+        return "Simplified Chinese (简体中文)";
+    }
+    let has_kana = trimmed
+        .chars()
+        .any(|c| matches!(c as u32, 0x3040..=0x30FF));
+    if has_kana {
+        return "Japanese (日本語)";
+    }
+    let has_hangul = trimmed
+        .chars()
+        .any(|c| matches!(c as u32, 0xAC00..=0xD7AF));
+    if has_hangul {
+        return "Korean (한국어)";
+    }
+    let has_latin = trimmed.chars().any(|c| c.is_ascii_alphabetic());
+    if trimmed.is_empty() || !has_latin {
+        if ui_language.eq_ignore_ascii_case("zh") {
+            return "Simplified Chinese (简体中文)";
+        }
+        return "English";
+    }
+    "the exact same language as the user's latest message"
+}
+
+fn build_thinking_appendix(level: &str, prompt: &str, ui_language: &str) -> String {
+    let lang_hint = detect_thinking_language_hint(prompt, ui_language);
+    let lang_rule = format!(
+        "- Write ALL internal reasoning (both native thinking/reasoning blocks and `<buddy_thought>...</buddy_thought>`) in {lang_hint}, in a natural, conversational, down-to-earth inner voice (no stiff English-only template thoughts unless the user wrote in English)."
+    );
     match normalize_thinking_level(level) {
         "off" => "\n\n---\n\n# Thinking Level: OFF\n\
                   - Respond immediately and directly with zero deliberation.\n\
                   - Do NOT output `<buddy_thought>` tags."
             .to_string(),
-        "low" => "\n\n---\n\n# Thinking Level: LOW\n\
-                  - Before answering, do a quick 1-2 line sanity check inside `<buddy_thought>...</buddy_thought>` (check core facts, catch obvious errors or unclear intent; skip the tag if you emit native model reasoning blocks).\n\
-                  - Keep the final response outside the tag concise and accurate."
-            .to_string(),
-        "high" => "\n\n---\n\n# Thinking Level: HIGH\n\
-                   - Think thoroughly step-by-step inside `<buddy_thought>...</buddy_thought>` before writing your final reply (skip the tag if using native model reasoning blocks):\n\
-                     1) Verify what the user actually wants (clarify first if ambiguous).\n\
-                     2) Check factual accuracy, technical feasibility, and edge cases — prepare honest pushback if the premise is flawed or unrealistic.\n\
-                     3) Structure the cleanest, verified answer.\n\
-                   - Write ONLY the polished final reply outside `</buddy_thought>`."
-            .to_string(),
-        "max" => "\n\n---\n\n# Thinking Level: MAX (Exhaustive Verification)\n\
-                  - Think exhaustively inside `<buddy_thought>...</buddy_thought>` before answering (skip the tag if using native model reasoning blocks):\n\
-                    1) Explore every plausible interpretation and edge case.\n\
-                    2) Simulate each possible outcome / solution branch and check for failures, contradictions, or hard feasibility limits.\n\
-                    3) Double-check every calculation, fact, path, and assumption; identify if you need to ask clarifying questions first or push back honestly on faulty claims.\n\
-                    4) Verify the planned reply is 100% sound before writing a single word to the user.\n\
-                  - Deliver ONLY the confirmed, well-structured final response after `</buddy_thought>`."
-            .to_string(),
-        _ => "\n\n---\n\n# Thinking Level: MEDIUM\n\
-              - Before answering, think cleanly inside `<buddy_thought>...</buddy_thought>` (identify true intent, check whether clarification or honest pushback is needed, verify facts/steps; skip the tag if using native model reasoning blocks).\n\
-              - Put ONLY the final user-facing reply after `</buddy_thought>`."
-            .to_string(),
+        "low" => format!(
+            "\n\n---\n\n# Thinking Level: LOW\n\
+             {lang_rule}\n\
+             - Before answering, do a quick 1-2 line sanity check inside `<buddy_thought>...</buddy_thought>` (check core facts, catch obvious errors or unclear intent; skip the tag if you emit native model reasoning blocks).\n\
+             - Keep the final response outside the tag concise, natural, and accurate."
+        ),
+        "high" => format!(
+            "\n\n---\n\n# Thinking Level: HIGH\n\
+             {lang_rule}\n\
+             - Think thoroughly step-by-step inside `<buddy_thought>...</buddy_thought>` before writing your final reply (skip the tag if using native model reasoning blocks):\n\
+               1) Verify what the user actually wants (clarify first if ambiguous).\n\
+               2) Check factual accuracy, technical feasibility, and edge cases — prepare honest pushback if the premise is flawed or unrealistic.\n\
+               3) Structure the cleanest, verified answer in natural human phrasing.\n\
+             - Write ONLY the polished final reply outside `</buddy_thought>`."
+        ),
+        "max" => format!(
+            "\n\n---\n\n# Thinking Level: MAX (Exhaustive Verification)\n\
+             {lang_rule}\n\
+             - Think exhaustively inside `<buddy_thought>...</buddy_thought>` before answering (skip the tag if using native model reasoning blocks):\n\
+               1) Explore every plausible interpretation and edge case.\n\
+               2) Simulate each possible outcome / solution branch and check for failures, contradictions, or hard feasibility limits.\n\
+               3) Double-check every calculation, fact, path, and assumption; identify if you need to ask clarifying questions first or push back honestly on faulty claims.\n\
+               4) Verify the planned reply is 100% sound before writing a single word to the user.\n\
+             - Deliver ONLY the confirmed, natural, well-structured final response after `</buddy_thought>`."
+        ),
+        _ => format!(
+            "\n\n---\n\n# Thinking Level: MEDIUM\n\
+             {lang_rule}\n\
+             - Before answering, think cleanly inside `<buddy_thought>...</buddy_thought>` (identify true intent, check whether clarification or honest pushback is needed, verify facts/steps; skip the tag if using native model reasoning blocks).\n\
+             - Put ONLY the final user-facing reply after `</buddy_thought>`."
+        ),
     }
 }
 
@@ -2468,7 +2510,11 @@ pub fn spawn_chat_stream(
                 "\n\n[LIVE SCREEN SHARE ACTIVE]\nThe user is actively sharing their screen with you right now. Use the attached live frame(s) to answer their question directly with specific visual feedback.{goal_note}"
             ));
         }
-        sys_prompt.push_str(&build_thinking_appendix(thinking_level));
+        sys_prompt.push_str(&build_thinking_appendix(
+            thinking_level,
+            &prompt,
+            &cfg.ui_language,
+        ));
 
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(150))
@@ -3242,5 +3288,24 @@ mod tests {
             }
         );
         assert_eq!(native_forced.levels, &["off", "low", "medium", "high"]);
+    }
+
+    #[test]
+    fn thinking_appendix_follows_user_language_and_natural_tone() {
+        assert_eq!(
+            detect_thinking_language_hint("帮我看看这个报错怎么回事", "en"),
+            "Simplified Chinese (简体中文)"
+        );
+        assert_eq!(
+            detect_thinking_language_hint("", "zh"),
+            "Simplified Chinese (简体中文)"
+        );
+        assert_eq!(
+            detect_thinking_language_hint("Explain this Rust error", "zh"),
+            "the exact same language as the user's latest message"
+        );
+        let app_zh = build_thinking_appendix("high", "帮我排查一下", "zh");
+        assert!(app_zh.contains("Simplified Chinese"));
+        assert!(app_zh.contains("native thinking/reasoning blocks"));
     }
 }

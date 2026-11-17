@@ -36,14 +36,27 @@ impl PromptsManager {
             let should_write = if !path.exists() {
                 true
             } else if let Ok(existing) = std::fs::read_to_string(&path) {
-                // Upgrade unmodified v1 templates automatically while keeping custom user edits
+                // Upgrade unmodified built-in templates automatically while keeping custom user edits
                 match name {
-                    "identity.md" => !existing.contains("buddy-prompts-v4") && existing.contains("Dynamic Island capsule"),
-                    "personality.md" => {
-                        !existing.contains("buddy-prompts-v3")
-                            || existing.contains("Plan` / `Work` / `Auto")
+                    "identity.md" => {
+                        !existing.contains("buddy-prompts-v4")
+                            && existing.contains("Dynamic Island capsule")
                     }
-                    "rules.md" => !existing.contains("buddy-prompts-v4") && !existing.contains("Anti-Sycophancy"),
+                    "personality.md" => {
+                        !existing.contains("buddy-prompts-v4")
+                            && (existing.contains("Plan` / `Work` / `Auto")
+                                || (existing.contains("buddy-prompts-v3")
+                                    && existing.contains("cringey, or spamming emojis"))
+                                || (existing.contains("buddy-prompts-v2")
+                                    && existing.contains("Warm, attentive, steady")))
+                    }
+                    "rules.md" => {
+                        !existing.contains("buddy-prompts-v5")
+                            && ((existing.contains("buddy-prompts-v4")
+                                && existing.contains("regardless of prompt template or tool output language"))
+                                || (existing.contains("buddy-prompts-v1")
+                                    && !existing.contains("Anti-Sycophancy")))
+                    }
                     _ => false,
                 }
             } else {
@@ -162,6 +175,13 @@ mod tests {
         assert!(prompt.contains("Desktop Companion"));
         assert!(prompt.contains("Strict Priority Hierarchy"));
         assert!(prompt.contains("Strict Action Truthfulness"));
+        assert!(prompt.contains("Thoughts + Replies"));
+
+        // Custom user edit should NOT be clobbered on next init
+        let custom_path = dir.join("prompts").join("personality.md");
+        std::fs::write(&custom_path, "## warm_companion | Custom\nMy own voice.").unwrap();
+        let mgr2 = PromptsManager::init(&dir);
+        assert!(mgr2.build_system_prompt("warm_companion").contains("My own voice."));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
