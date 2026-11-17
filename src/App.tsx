@@ -1,12 +1,18 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Clock, Download, MessageSquare, Pause, Play, Puzzle, Settings, Square, X } from "lucide-react";
+import { Clock, Download, Loader2, MessageSquare, Pause, Play, Puzzle, Settings, Square, X } from "lucide-react";
 import ChatTab, { memoryToAttachment } from "./components/ChatTab";
-import MemoryTab from "./components/MemoryTab";
-import PluginsTab from "./components/PluginsTab";
-import SettingsTab from "./components/SettingsTab";
+const MemoryTab = lazy(() => import("./components/MemoryTab"));
+const PluginsTab = lazy(() => import("./components/PluginsTab"));
+const SettingsTab = lazy(() => import("./components/SettingsTab"));
 import { getStrings, makeWelcomeGreeting } from "./i18n";
+import {
+  clampThinkingLevel,
+  getModelThinkingCapability,
+  normalizeThinkingLevel,
+  resolveActiveChatModel,
+} from "./thinking";
 import type {
   AgentStep,
   AppSettings,
@@ -2291,13 +2297,12 @@ export default function App() {
         };
 
   const lang: UiLang = settings.ui_language === "zh" ? "zh" : "en";
-  const thinkingLevel: ThinkingLevel =
-    settings.thinking_level === "off" ||
-    settings.thinking_level === "low" ||
-    settings.thinking_level === "high" ||
-    settings.thinking_level === "max"
-      ? settings.thinking_level
-      : "medium";
+  const activeChatModel = resolveActiveChatModel(settings);
+  const thinkingCapability = getModelThinkingCapability(activeChatModel);
+  const thinkingLevel: ThinkingLevel = clampThinkingLevel(
+    normalizeThinkingLevel(settings.thinking_level),
+    thinkingCapability
+  );
   thinkingLevelRef.current = thinkingLevel;
   const ui = getStrings(lang);
 
@@ -2627,6 +2632,7 @@ export default function App() {
                   lang={lang}
                   agentMode={settings.agent_mode}
                   thinkingLevel={thinkingLevel}
+                  thinkingCapability={thinkingCapability}
                   activeStreamId={activeStreamId}
                   messages={messages}
                   conversations={conversations}
@@ -2669,68 +2675,78 @@ export default function App() {
                 />
               )}
 
-              {activeTab === "memory" && (
-                <MemoryTab
-                  lang={lang}
-                  refreshTrigger={memoryRefresh}
-                  enabledPlugins={enabledPluginsMap}
-                  onAskAi={(item) => {
-                    setAttachments((prev) => [...prev, memoryToAttachment(item)].slice(0, 6));
-                    switchTab("chat");
-                  }}
-                  onOcrExtracted={(ocrText) => {
-                    setMessages((prev) => [
-                      ...prev,
-                      {
-                        id: Date.now(),
-                        role: "assistant",
-                        text: `**Offline OCR:**\n\`\`\`\n${ocrText}\n\`\`\``,
-                      },
-                    ]);
-                    switchTab("chat");
-                  }}
-                />
-              )}
+              {(activeTab === "memory" || activeTab === "plugins" || activeTab === "settings") && (
+                <Suspense
+                  fallback={
+                    <div className="flex-1 flex items-center justify-center text-white/45">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    </div>
+                  }
+                >
+                  {activeTab === "memory" && (
+                    <MemoryTab
+                      lang={lang}
+                      refreshTrigger={memoryRefresh}
+                      enabledPlugins={enabledPluginsMap}
+                      onAskAi={(item) => {
+                        setAttachments((prev) => [...prev, memoryToAttachment(item)].slice(0, 6));
+                        switchTab("chat");
+                      }}
+                      onOcrExtracted={(ocrText) => {
+                        setMessages((prev) => [
+                          ...prev,
+                          {
+                            id: Date.now(),
+                            role: "assistant",
+                            text: `**Offline OCR:**\n\`\`\`\n${ocrText}\n\`\`\``,
+                          },
+                        ]);
+                        switchTab("chat");
+                      }}
+                    />
+                  )}
 
-              {activeTab === "plugins" && (
-                <PluginsTab
-                  lang={lang}
-                  pluginsData={pluginsData}
-                  pluginProgress={pluginProgress}
-                  lastPickedColor={lastPickedColor}
-                  timerState={timerState}
-                  droppedPathsHint={droppedPathsHint}
-                  focusedPluginId={focusedPluginId}
-                  skills={skills}
-                  onRefreshPlugins={setPluginsData}
-                  onRefreshSkills={setSkills}
-                  onCopyText={(text) => {
-                    void navigator.clipboard?.writeText(text).catch(() => {});
-                  }}
-                />
-              )}
+                  {activeTab === "plugins" && (
+                    <PluginsTab
+                      lang={lang}
+                      pluginsData={pluginsData}
+                      pluginProgress={pluginProgress}
+                      lastPickedColor={lastPickedColor}
+                      timerState={timerState}
+                      droppedPathsHint={droppedPathsHint}
+                      focusedPluginId={focusedPluginId}
+                      skills={skills}
+                      onRefreshPlugins={setPluginsData}
+                      onRefreshSkills={setSkills}
+                      onCopyText={(text) => {
+                        void navigator.clipboard?.writeText(text).catch(() => {});
+                      }}
+                    />
+                  )}
 
-              {activeTab === "settings" && (
-                <SettingsTab
-                  settings={settings}
-                  refreshHz={refreshHz}
-                  expandedDims={activeDims}
-                  appVersion={appVersion}
-                  availableUpdate={availableUpdate}
-                  updateProgress={updateProgress}
-                  onSaved={handleSettingsSaved}
-                  onTriggerSnip={() => {
-                    transitionTo(restStateOrMusic());
-                    window.setTimeout(() => void invoke("trigger_snip"), 180);
-                  }}
-                  onTestInhale={() => {
-                    transitionTo("idle");
-                    window.setTimeout(triggerCapture, 220);
-                  }}
-                  onCheckUpdate={handleCheckUpdate}
-                  onInstallUpdate={handleInstallUpdate}
-                  onResetDock={handleResetDock}
-                />
+                  {activeTab === "settings" && (
+                    <SettingsTab
+                      settings={settings}
+                      refreshHz={refreshHz}
+                      expandedDims={activeDims}
+                      appVersion={appVersion}
+                      availableUpdate={availableUpdate}
+                      updateProgress={updateProgress}
+                      onSaved={handleSettingsSaved}
+                      onTriggerSnip={() => {
+                        transitionTo(restStateOrMusic());
+                        window.setTimeout(() => void invoke("trigger_snip"), 180);
+                      }}
+                      onTestInhale={() => {
+                        transitionTo("idle");
+                        window.setTimeout(triggerCapture, 220);
+                      }}
+                      onCheckUpdate={handleCheckUpdate}
+                      onInstallUpdate={handleInstallUpdate}
+                      onResetDock={handleResetDock}
+                    />
+                  )}
+                </Suspense>
               )}
 
               {/* ULTRA-MINIMALIST BOTTOM MICRO-DOCK */}

@@ -20,11 +20,18 @@ import {
   Zap,
 } from "lucide-react";
 import { getStrings } from "../i18n";
-import { ThinkingSlider } from "./ChatTab";
+import {
+  clampThinkingLevel,
+  formatThinkingBadge,
+  getModelThinkingCapability,
+  normalizeThinkingLevel,
+  normalizeThinkingMode,
+  resolveActiveChatModel,
+} from "../thinking";
+import { getStepDisplay, ThinkingSlider } from "./ChatTab";
 import type {
   AppSettings,
   ModelProfile,
-  ThinkingLevel,
   UiLang,
   UpdateInfo,
 } from "../types";
@@ -62,6 +69,20 @@ const MODEL_PRESETS: ModelPreset[] = [
     provider: "openai",
     baseUrl: "https://api.xiaomimimo.com/v1",
     modelId: "mimo-v2-flash",
+  },
+  {
+    id: "gemini_35_flash_lite",
+    label: "Gemini 3.5 Flash Lite",
+    provider: "gemini",
+    baseUrl: "https://generativelanguage.googleapis.com",
+    modelId: "gemini-3.5-flash-lite",
+  },
+  {
+    id: "gemini_35_flash",
+    label: "Gemini 3.5 Flash",
+    provider: "gemini",
+    baseUrl: "https://generativelanguage.googleapis.com",
+    modelId: "gemini-3.5-flash",
   },
   {
     id: "gemini_flash",
@@ -267,6 +288,7 @@ function makeFallbackProfiles(cfg: AppSettings): ModelProfile[] {
       base_url: cfg.base_url,
       model_id: cfg.model_id,
       supports_vision: true,
+      thinking_mode: "auto",
       has_api_key: cfg.has_api_key,
     },
   ];
@@ -335,6 +357,7 @@ export default function SettingsTab({
       base_url: "https://generativelanguage.googleapis.com",
       model_id: "gemini-2.5-flash",
       supports_vision: true,
+      thinking_mode: "auto",
       has_api_key: false,
     };
     setIsNewProfile(true);
@@ -686,27 +709,48 @@ export default function SettingsTab({
                   />
                 </div>
 
-                <label className="flex items-center justify-between gap-2 pt-0.5 cursor-pointer select-none">
-                  <span className="text-[10.5px] text-white/70 flex items-center gap-1.5">
-                    {editingProfile.supports_vision ? (
-                      <Eye className="w-3 h-3 text-sky-300" />
-                    ) : (
-                      <EyeOff className="w-3 h-3 text-white/35" />
-                    )}
-                    <span>{s.supportsVision}</span>
-                  </span>
-                  <input
-                    type="checkbox"
-                    checked={editingProfile.supports_vision}
-                    onChange={(e) =>
-                      setEditingProfile({
-                        ...editingProfile,
-                        supports_vision: e.target.checked,
-                      })
-                    }
-                    className="accent-sky-400 w-3.5 h-3.5 rounded"
-                  />
-                </label>
+                <div className="grid grid-cols-2 gap-2 pt-0.5 items-center">
+                  <label className="flex items-center justify-between gap-2 cursor-pointer select-none">
+                    <span className="text-[10.5px] text-white/70 flex items-center gap-1.5 truncate">
+                      {editingProfile.supports_vision ? (
+                        <Eye className="w-3 h-3 text-sky-300 shrink-0" />
+                      ) : (
+                        <EyeOff className="w-3 h-3 text-white/35 shrink-0" />
+                      )}
+                      <span className="truncate">{s.supportsVision}</span>
+                    </span>
+                    <input
+                      type="checkbox"
+                      checked={editingProfile.supports_vision}
+                      onChange={(e) =>
+                        setEditingProfile({
+                          ...editingProfile,
+                          supports_vision: e.target.checked,
+                        })
+                      }
+                      className="accent-sky-400 w-3.5 h-3.5 rounded shrink-0"
+                    />
+                  </label>
+                  <div className="flex items-center gap-1.5 min-w-0">
+                    <span className="text-[10px] text-white/50 shrink-0">
+                      {s.thinkingModeLabel}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <DarkSelect
+                        compact
+                        value={normalizeThinkingMode(editingProfile.thinking_mode)}
+                        options={[
+                          { id: "auto", label: s.thinkingModeAuto },
+                          { id: "native", label: s.thinkingModeNative },
+                          { id: "prompt", label: s.thinkingModePrompt },
+                        ]}
+                        onChange={(mode) =>
+                          setEditingProfile({ ...editingProfile, thinking_mode: mode })
+                        }
+                      />
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -782,42 +826,57 @@ export default function SettingsTab({
               </div>
             </div>
 
-            {/* Thinking Effort (Horizontal Slider: Off -> Max) */}
-            <div className="pt-1.5 border-t border-white/[0.06] space-y-1">
-              <div className="flex items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="text-[11.5px] font-medium text-white">{s.thinkingLevel}</div>
+            {/* Thinking Effort (Dynamically adapts to active LLM) */}
+            {(() => {
+              const activeChatModel = resolveActiveChatModel(draft);
+              const thinkingCap = getModelThinkingCapability(activeChatModel);
+              const rawThinking = normalizeThinkingLevel(draft.thinking_level);
+              const effectiveThinking = clampThinkingLevel(rawThinking, thinkingCap);
+              const stepDisplay = getStepDisplay(effectiveThinking, lang, thinkingCap);
+              const rawDisplay = getStepDisplay(rawThinking, lang, thinkingCap);
+              const badge = formatThinkingBadge(thinkingCap, lang);
+              return (
+                <div className="pt-1.5 border-t border-white/[0.06] space-y-1">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="min-w-0 flex items-center gap-1.5">
+                      <div className="text-[11.5px] font-medium text-white shrink-0">
+                        {s.thinkingLevel}
+                      </div>
+                      <span
+                        className={`px-1.5 py-[1px] rounded-full text-[9px] border truncate ${
+                          thinkingCap.isNative
+                            ? "bg-sky-500/15 border-sky-400/25 text-sky-200"
+                            : "bg-white/[0.05] border-white/10 text-white/55"
+                        }`}
+                        title={s.thinkingLevelDesc}
+                      >
+                        {badge}
+                      </span>
+                    </div>
+                    <ThinkingSlider
+                      value={effectiveThinking}
+                      capability={thinkingCap}
+                      lang={lang}
+                      onChange={(lvl) => {
+                        const next = { ...draft, thinking_level: lvl };
+                        setDraft(next);
+                        void handleSaveDirect(next, false);
+                      }}
+                    />
+                  </div>
+                  <div className="text-[10px] text-white/45 truncate" title={stepDisplay.desc}>
+                    {stepDisplay.desc}
+                  </div>
+                  {rawThinking !== effectiveThinking && (
+                    <div className="text-[9.5px] text-amber-300/80 truncate">
+                      {s.thinkingAdapted
+                        .replace("{from}", rawDisplay.label)
+                        .replace("{to}", stepDisplay.label)}
+                    </div>
+                  )}
                 </div>
-                <ThinkingSlider
-                  value={
-                    (draft.thinking_level === "off" ||
-                    draft.thinking_level === "low" ||
-                    draft.thinking_level === "high" ||
-                    draft.thinking_level === "max"
-                      ? draft.thinking_level
-                      : "medium") as ThinkingLevel
-                  }
-                  lang={lang}
-                  onChange={(lvl) => {
-                    const next = { ...draft, thinking_level: lvl };
-                    setDraft(next);
-                    void handleSaveDirect(next, false);
-                  }}
-                />
-              </div>
-              <div className="text-[10px] text-white/45 truncate">
-                {
-                  getStrings(lang).chat.thinkLevels[
-                    (draft.thinking_level === "off" ||
-                    draft.thinking_level === "low" ||
-                    draft.thinking_level === "high" ||
-                    draft.thinking_level === "max"
-                      ? draft.thinking_level
-                      : "medium") as ThinkingLevel
-                  ].desc
-                }
-              </div>
-            </div>
+              );
+            })()}
 
             {/* Desktop Agent Mode + Workspace */}
             <div className="pt-1.5 border-t border-white/[0.06] space-y-1.5">

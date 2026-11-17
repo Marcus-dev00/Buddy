@@ -51,6 +51,18 @@ fn default_chat_profile_id() -> String {
     "prof_default".to_string()
 }
 
+fn default_thinking_mode() -> String {
+    "auto".to_string()
+}
+
+fn normalize_thinking_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "native" => "native".to_string(),
+        "prompt" => "prompt".to_string(),
+        _ => "auto".to_string(),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelProfile {
     pub id: String,
@@ -61,6 +73,8 @@ pub struct ModelProfile {
     pub model_id: String,
     #[serde(default = "default_true")]
     pub supports_vision: bool,
+    #[serde(default = "default_thinking_mode")]
+    pub thinking_mode: String, // "auto" | "native" | "prompt"
     #[serde(default)]
     pub has_api_key: bool,
 }
@@ -74,6 +88,7 @@ pub struct ResolvedModelConfig {
     pub base_url: String,
     pub model_id: String,
     pub supports_vision: bool,
+    pub thinking_mode: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -121,6 +136,7 @@ impl Default for AppSettings {
             base_url: "https://api.xiaomimimo.com/v1".to_string(),
             model_id: "mimo-v2-flash".to_string(),
             supports_vision: true,
+            thinking_mode: default_thinking_mode(),
             has_api_key: false,
         };
         Self {
@@ -215,6 +231,7 @@ impl SettingsManager {
                 base_url: settings.base_url.clone(),
                 model_id: settings.model_id.clone(),
                 supports_vision: true,
+                thinking_mode: default_thinking_mode(),
                 has_api_key: legacy_key_exists,
             });
             settings.chat_profile_id = def_id;
@@ -248,6 +265,7 @@ impl SettingsManager {
     ) {
         for prof in &mut settings.model_profiles {
             prof.id = sanitize_profile_id(&prof.id);
+            prof.thinking_mode = normalize_thinking_mode(&prof.thinking_mode);
             let kp = keys_dir.join(format!("{}.dpapi", prof.id));
             let has_kp = kp.exists()
                 && std::fs::read_to_string(&kp)
@@ -356,6 +374,7 @@ impl SettingsManager {
                 base_url: next.base_url.clone(),
                 model_id: next.model_id.clone(),
                 supports_vision: true,
+                thinking_mode: default_thinking_mode(),
                 has_api_key: false,
             });
         }
@@ -398,6 +417,7 @@ impl SettingsManager {
         set_as_watch: bool,
     ) -> Result<AppSettings, String> {
         profile.id = sanitize_profile_id(&profile.id);
+        profile.thinking_mode = normalize_thinking_mode(&profile.thinking_mode);
         if profile.name.trim().is_empty() {
             profile.name = derive_profile_name(&profile.api_provider, &profile.model_id);
         }
@@ -558,6 +578,7 @@ impl SettingsManager {
                 base_url: cfg.base_url.clone(),
                 model_id: cfg.model_id.clone(),
                 supports_vision: true,
+                thinking_mode: default_thinking_mode(),
                 has_api_key: cfg.has_api_key,
             });
 
@@ -570,6 +591,7 @@ impl SettingsManager {
                 base_url: chosen.base_url,
                 model_id: chosen.model_id,
                 supports_vision: chosen.supports_vision,
+                thinking_mode: normalize_thinking_mode(&chosen.thinking_mode),
             },
             key,
         )
@@ -895,6 +917,7 @@ mod tests {
             base_url: "https://generativelanguage.googleapis.com".to_string(),
             model_id: "gemini-2.5-flash".to_string(),
             supports_vision: true,
+            thinking_mode: default_thinking_mode(),
             has_api_key: false,
         };
         let saved = mgr.save_profile(prof2, None, false, true).unwrap();

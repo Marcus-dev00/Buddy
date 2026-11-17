@@ -2,6 +2,17 @@
 
 All notable changes to **Buddy** are documented in this file.
 
+## [0.2.1] - 2026-11-18
+
+### Added
+- **Dynamic Per-LLM Thinking Adaptation**: Automatically adapts available thinking tiers and UI controls to the active model (`Gemini 3 / 3.5` `thinkingLevel`, `Gemini 2.5` `thinkingBudget`, `Claude 3.7–4.6` `budget_tokens`, `Claude 4.7+ / 5.x` `adaptive` + `effort`, `OpenAI` `o1/o3/o4-mini/GPT-5` `reasoning_effort`, `DeepSeek` & `Xiaomi MiMo` toggles, plus `Prompt` mode for non-reasoning/custom models), clamping saved preferences safely when switching models.
+- **Manual Thinking Mode Override & Gemini 3.5 Presets**: Added per-profile **Thinking Mode** override (`Auto Detect` / `Force Native` / `Prompt Only`) in Settings alongside `Gemini 3.5 Flash Lite` and `Gemini 3.5 Flash` presets.
+- **Multi-Turn Tool Thinking Continuity**: Preserved Anthropic `thinking` / `signature` / `redacted_thinking` blocks and DeepSeek/MiMo `reasoning_content` across multi-step Agent tool loops.
+
+### Improved
+- **Transient Error Resilience & Safe Downgrade**: Added exponential backoff auto-retry (`429 / 500 / 502 / 503 / 504`, timeout/connect spikes, respecting `Retry-After` and user cancellation) across streaming chat and background watch/compaction requests, plus automatic one-shot stripping/downgrade if a proxy rejects native thinking parameters (`400/422`).
+- **Frontend Tab Code Splitting & Release Workflow**: Lazy-loaded `MemoryTab`, `PluginsTab`, and `SettingsTab` to bring the initial JS bundle under 500 kB, updated bilingual READMEs, upgraded GitHub Actions checkout/setup-node to Node 24 runtimes, and automated `CHANGELOG.md` extraction for GitHub Release notes.
+
 ## [0.2.0] - 2026-11-17
 
 ### Added

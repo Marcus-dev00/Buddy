@@ -185,6 +185,8 @@ export interface PersonalityOption {
   label: string;
 }
 
+export type ThinkingModeOverride = "auto" | "native" | "prompt";
+
 export interface ModelProfile {
   id: string;
   name: string;
@@ -192,6 +194,7 @@ export interface ModelProfile {
   base_url: string;
   model_id: string;
   supports_vision: boolean;
+  thinking_mode?: ThinkingModeOverride | string;
   has_api_key: boolean;
 }
 

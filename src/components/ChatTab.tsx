@@ -37,6 +37,11 @@ import {
   XCircle,
 } from "lucide-react";
 import { formatRelativeTime, getStrings } from "../i18n";
+import {
+  ALL_THINKING_LEVELS,
+  formatThinkingBadge,
+  type ModelThinkingCapability,
+} from "../thinking";
 import type {
   AgentStep,
   ApprovalDecision,
@@ -110,6 +115,7 @@ interface ChatTabProps {
   lang: UiLang;
   agentMode: boolean;
   thinkingLevel: ThinkingLevel;
+  thinkingCapability?: ModelThinkingCapability;
   activeStreamId: string | null;
   messages: ChatMessage[];
   conversations: ConversationSummary[];
@@ -334,23 +340,51 @@ function ThoughtBox({
   );
 }
 
-export const THINKING_STEPS: ThinkingLevel[] = ["off", "low", "medium", "high", "max"];
+export const THINKING_STEPS: ThinkingLevel[] = ALL_THINKING_LEVELS;
+
+const DEFAULT_THINKING_CAP: ModelThinkingCapability = {
+  levels: ALL_THINKING_LEVELS,
+  isNative: false,
+  familyName: "Prompt",
+};
+
+export function getStepDisplay(
+  step: ThinkingLevel,
+  lang: UiLang,
+  cap: ModelThinkingCapability = DEFAULT_THINKING_CAP
+): { short: string; label: string; desc: string } {
+  const s = getStrings(lang).chat;
+  const base = s.thinkLevels[step];
+  const ov = cap.stepOverrides?.[step];
+  if (!ov) return base;
+  return {
+    short: ov.short,
+    label: ov.label,
+    desc: lang === "zh" ? ov.descZh : ov.descEn,
+  };
+}
 
 export function ThinkingSlider({
   value,
   lang,
+  capability,
   disabled,
   compact,
   onChange,
 }: {
   value: ThinkingLevel;
   lang: UiLang;
+  capability?: ModelThinkingCapability;
   disabled?: boolean;
   compact?: boolean;
   onChange: (next: ThinkingLevel) => void;
 }) {
   const s = getStrings(lang).chat;
-  const idx = Math.max(0, THINKING_STEPS.indexOf(value));
+  const cap = capability ?? DEFAULT_THINKING_CAP;
+  const steps = cap.levels.length > 0 ? cap.levels : THINKING_STEPS;
+  const rawIdx = steps.indexOf(value);
+  const idx = rawIdx >= 0 ? rawIdx : 0;
+  const count = steps.length;
   const trackRef = useRef<HTMLDivElement | null>(null);
   const draggingRef = useRef(false);
 
@@ -360,23 +394,42 @@ export function ThinkingSlider({
     const rect = el.getBoundingClientRect();
     if (rect.width <= 0) return;
     const ratio = Math.max(0, Math.min(0.999, (clientX - rect.left) / rect.width));
-    const nextIdx = Math.floor(ratio * 5);
-    const next = THINKING_STEPS[nextIdx];
+    const nextIdx = Math.floor(ratio * count);
+    const next = steps[nextIdx];
     if (next && next !== value) {
       onChange(next);
     }
   };
 
+  const activeStep = steps[idx] ?? "medium";
   const accentBar =
-    idx === 0
+    activeStep === "off"
       ? "bg-white/25"
-      : idx === 1
+      : activeStep === "low"
       ? "bg-white/60"
-      : idx === 2
+      : activeStep === "medium"
       ? "bg-sky-400"
-      : idx === 3
+      : activeStep === "high"
       ? "bg-indigo-400"
       : "bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.75)]";
+
+  const widthClass = compact
+    ? count <= 2
+      ? "w-[82px] h-[24px]"
+      : count === 3
+      ? "w-[110px] h-[24px]"
+      : count === 4
+      ? "w-[128px] h-[24px]"
+      : "w-[144px] h-[24px]"
+    : count <= 2
+    ? "w-[116px] h-[26px]"
+    : count === 3
+    ? "w-[148px] h-[26px]"
+    : count === 4
+    ? "w-[174px] h-[26px]"
+    : "w-[196px] h-[26px]";
+
+  const badgeText = formatThinkingBadge(cap, lang);
 
   return (
     <div
@@ -384,7 +437,7 @@ export function ThinkingSlider({
       role="slider"
       aria-label={s.thinkPrefix}
       aria-valuemin={0}
-      aria-valuemax={4}
+      aria-valuemax={Math.max(0, count - 1)}
       aria-valuenow={idx}
       onPointerDown={(e) => {
         if (disabled) return;
@@ -409,28 +462,29 @@ export function ThinkingSlider({
       onPointerCancel={() => {
         draggingRef.current = false;
       }}
-      className={`relative grid grid-cols-5 items-center rounded-lg bg-[#08090d] border border-white/[0.09] p-[2px] select-none touch-none ${
-        compact ? "w-[144px] h-[24px]" : "w-[196px] h-[26px]"
-      } ${disabled ? "opacity-45 pointer-events-none" : "cursor-pointer"}`}
+      style={{ gridTemplateColumns: `repeat(${count}, minmax(0, 1fr))` }}
+      className={`relative grid items-center rounded-lg bg-[#08090d] border border-white/[0.09] p-[2px] select-none touch-none ${widthClass} ${
+        disabled ? "opacity-45 pointer-events-none" : "cursor-pointer"
+      }`}
     >
       {/* Smooth Gliding Elevated Thumb (Codex / Claude Code matte glass) */}
       <div
         className="pointer-events-none absolute top-[2px] bottom-[2px] left-[2px] rounded-[6px] bg-white/[0.11] border border-white/[0.15] shadow-[0_1px_4px_rgba(0,0,0,0.65)] flex flex-col justify-end items-center pb-[1.5px] transition-transform duration-200 ease-out"
         style={{
-          width: "calc((100% - 4px) / 5)",
+          width: `calc((100% - 4px) / ${count})`,
           transform: `translateX(${idx * 100}%)`,
         }}
       >
         <span className={`w-3.5 h-[1.5px] rounded-full transition-colors ${accentBar}`} />
       </div>
 
-      {THINKING_STEPS.map((step, i) => {
+      {steps.map((step, i) => {
         const active = i === idx;
-        const stepInfo = s.thinkLevels[step];
+        const stepInfo = getStepDisplay(step, lang, cap);
         return (
           <div
             key={step}
-            title={stepInfo.desc}
+            title={`${badgeText} — ${stepInfo.desc}`}
             className={`relative z-10 text-center text-[9.5px] tracking-tight transition-colors ${
               active
                 ? step === "max"
@@ -451,6 +505,7 @@ export default function ChatTab({
   lang,
   agentMode,
   thinkingLevel,
+  thinkingCapability,
   activeStreamId,
   messages,
   conversations,
@@ -788,6 +843,7 @@ export default function ChatTab({
           <ThinkingSlider
             compact
             value={thinkingLevel}
+            capability={thinkingCapability}
             lang={lang}
             disabled={isThinking}
             onChange={onChangeThinkingLevel}

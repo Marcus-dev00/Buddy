@@ -84,8 +84,10 @@ enum TurnOutcome {
     ToolCalls {
         turn_text: String,
         turn_thought: String,
+        native_reasoning: String,
         calls: Vec<ParsedToolCall>,
         gemini_raw_parts: Vec<Value>,
+        anthropic_raw_blocks: Vec<Value>,
     },
 }
 
@@ -215,6 +217,607 @@ fn trailing_tag_prefix_len(text: &str, tag: &str) -> usize {
         }
     }
     0
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ApiProtocol {
+    OpenAi,
+    Anthropic,
+    Gemini,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThinkingBackend {
+    PromptOnly,
+    GeminiBudget { pro_min: bool },
+    GeminiLevel { allow_minimal: bool },
+    AnthropicBudget,
+    AnthropicAdaptive,
+    OpenAiEffort { allow_minimal: bool, allow_xhigh: bool },
+    DeepSeekChat,
+    BinaryThinkingToggle,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ThinkingCapability {
+    levels: &'static [&'static str],
+    backend: ThinkingBackend,
+}
+
+const LEVELS_ALL: &[&str] = &["off", "low", "medium", "high", "max"];
+const LEVELS_FLASH_3: &[&str] = &["off", "low", "medium", "high"];
+const LEVELS_NO_OFF_4: &[&str] = &["low", "medium", "high", "max"];
+const LEVELS_3_TIER: &[&str] = &["low", "medium", "high"];
+const LEVELS_DEEPSEEK_CHAT: &[&str] = &["off", "low", "high", "max"];
+const LEVELS_DEEPSEEK_R1: &[&str] = &["low", "high", "max"];
+const LEVELS_BINARY: &[&str] = &["off", "high"];
+
+fn strip_vendor_prefix(model_lower: &str) -> &str {
+    let trimmed = model_lower.trim().trim_start_matches("models/");
+    trimmed.rsplit('/').next().unwrap_or(trimmed)
+}
+
+fn parse_claude_version(model_lower: &str) -> Option<(u8, u8)> {
+    // Handles patterns like claude-sonnet-4-5, claude-3-7-sonnet, claude-opus-4.7, claude-sonnet-5
+    let m = strip_vendor_prefix(model_lower);
+    if !m.contains("claude") && !m.contains("opus") && !m.contains("sonnet") && !m.contains("haiku") {
+        return None;
+    }
+    let tokens: Vec<&str> = m.split(|c: char| !c.is_ascii_alphanumeric()).collect();
+    for i in 0..tokens.len() {
+        let Ok(major) = tokens[i].parse::<u8>() else {
+            continue;
+        };
+        if !(3..=9).contains(&major) {
+            continue;
+        }
+        let minor = tokens
+            .get(i + 1)
+            .and_then(|t| t.parse::<u8>().ok())
+            .filter(|&n| n <= 20)
+            .unwrap_or(0);
+        return Some((major, minor));
+    }
+    None
+}
+
+fn has_gemini_gen3_plus(model_lower: &str) -> bool {
+    let m = strip_vendor_prefix(model_lower);
+    m.contains("gemini-3")
+        || m.contains("gemini3")
+        || m.contains("gemini-4")
+        || m.contains("gemini4")
+}
+
+fn parse_gpt5_minor(model_lower: &str) -> Option<(u8, bool)> {
+    let m = strip_vendor_prefix(model_lower);
+    let idx = m.find("gpt-5")?;
+    let rest = &m[idx + "gpt-5".len()..];
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let minor: u8 = after_dot
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0);
+        return Some((minor, m.contains("-pro")));
+    }
+    if rest.is_empty() || rest.starts_with('-') {
+        return Some((0, m.contains("-pro")));
+    }
+    None
+}
+
+fn is_openai_o_series(model_lower: &str) -> bool {
+    let m = strip_vendor_prefix(model_lower);
+    if m == "o1-mini" || m == "o1-preview" {
+        return false;
+    }
+    m == "o1"
+        || m.starts_with("o1-")
+        || m == "o3"
+        || m.starts_with("o3-")
+        || m == "o4"
+        || m.starts_with("o4-")
+}
+
+fn infer_thinking_capability(
+    api_provider: &str,
+    base_url: &str,
+    model_id: &str,
+) -> ThinkingCapability {
+    let (_, is_anthropic, is_gemini, clean_url) = classify_protocol(api_provider, base_url);
+    let url_lower = clean_url.to_ascii_lowercase();
+    let model_lower = model_id.trim().to_ascii_lowercase();
+    let model_short = strip_vendor_prefix(&model_lower);
+
+    if is_gemini {
+        if has_gemini_gen3_plus(&model_lower) {
+            if model_short.contains("pro") {
+                return ThinkingCapability {
+                    levels: LEVELS_3_TIER,
+                    backend: ThinkingBackend::GeminiLevel {
+                        allow_minimal: false,
+                    },
+                };
+            }
+            return ThinkingCapability {
+                levels: LEVELS_FLASH_3,
+                backend: ThinkingBackend::GeminiLevel {
+                    allow_minimal: true,
+                },
+            };
+        }
+        if model_short.contains("2.5") || model_short.contains("thinking") {
+            let is_pro = model_short.contains("pro");
+            return ThinkingCapability {
+                levels: if is_pro { LEVELS_NO_OFF_4 } else { LEVELS_ALL },
+                backend: ThinkingBackend::GeminiBudget { pro_min: is_pro },
+            };
+        }
+        return ThinkingCapability {
+            levels: LEVELS_ALL,
+            backend: ThinkingBackend::PromptOnly,
+        };
+    }
+
+    if is_anthropic {
+        if let Some((major, minor)) = parse_claude_version(&model_lower) {
+            if (major, minor) >= (4, 7) {
+                return ThinkingCapability {
+                    levels: LEVELS_ALL,
+                    backend: ThinkingBackend::AnthropicAdaptive,
+                };
+            }
+            if (major, minor) >= (3, 7) {
+                return ThinkingCapability {
+                    levels: LEVELS_ALL,
+                    backend: ThinkingBackend::AnthropicBudget,
+                };
+            }
+        }
+        return ThinkingCapability {
+            levels: LEVELS_ALL,
+            backend: ThinkingBackend::PromptOnly,
+        };
+    }
+
+    if url_lower.contains("xiaomimimo.com") || model_short.starts_with("mimo") {
+        return ThinkingCapability {
+            levels: LEVELS_BINARY,
+            backend: ThinkingBackend::BinaryThinkingToggle,
+        };
+    }
+
+    if url_lower.contains("deepseek.com") || model_short.starts_with("deepseek") {
+        let is_reasoner = model_short.contains("reasoner") || model_short.contains("r1");
+        if url_lower.contains("deepseek.com") {
+            if is_reasoner {
+                return ThinkingCapability {
+                    levels: LEVELS_DEEPSEEK_R1,
+                    backend: ThinkingBackend::OpenAiEffort {
+                        allow_minimal: false,
+                        allow_xhigh: false,
+                    },
+                };
+            }
+            return ThinkingCapability {
+                levels: LEVELS_DEEPSEEK_CHAT,
+                backend: ThinkingBackend::DeepSeekChat,
+            };
+        }
+        return ThinkingCapability {
+            levels: if is_reasoner {
+                LEVELS_NO_OFF_4
+            } else {
+                LEVELS_ALL
+            },
+            backend: ThinkingBackend::PromptOnly,
+        };
+    }
+
+    if is_openai_o_series(&model_lower) {
+        return ThinkingCapability {
+            levels: LEVELS_3_TIER,
+            backend: ThinkingBackend::OpenAiEffort {
+                allow_minimal: false,
+                allow_xhigh: false,
+            },
+        };
+    }
+
+    if let Some((minor, is_pro)) = parse_gpt5_minor(&model_lower) {
+        let supports_xhigh = minor >= 2 || is_pro;
+        return ThinkingCapability {
+            levels: if supports_xhigh {
+                LEVELS_ALL
+            } else {
+                LEVELS_FLASH_3
+            },
+            backend: ThinkingBackend::OpenAiEffort {
+                allow_minimal: true,
+                allow_xhigh: supports_xhigh,
+            },
+        };
+    }
+
+    ThinkingCapability {
+        levels: LEVELS_ALL,
+        backend: ThinkingBackend::PromptOnly,
+    }
+}
+
+fn infer_thinking_capability_with_mode(
+    api_provider: &str,
+    base_url: &str,
+    model_id: &str,
+    thinking_mode: &str,
+) -> ThinkingCapability {
+    let mode = thinking_mode.trim().to_ascii_lowercase();
+    if mode == "prompt" {
+        return ThinkingCapability {
+            levels: LEVELS_ALL,
+            backend: ThinkingBackend::PromptOnly,
+        };
+    }
+    let auto = infer_thinking_capability(api_provider, base_url, model_id);
+    if mode == "native" && auto.backend == ThinkingBackend::PromptOnly {
+        let (_, is_anthropic, is_gemini, _) = classify_protocol(api_provider, base_url);
+        if is_gemini {
+            return ThinkingCapability {
+                levels: LEVELS_FLASH_3,
+                backend: ThinkingBackend::GeminiLevel {
+                    allow_minimal: true,
+                },
+            };
+        }
+        if is_anthropic {
+            return ThinkingCapability {
+                levels: LEVELS_ALL,
+                backend: ThinkingBackend::AnthropicAdaptive,
+            };
+        }
+        return ThinkingCapability {
+            levels: LEVELS_FLASH_3,
+            backend: ThinkingBackend::OpenAiEffort {
+                allow_minimal: true,
+                allow_xhigh: false,
+            },
+        };
+    }
+    auto
+}
+
+fn level_rank(level: &str) -> i32 {
+    match level {
+        "off" => 0,
+        "low" => 1,
+        "medium" => 2,
+        "high" => 3,
+        "max" => 4,
+        _ => 2,
+    }
+}
+
+fn clamp_thinking_level(requested: &str, cap: &ThinkingCapability) -> &'static str {
+    let norm = normalize_thinking_level(requested);
+    for &lvl in cap.levels {
+        if lvl == norm {
+            return lvl;
+        }
+    }
+    let req_rank = level_rank(norm);
+    // Never downgrade an explicitly active thinking level to "off" if an active level exists.
+    let candidates: Vec<&'static str> = if norm != "off" {
+        let non_off: Vec<&'static str> = cap
+            .levels
+            .iter()
+            .copied()
+            .filter(|&l| l != "off")
+            .collect();
+        if non_off.is_empty() {
+            cap.levels.to_vec()
+        } else {
+            non_off
+        }
+    } else {
+        cap.levels.to_vec()
+    };
+
+    candidates
+        .into_iter()
+        .min_by_key(|&lvl| ((level_rank(lvl) - req_rank).abs(), level_rank(lvl)))
+        .unwrap_or("medium")
+}
+
+/// Applies provider-native thinking fields to `body` and reports whether any native fields were injected.
+fn apply_native_thinking(body: &mut Value, backend: ThinkingBackend, effective_level: &str) -> bool {
+    match backend {
+        ThinkingBackend::PromptOnly => false,
+        ThinkingBackend::GeminiBudget { pro_min } => {
+            let cfg = match effective_level {
+                "off" if !pro_min => json!({ "thinkingBudget": 0, "includeThoughts": false }),
+                "off" => json!({ "thinkingBudget": 128, "includeThoughts": false }),
+                "low" => json!({ "thinkingBudget": 1024, "includeThoughts": true }),
+                "high" => json!({ "thinkingBudget": 10240, "includeThoughts": true }),
+                "max" => json!({ "thinkingBudget": 24576, "includeThoughts": true }),
+                _ => json!({ "thinkingBudget": 4096, "includeThoughts": true }),
+            };
+            body["generationConfig"]["thinkingConfig"] = cfg;
+            true
+        }
+        ThinkingBackend::GeminiLevel { allow_minimal } => {
+            let (lvl_str, include_thoughts) = match effective_level {
+                "off" if allow_minimal => ("minimal", false),
+                "off" | "low" => ("low", effective_level != "off"),
+                "high" | "max" => ("high", true),
+                _ => ("medium", true),
+            };
+            body["generationConfig"]["thinkingConfig"] = json!({
+                "thinkingLevel": lvl_str,
+                "includeThoughts": include_thoughts
+            });
+            true
+        }
+        ThinkingBackend::AnthropicBudget => {
+            if effective_level == "off" {
+                return false;
+            }
+            let (budget, max_tok) = match effective_level {
+                "low" => (1024_u64, 8192_u64),
+                "high" => (10240_u64, 20480_u64),
+                "max" => (20480_u64, 32000_u64),
+                _ => (4096_u64, 12288_u64),
+            };
+            body["max_tokens"] = json!(max_tok);
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            true
+        }
+        ThinkingBackend::AnthropicAdaptive => {
+            if effective_level == "off" {
+                return false;
+            }
+            let effort = match effective_level {
+                "low" => "low",
+                "high" => "high",
+                "max" => "max",
+                _ => "medium",
+            };
+            body["max_tokens"] = json!(16384_u64);
+            body["thinking"] = json!({ "type": "adaptive" });
+            body["output_config"] = json!({ "effort": effort });
+            true
+        }
+        ThinkingBackend::OpenAiEffort {
+            allow_minimal,
+            allow_xhigh,
+        } => {
+            let effort = match effective_level {
+                "off" if allow_minimal => "minimal",
+                "off" | "low" => "low",
+                "high" => "high",
+                "max" if allow_xhigh => "xhigh",
+                "max" => "high",
+                _ => "medium",
+            };
+            body["reasoning_effort"] = json!(effort);
+            true
+        }
+        ThinkingBackend::DeepSeekChat => {
+            if effective_level == "off" {
+                body["thinking"] = json!({ "type": "disabled" });
+            } else {
+                let effort = match effective_level {
+                    "low" => "low",
+                    "max" => "max",
+                    _ => "high",
+                };
+                body["thinking"] = json!({ "type": "enabled" });
+                body["reasoning_effort"] = json!(effort);
+            }
+            true
+        }
+        ThinkingBackend::BinaryThinkingToggle => {
+            body["thinking"] = json!({
+                "type": if effective_level == "off" { "disabled" } else { "enabled" }
+            });
+            true
+        }
+    }
+}
+
+fn strip_native_thinking(body: &mut Value, protocol: ApiProtocol) {
+    match protocol {
+        ApiProtocol::Gemini => {
+            if let Some(gen_cfg) = body.get_mut("generationConfig").and_then(|v| v.as_object_mut())
+            {
+                gen_cfg.remove("thinkingConfig");
+                if gen_cfg.is_empty() {
+                    if let Some(root) = body.as_object_mut() {
+                        root.remove("generationConfig");
+                    }
+                }
+            }
+        }
+        ApiProtocol::Anthropic => {
+            if let Some(root) = body.as_object_mut() {
+                root.remove("thinking");
+                root.remove("output_config");
+                if root
+                    .get("max_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0)
+                    > 4096
+                {
+                    root.insert("max_tokens".to_string(), json!(4096));
+                }
+            }
+        }
+        ApiProtocol::OpenAi => {
+            if let Some(root) = body.as_object_mut() {
+                root.remove("reasoning_effort");
+                root.remove("thinking");
+            }
+        }
+    }
+}
+
+fn is_thinking_param_rejection(status: reqwest::StatusCode, err_txt: &str) -> bool {
+    let code = status.as_u16();
+    if code != 400 && code != 422 {
+        return false;
+    }
+    let low = err_txt.to_ascii_lowercase();
+    let mentions_field = low.contains("thinking")
+        || low.contains("reasoning")
+        || low.contains("budget")
+        || low.contains("effort")
+        || low.contains("output_config")
+        || low.contains("thought");
+    let mentions_invalid = low.contains("unknown")
+        || low.contains("unsupported")
+        || low.contains("unrecognized")
+        || low.contains("invalid")
+        || low.contains("extra")
+        || low.contains("unexpected");
+    mentions_field && mentions_invalid
+}
+
+fn retry_delay_ms(attempt: usize, retry_after_secs: Option<u64>) -> u64 {
+    let base_ms: u64 = match attempt {
+        0 => 1200,
+        1 => 2600,
+        _ => 5200,
+    };
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 350) as u64)
+        .unwrap_or(0);
+    let computed = base_ms + jitter_ms;
+    retry_after_secs
+        .map(|s| s.clamp(1, 15) * 1000)
+        .unwrap_or(0)
+        .max(computed)
+        .min(15_000)
+}
+
+async fn sleep_cancellable(ms: u64, cancel_flag: Option<&AtomicBool>) -> bool {
+    let mut elapsed = 0_u64;
+    while elapsed < ms {
+        if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return false;
+        }
+        let step = (ms - elapsed).min(120);
+        tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+        elapsed += step;
+    }
+    !cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_post_with_retry(
+    client: &reqwest::Client,
+    protocol: ApiProtocol,
+    endpoint: &str,
+    api_key: &str,
+    body: &mut Value,
+    native_thinking_injected: bool,
+    cancel_flag: Option<&AtomicBool>,
+    max_attempts: usize,
+) -> Result<reqwest::Response, String> {
+    let mut downgraded = false;
+    let mut attempt = 0_usize;
+    let max_tries = max_attempts.max(1);
+
+    loop {
+        if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err("Cancelled by user.".to_string());
+        }
+
+        let mut req = client.post(endpoint);
+        match protocol {
+            ApiProtocol::Gemini => {
+                req = req.header("x-goog-api-key", api_key.trim());
+            }
+            ApiProtocol::Anthropic => {
+                req = req
+                    .header("x-api-key", api_key.trim())
+                    .header("anthropic-version", "2023-06-01");
+            }
+            ApiProtocol::OpenAi => {
+                if !api_key.trim().is_empty() {
+                    req = req.bearer_auth(api_key.trim());
+                }
+            }
+        }
+        let resp_res = req.json(body).send().await;
+
+        match resp_res {
+            Err(e) => {
+                if (e.is_timeout() || e.is_connect()) && attempt + 1 < max_tries {
+                    let wait_ms = retry_delay_ms(attempt, None);
+                    attempt += 1;
+                    crate::logger::log_warn(
+                        "ai",
+                        &format!("transient network error ({e}); retrying in {wait_ms}ms"),
+                    );
+                    if !sleep_cancellable(wait_ms, cancel_flag).await {
+                        return Err("Cancelled by user.".to_string());
+                    }
+                    continue;
+                }
+                return Err(format!("Request failed: {e}"));
+            }
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    return Ok(resp);
+                }
+                let status = resp.status();
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                let err_txt = resp.text().await.unwrap_or_default();
+
+                if native_thinking_injected
+                    && !downgraded
+                    && is_thinking_param_rejection(status, &err_txt)
+                {
+                    strip_native_thinking(body, protocol);
+                    downgraded = true;
+                    crate::logger::log_warn(
+                        "ai",
+                        &format!(
+                            "API rejected native thinking params ({status}); retrying without native thinking"
+                        ),
+                    );
+                    continue;
+                }
+
+                let is_transient = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
+                if is_transient && attempt + 1 < max_tries {
+                    let wait_ms = retry_delay_ms(attempt, retry_after);
+                    attempt += 1;
+                    crate::logger::log_warn(
+                        "ai",
+                        &format!(
+                            "transient HTTP {status} on attempt {attempt}; retrying in {wait_ms}ms"
+                        ),
+                    );
+                    if !sleep_cancellable(wait_ms, cancel_flag).await {
+                        return Err("Cancelled by user.".to_string());
+                    }
+                    continue;
+                }
+
+                return Err(format!(
+                    "API returned {status}: {}",
+                    err_txt.chars().take(240).collect::<String>()
+                ));
+            }
+        }
+    }
 }
 
 fn normalize_thinking_level(raw: &str) -> &'static str {
@@ -612,6 +1215,10 @@ struct AnthropicBlock {
     id: String,
     name: String,
     partial_json: String,
+    text: String,
+    thinking_text: String,
+    signature: String,
+    redacted_data: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -625,6 +1232,7 @@ async fn run_openai_turn(
     agent_mode: bool,
     include_media_downloader: bool,
     thinking_level: &str,
+    thinking_backend: ThinkingBackend,
     stream_id: &str,
     turn_idx: usize,
     cancel_flag: &AtomicBool,
@@ -635,28 +1243,27 @@ async fn run_openai_turn(
         "stream": true,
         "messages": messages
     });
+    let native_thinking = apply_native_thinking(&mut body, thinking_backend, thinking_level);
     if agent_mode {
         body["tools"] = openai_tools_json(include_media_downloader);
         body["tool_choice"] = json!("auto");
     }
 
-    let mut req = client.post(&endpoint).json(&body);
-    if !api_key.is_empty() {
-        req = req.bearer_auth(api_key);
-    }
-
-    let mut resp = req.send().await.map_err(|e| format!("Request failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_txt = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "API returned {status}: {}",
-            err_txt.chars().take(240).collect::<String>()
-        ));
-    }
+    let mut resp = send_post_with_retry(
+        client,
+        ApiProtocol::OpenAi,
+        &endpoint,
+        api_key,
+        &mut body,
+        native_thinking,
+        Some(cancel_flag),
+        4,
+    )
+    .await?;
 
     let mut turn_text = String::new();
     let mut turn_thought = String::new();
+    let mut native_reasoning = String::new();
     let mut splitter = ThoughtTagSplitter::new(thinking_level != "off");
     let mut sse_buffer = String::new();
     let mut partial_tools: BTreeMap<usize, OpenAiPartialTool> = BTreeMap::new();
@@ -690,9 +1297,12 @@ async fn run_openai_turn(
                             .as_str()
                             .or_else(|| delta_obj["reasoning"].as_str())
                         {
-                            if !rc.is_empty() && thinking_level != "off" {
-                                turn_thought.push_str(rc);
-                                emit_thought(app, stream_id, rc);
+                            if !rc.is_empty() {
+                                native_reasoning.push_str(rc);
+                                if thinking_level != "off" {
+                                    turn_thought.push_str(rc);
+                                    emit_thought(app, stream_id, rc);
+                                }
                             }
                         }
                         if let Some(delta) = delta_obj["content"].as_str() {
@@ -775,8 +1385,10 @@ async fn run_openai_turn(
         Ok(TurnOutcome::ToolCalls {
             turn_text,
             turn_thought,
+            native_reasoning,
             calls,
             gemini_raw_parts: Vec::new(),
+            anthropic_raw_blocks: Vec::new(),
         })
     }
 }
@@ -793,6 +1405,7 @@ async fn run_anthropic_turn(
     agent_mode: bool,
     include_media_downloader: bool,
     thinking_level: &str,
+    thinking_backend: ThinkingBackend,
     stream_id: &str,
     turn_idx: usize,
     cancel_flag: &AtomicBool,
@@ -809,27 +1422,22 @@ async fn run_anthropic_turn(
         "system": sys_prompt,
         "messages": messages
     });
+    let native_thinking = apply_native_thinking(&mut body, thinking_backend, thinking_level);
     if agent_mode {
         body["tools"] = anthropic_tools_json(include_media_downloader);
     }
 
-    let mut resp = client
-        .post(&endpoint)
-        .header("x-api-key", api_key)
-        .header("anthropic-version", "2023-06-01")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_txt = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "API returned {status}: {}",
-            err_txt.chars().take(240).collect::<String>()
-        ));
-    }
+    let mut resp = send_post_with_retry(
+        client,
+        ApiProtocol::Anthropic,
+        &endpoint,
+        api_key,
+        &mut body,
+        native_thinking,
+        Some(cancel_flag),
+        4,
+    )
+    .await?;
 
     let mut turn_text = String::new();
     let mut turn_thought = String::new();
@@ -866,6 +1474,16 @@ async fn run_anthropic_turn(
                                         id: cb["id"].as_str().unwrap_or("").to_string(),
                                         name: cb["name"].as_str().unwrap_or("").to_string(),
                                         partial_json: String::new(),
+                                        text: cb["text"].as_str().unwrap_or("").to_string(),
+                                        thinking_text: cb["thinking"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        signature: cb["signature"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string(),
+                                        redacted_data: cb["data"].as_str().unwrap_or("").to_string(),
                                     },
                                 );
                             }
@@ -874,13 +1492,25 @@ async fn run_anthropic_turn(
                                 let dtype = parsed["delta"]["type"].as_str().unwrap_or("");
                                 if dtype == "thinking_delta" {
                                     if let Some(th) = parsed["delta"]["thinking"].as_str() {
+                                        if let Some(b) = blocks.get_mut(&idx) {
+                                            b.thinking_text.push_str(th);
+                                        }
                                         if !th.is_empty() && thinking_level != "off" {
                                             turn_thought.push_str(th);
                                             emit_thought(app, stream_id, th);
                                         }
                                     }
+                                } else if dtype == "signature_delta" {
+                                    if let Some(sig) = parsed["delta"]["signature"].as_str() {
+                                        if let Some(b) = blocks.get_mut(&idx) {
+                                            b.signature.push_str(sig);
+                                        }
+                                    }
                                 } else if dtype == "text_delta" || parsed["delta"]["text"].is_string() {
                                     if let Some(delta) = parsed["delta"]["text"].as_str() {
+                                        if let Some(b) = blocks.get_mut(&idx) {
+                                            b.text.push_str(delta);
+                                        }
                                         let (th, ans) = splitter.push(delta);
                                         if !th.is_empty() {
                                             turn_thought.push_str(&th);
@@ -929,29 +1559,64 @@ async fn run_anthropic_turn(
         emit_chunk(app, stream_id, &ans_tail);
     }
 
-    let tool_calls: Vec<ParsedToolCall> = blocks
-        .into_iter()
-        .filter(|(_, b)| b.kind == "tool_use" && !b.name.trim().is_empty())
-        .map(|(idx, b)| {
-            let raw_arguments = if b.partial_json.trim().is_empty() {
-                "{}".to_string()
-            } else {
-                b.partial_json
-            };
-            let args: Value = serde_json::from_str(&raw_arguments).unwrap_or_else(|_| json!({}));
-            let id = if b.id.is_empty() {
-                format!("toolu_{turn_idx}_{idx}")
-            } else {
-                b.id
-            };
-            ParsedToolCall {
-                id,
-                name: b.name,
-                args,
-                raw_arguments,
+    let mut anthropic_raw_blocks: Vec<Value> = Vec::new();
+    let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
+    for (idx, b) in blocks {
+        match b.kind.as_str() {
+            "thinking" => {
+                if !b.thinking_text.is_empty() || !b.signature.is_empty() {
+                    anthropic_raw_blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": b.thinking_text,
+                        "signature": b.signature
+                    }));
+                }
             }
-        })
-        .collect();
+            "redacted_thinking" => {
+                if !b.redacted_data.is_empty() {
+                    anthropic_raw_blocks.push(json!({
+                        "type": "redacted_thinking",
+                        "data": b.redacted_data
+                    }));
+                }
+            }
+            "text" => {
+                if !b.text.is_empty() {
+                    anthropic_raw_blocks.push(json!({
+                        "type": "text",
+                        "text": b.text
+                    }));
+                }
+            }
+            "tool_use" if !b.name.trim().is_empty() => {
+                let raw_arguments = if b.partial_json.trim().is_empty() {
+                    "{}".to_string()
+                } else {
+                    b.partial_json
+                };
+                let args: Value =
+                    serde_json::from_str(&raw_arguments).unwrap_or_else(|_| json!({}));
+                let id = if b.id.is_empty() {
+                    format!("toolu_{turn_idx}_{idx}")
+                } else {
+                    b.id
+                };
+                anthropic_raw_blocks.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": b.name,
+                    "input": args
+                }));
+                tool_calls.push(ParsedToolCall {
+                    id,
+                    name: b.name,
+                    args,
+                    raw_arguments,
+                });
+            }
+            _ => {}
+        }
+    }
 
     if tool_calls.is_empty() {
         Ok(TurnOutcome::Finished {
@@ -962,8 +1627,10 @@ async fn run_anthropic_turn(
         Ok(TurnOutcome::ToolCalls {
             turn_text,
             turn_thought,
+            native_reasoning: String::new(),
             calls: tool_calls,
             gemini_raw_parts: Vec::new(),
+            anthropic_raw_blocks,
         })
     }
 }
@@ -980,6 +1647,7 @@ async fn run_gemini_turn(
     agent_mode: bool,
     include_media_downloader: bool,
     thinking_level: &str,
+    thinking_backend: ThinkingBackend,
     stream_id: &str,
     turn_idx: usize,
     cancel_flag: &AtomicBool,
@@ -997,41 +1665,24 @@ async fn run_gemini_turn(
         "contents": contents
     });
 
-    // Configure native Gemini 2.5 thinking budget cleanly
     let lvl = normalize_thinking_level(thinking_level);
-    let is_gemini_25 = model_clean.contains("2.5") || model_clean.contains("thinking");
-    if is_gemini_25 {
-        let thinking_cfg = match lvl {
-            "off" if !model_clean.contains("pro") => json!({ "thinkingBudget": 0, "includeThoughts": false }),
-            "off" => json!({ "thinkingBudget": 128, "includeThoughts": false }),
-            "low" => json!({ "thinkingBudget": 1024, "includeThoughts": true }),
-            "high" => json!({ "thinkingBudget": 10240, "includeThoughts": true }),
-            "max" => json!({ "thinkingBudget": 24576, "includeThoughts": true }),
-            _ => json!({ "thinkingBudget": 4096, "includeThoughts": true }),
-        };
-        body["generationConfig"] = json!({ "thinkingConfig": thinking_cfg });
-    }
+    let native_thinking = apply_native_thinking(&mut body, thinking_backend, lvl);
 
     if agent_mode {
         body["tools"] = gemini_tools_json(include_media_downloader);
     }
 
-    let mut resp = client
-        .post(&endpoint)
-        .header("x-goog-api-key", api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let err_txt = resp.text().await.unwrap_or_default();
-        return Err(format!(
-            "API returned {status}: {}",
-            err_txt.chars().take(240).collect::<String>()
-        ));
-    }
+    let mut resp = send_post_with_retry(
+        client,
+        ApiProtocol::Gemini,
+        &endpoint,
+        api_key,
+        &mut body,
+        native_thinking,
+        Some(cancel_flag),
+        4,
+    )
+    .await?;
 
     let mut turn_text = String::new();
     let mut turn_thought = String::new();
@@ -1127,8 +1778,10 @@ async fn run_gemini_turn(
         Ok(TurnOutcome::ToolCalls {
             turn_text,
             turn_thought,
+            native_reasoning: String::new(),
             calls,
             gemini_raw_parts: raw_model_parts,
+            anthropic_raw_blocks: Vec::new(),
         })
     }
 }
@@ -1503,25 +2156,39 @@ pub async fn run_oneshot_vision(
             "contents": [{ "role": "user", "parts": parts }],
             "generationConfig": { "maxOutputTokens": max_tokens }
         });
+        let cap = infer_thinking_capability_with_mode(
+            &model.api_provider,
+            &model.base_url,
+            &model.model_id,
+            &model.thinking_mode,
+        );
+        let native_thinking = match cap.backend {
+            ThinkingBackend::GeminiBudget { .. } | ThinkingBackend::GeminiLevel { .. } => {
+                let min_lvl = clamp_thinking_level("off", &cap);
+                apply_native_thinking(&mut body, cap.backend, min_lvl)
+            }
+            _ => false,
+        };
         if !sys_prompt.trim().is_empty() {
             body["systemInstruction"] = json!({ "parts": [{ "text": sys_prompt }] });
         }
 
-        let resp = client
-            .post(&endpoint)
-            .header("x-goog-api-key", api_key.trim())
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Watch request failed: {e}"))?;
-        let status = resp.status();
+        let resp = send_post_with_retry(
+            client,
+            ApiProtocol::Gemini,
+            &endpoint,
+            api_key,
+            &mut body,
+            native_thinking,
+            None,
+            2,
+        )
+        .await
+        .map_err(|e| format!("Watch {e}"))?;
         let val: Value = resp
             .json()
             .await
             .map_err(|e| format!("Watch parse failed: {e}"))?;
-        if !status.is_success() {
-            return Err(format!("Watch HTTP {status}: {val}"));
-        }
         let mut out = String::new();
         if let Some(arr) = val
             .get("candidates")
@@ -1554,28 +2221,28 @@ pub async fn run_oneshot_vision(
             }));
         }
         content_parts.push(json!({ "type": "text", "text": user_prompt }));
-        let body = json!({
+        let mut body = json!({
             "model": model.model_id.trim(),
             "max_tokens": max_tokens,
             "system": sys_prompt,
             "messages": [{ "role": "user", "content": content_parts }]
         });
-        let resp = client
-            .post(&endpoint)
-            .header("x-api-key", api_key.trim())
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Watch request failed: {e}"))?;
-        let status = resp.status();
+        let resp = send_post_with_retry(
+            client,
+            ApiProtocol::Anthropic,
+            &endpoint,
+            api_key,
+            &mut body,
+            false,
+            None,
+            2,
+        )
+        .await
+        .map_err(|e| format!("Watch {e}"))?;
         let val: Value = resp
             .json()
             .await
             .map_err(|e| format!("Watch parse failed: {e}"))?;
-        if !status.is_success() {
-            return Err(format!("Watch HTTP {status}: {val}"));
-        }
         let mut out = String::new();
         if let Some(arr) = val.get("content").and_then(|c| c.as_array()) {
             for blk in arr {
@@ -1596,7 +2263,7 @@ pub async fn run_oneshot_vision(
                 "image_url": { "url": format!("data:image/jpeg;base64,{raw}", raw = f.jpeg_b64), "detail": "high" }
             }));
         }
-        let body = json!({
+        let mut body = json!({
             "model": model.model_id.trim(),
             "max_tokens": max_tokens,
             "messages": [
@@ -1604,22 +2271,22 @@ pub async fn run_oneshot_vision(
                 { "role": "user", "content": user_parts }
             ]
         });
-        let mut req = client.post(&endpoint).json(&body);
-        if !api_key.trim().is_empty() {
-            req = req.bearer_auth(api_key.trim());
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("Watch request failed: {e}"))?;
-        let status = resp.status();
+        let resp = send_post_with_retry(
+            client,
+            ApiProtocol::OpenAi,
+            &endpoint,
+            api_key,
+            &mut body,
+            false,
+            None,
+            2,
+        )
+        .await
+        .map_err(|e| format!("Watch {e}"))?;
         let val: Value = resp
             .json()
             .await
             .map_err(|e| format!("Watch parse failed: {e}"))?;
-        if !status.is_success() {
-            return Err(format!("Watch HTTP {status}: {val}"));
-        }
         let text = val
             .get("choices")
             .and_then(|c| c.get(0))
@@ -1746,7 +2413,14 @@ pub fn spawn_chat_stream(
             return;
         }
 
-        let thinking_level = normalize_thinking_level(&cfg.thinking_level);
+        let thinking_cap = infer_thinking_capability_with_mode(
+            &chat_model.api_provider,
+            &chat_model.base_url,
+            &chat_model.model_id,
+            &chat_model.thinking_mode,
+        );
+        let thinking_level = clamp_thinking_level(&cfg.thinking_level, &thinking_cap);
+        let thinking_backend = thinking_cap.backend;
         let mirror_prefix = plugin_mgr.list().mirror_prefix;
         let media_dl_ready = plugin_mgr.is_engine_ready("media_downloader");
         let mut sys_prompt = prompts_mgr.build_system_prompt(&cfg.persona_id);
@@ -1907,6 +2581,7 @@ pub fn spawn_chat_stream(
                     cfg.agent_mode,
                     media_dl_ready,
                     thinking_level,
+                    thinking_backend,
                     &stream_id,
                     turn_idx,
                     &cancel_flag,
@@ -1924,6 +2599,7 @@ pub fn spawn_chat_stream(
                     cfg.agent_mode,
                     media_dl_ready,
                     thinking_level,
+                    thinking_backend,
                     &stream_id,
                     turn_idx,
                     &cancel_flag,
@@ -1940,6 +2616,7 @@ pub fn spawn_chat_stream(
                     cfg.agent_mode,
                     media_dl_ready,
                     thinking_level,
+                    thinking_backend,
                     &stream_id,
                     turn_idx,
                     &cancel_flag,
@@ -1950,6 +2627,9 @@ pub fn spawn_chat_stream(
             match turn_res {
                 Err(err) => {
                     approval_mgr.reject_for_stream(&stream_id);
+                    if cancel_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
                     crate::logger::log_error("ai", &format!("chat turn failed: {err}"));
                     let _ = app.emit(
                         "buddy://ai-error",
@@ -1976,8 +2656,10 @@ pub fn spawn_chat_stream(
                 Ok(TurnOutcome::ToolCalls {
                     turn_text,
                     turn_thought,
+                    native_reasoning,
                     calls,
                     gemini_raw_parts,
+                    anthropic_raw_blocks,
                 }) => {
                     full_text.push_str(&turn_text);
                     if !turn_thought.is_empty() {
@@ -1997,18 +2679,23 @@ pub fn spawn_chat_stream(
                             "parts": gemini_raw_parts
                         }));
                     } else if is_anthropic {
-                        let mut blocks: Vec<Value> = Vec::new();
-                        if !turn_text.is_empty() {
-                            blocks.push(json!({ "type": "text", "text": turn_text }));
-                        }
-                        for c in &calls {
-                            blocks.push(json!({
-                                "type": "tool_use",
-                                "id": c.id,
-                                "name": c.name,
-                                "input": c.args
-                            }));
-                        }
+                        let blocks = if anthropic_raw_blocks.is_empty() {
+                            let mut fallback: Vec<Value> = Vec::new();
+                            if !turn_text.is_empty() {
+                                fallback.push(json!({ "type": "text", "text": turn_text }));
+                            }
+                            for c in &calls {
+                                fallback.push(json!({
+                                    "type": "tool_use",
+                                    "id": c.id,
+                                    "name": c.name,
+                                    "input": c.args
+                                }));
+                            }
+                            fallback
+                        } else {
+                            anthropic_raw_blocks
+                        };
                         anthropic_msgs.push(json!({ "role": "assistant", "content": blocks }));
                     } else {
                         let tc_vals: Vec<Value> = calls
@@ -2024,11 +2711,17 @@ pub fn spawn_chat_stream(
                                 })
                             })
                             .collect();
-                        openai_msgs.push(json!({
+                        let mut assistant_msg = json!({
                             "role": "assistant",
                             "content": if turn_text.is_empty() { Value::Null } else { Value::String(turn_text) },
                             "tool_calls": tc_vals
-                        }));
+                        });
+                        if (base_url.contains("deepseek.com") || base_url.contains("xiaomimimo.com"))
+                            && !native_reasoning.is_empty()
+                        {
+                            assistant_msg["reasoning_content"] = json!(native_reasoning);
+                        }
+                        openai_msgs.push(assistant_msg);
                     }
 
                     let mut anthropic_results: Vec<Value> = Vec::new();
@@ -2365,5 +3058,189 @@ mod tests {
         let (th2, ans2) = s_off.push("<buddy_thought>raw");
         assert_eq!(th2, "");
         assert_eq!(ans2, "<buddy_thought>raw");
+    }
+
+    #[test]
+    fn infers_and_clamps_model_specific_thinking_capabilities() {
+        // Gemini 3.5 Flash Lite -> 4 native tiers, clamps max -> high
+        let g35 = infer_thinking_capability(
+            "gemini",
+            "https://generativelanguage.googleapis.com",
+            "gemini-3.5-flash-lite",
+        );
+        assert_eq!(g35.levels, &["off", "low", "medium", "high"]);
+        assert_eq!(
+            g35.backend,
+            ThinkingBackend::GeminiLevel {
+                allow_minimal: true
+            }
+        );
+        assert_eq!(clamp_thinking_level("max", &g35), "high");
+        assert_eq!(clamp_thinking_level("off", &g35), "off");
+
+        // Gemini 2.5 Pro -> cannot turn off completely
+        let g25p = infer_thinking_capability(
+            "gemini",
+            "https://generativelanguage.googleapis.com",
+            "gemini-2.5-pro",
+        );
+        assert_eq!(g25p.levels, &["low", "medium", "high", "max"]);
+        assert_eq!(clamp_thinking_level("off", &g25p), "low");
+        assert_eq!(clamp_thinking_level("max", &g25p), "max");
+
+        // Claude 4.5 (budget_tokens) vs Claude 4.7+ (adaptive) vs Claude 3.5 Haiku (prompt)
+        let c45 = infer_thinking_capability(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-sonnet-4-5",
+        );
+        assert_eq!(c45.backend, ThinkingBackend::AnthropicBudget);
+
+        let c47 = infer_thinking_capability(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-opus-4-7",
+        );
+        assert_eq!(c47.backend, ThinkingBackend::AnthropicAdaptive);
+
+        let c35h = infer_thinking_capability(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-3-5-haiku-latest",
+        );
+        assert_eq!(c35h.backend, ThinkingBackend::PromptOnly);
+
+        // OpenAI o3 vs GPT-5 vs GPT-5.2 vs GPT-4o
+        let o3 = infer_thinking_capability("openai", "https://api.openai.com/v1", "o3");
+        assert_eq!(o3.levels, &["low", "medium", "high"]);
+        assert_eq!(clamp_thinking_level("off", &o3), "low");
+        assert_eq!(clamp_thinking_level("max", &o3), "high");
+
+        let gpt5 = infer_thinking_capability("openai", "https://api.openai.com/v1", "gpt-5-mini");
+        assert_eq!(gpt5.levels, &["off", "low", "medium", "high"]);
+        assert_eq!(clamp_thinking_level("max", &gpt5), "high");
+
+        let gpt52 = infer_thinking_capability("openai", "https://api.openai.com/v1", "gpt-5.2");
+        assert_eq!(gpt52.levels, &["off", "low", "medium", "high", "max"]);
+
+        let gpt4o = infer_thinking_capability("openai", "https://api.openai.com/v1", "gpt-4o-mini");
+        assert_eq!(gpt4o.backend, ThinkingBackend::PromptOnly);
+
+        // MiMo binary thinking toggle: active low preference must NOT clamp down to off
+        let mimo = infer_thinking_capability(
+            "openai",
+            "https://api.xiaomimimo.com/v1",
+            "mimo-v2-flash",
+        );
+        assert_eq!(mimo.levels, &["off", "high"]);
+        assert_eq!(clamp_thinking_level("low", &mimo), "high");
+        assert_eq!(clamp_thinking_level("off", &mimo), "off");
+
+        // DeepSeek Chat V3
+        let ds = infer_thinking_capability(
+            "openai",
+            "https://api.deepseek.com/v1",
+            "deepseek-chat",
+        );
+        assert_eq!(ds.levels, &["off", "low", "high", "max"]);
+        assert_eq!(clamp_thinking_level("medium", &ds), "low");
+    }
+
+    #[test]
+    fn native_thinking_payload_and_strip_work_cleanly() {
+        // Gemini 3 uses thinkingLevel and never sets thinkingBudget
+        let mut g_body = json!({ "contents": [] });
+        assert!(apply_native_thinking(
+            &mut g_body,
+            ThinkingBackend::GeminiLevel {
+                allow_minimal: true
+            },
+            "high"
+        ));
+        assert_eq!(
+            g_body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "high"
+        );
+        assert!(g_body["generationConfig"]["thinkingConfig"]
+            .get("thinkingBudget")
+            .is_none());
+        strip_native_thinking(&mut g_body, ApiProtocol::Gemini);
+        assert!(g_body.get("generationConfig").is_none());
+
+        // Anthropic budget ensures max_tokens > budget_tokens and cleans up on downgrade
+        let mut a_body = json!({ "model": "claude-sonnet-4-5", "max_tokens": 4096 });
+        assert!(apply_native_thinking(
+            &mut a_body,
+            ThinkingBackend::AnthropicBudget,
+            "max"
+        ));
+        assert!(
+            a_body["max_tokens"].as_u64().unwrap()
+                > a_body["thinking"]["budget_tokens"].as_u64().unwrap()
+        );
+        strip_native_thinking(&mut a_body, ApiProtocol::Anthropic);
+        assert!(a_body.get("thinking").is_none());
+        assert_eq!(a_body["max_tokens"], 4096);
+
+        // OpenAI strip cleans reasoning_effort & thinking
+        let mut o_body = json!({ "model": "deepseek-chat" });
+        assert!(apply_native_thinking(
+            &mut o_body,
+            ThinkingBackend::DeepSeekChat,
+            "max"
+        ));
+        assert_eq!(o_body["reasoning_effort"], "max");
+        assert_eq!(o_body["thinking"]["type"], "enabled");
+        strip_native_thinking(&mut o_body, ApiProtocol::OpenAi);
+        assert!(o_body.get("reasoning_effort").is_none());
+        assert!(o_body.get("thinking").is_none());
+    }
+
+    #[test]
+    fn error_classifiers_and_retry_delays_are_bounded() {
+        assert!(is_thinking_param_rejection(
+            reqwest::StatusCode::BAD_REQUEST,
+            "Invalid value for 'reasoning_effort': unsupported"
+        ));
+        assert!(!is_thinking_param_rejection(
+            reqwest::StatusCode::BAD_REQUEST,
+            "Invalid API key provided"
+        ));
+        assert!(!is_thinking_param_rejection(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "This model is currently experiencing high demand"
+        ));
+
+        let d0 = retry_delay_ms(0, None);
+        let d2 = retry_delay_ms(2, Some(60));
+        assert!((1200..=1600).contains(&d0));
+        assert_eq!(d2, 15_000);
+    }
+
+    #[test]
+    fn manual_thinking_mode_overrides_auto_detection() {
+        let prompt_forced = infer_thinking_capability_with_mode(
+            "gemini",
+            "https://generativelanguage.googleapis.com",
+            "gemini-3.5-flash-lite",
+            "prompt",
+        );
+        assert_eq!(prompt_forced.backend, ThinkingBackend::PromptOnly);
+        assert_eq!(prompt_forced.levels, &["off", "low", "medium", "high", "max"]);
+
+        let native_forced = infer_thinking_capability_with_mode(
+            "openai",
+            "https://my-proxy.example.com/v1",
+            "custom-reasoning-alias",
+            "native",
+        );
+        assert_eq!(
+            native_forced.backend,
+            ThinkingBackend::OpenAiEffort {
+                allow_minimal: true,
+                allow_xhigh: false
+            }
+        );
+        assert_eq!(native_forced.levels, &["off", "low", "medium", "high"]);
     }
 }
