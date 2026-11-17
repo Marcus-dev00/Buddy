@@ -5,17 +5,17 @@
 //! and live endpoint verification.
 
 use crate::agent_tools::{
-    anthropic_tools_json, build_agent_system_appendix, execute_tool, gemini_tools_json,
-    openai_tools_json, plan_tool_execution, resolve_user_path, AgentApprovalManager,
-    AgentStepEvent, ApprovalDecision,
+    anthropic_tools_json, build_agent_system_appendix, execute_fetch_web_page, execute_tool,
+    execute_web_search, gemini_tools_json, openai_tools_json, plan_tool_execution,
+    resolve_user_path, AgentApprovalManager, AgentStepEvent, ApprovalDecision,
 };
 use crate::db::MemoryDb;
-use crate::plugins::{run_offline_ocr, PluginManager};
+use crate::plugins::{run_media_download, run_offline_ocr, PluginManager};
 use crate::prompts::PromptsManager;
-use crate::settings::SettingsManager;
+use crate::settings::{ResolvedModelConfig, SettingsManager};
 use crate::skills::{search_github_skills, SkillsManager};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use image::{codecs::jpeg::JpegEncoder, imageops::FilterType};
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -30,6 +30,12 @@ pub struct AttachmentPayload {
     pub label: String,
     pub text_content: Option<String>,
     pub file_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InlineImageFrame {
+    pub label: String,
+    pub jpeg_b64: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -253,25 +259,27 @@ fn build_thinking_appendix(level: &str) -> String {
     }
 }
 
-/// Resizes image longest edge to <= 1536px and encodes JPEG (q=82) returning raw base64.
-pub fn compress_image_to_jpeg_base64(path_str: &str) -> Result<String, String> {
-    let path = Path::new(path_str);
-    let img = image::open(path).map_err(|e| format!("open image failed: {e}"))?;
+/// Resizes `DynamicImage` longest edge to `<= max_dim` and encodes JPEG returning raw base64.
+pub fn encode_dynamic_image_jpeg_base64(
+    img: &DynamicImage,
+    max_dim_limit: u32,
+    quality: u8,
+) -> Result<String, String> {
     let (w, h) = (img.width(), img.height());
     let max_dim = w.max(h);
 
-    let resized = if max_dim > 1536 {
-        let scale = 1536.0 / (max_dim as f32);
+    let resized = if max_dim > max_dim_limit {
+        let scale = (max_dim_limit as f32) / (max_dim as f32);
         let nw = ((w as f32) * scale).round().max(1.0) as u32;
         let nh = ((h as f32) * scale).round().max(1.0) as u32;
-        img.resize(nw, nh, FilterType::Triangle)
+        img.resize(nw, nh, FilterType::CatmullRom)
     } else {
-        img
+        img.clone()
     };
 
     let rgb = resized.to_rgb8();
     let mut out = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut out, 82);
+    let mut encoder = JpegEncoder::new_with_quality(&mut out, quality);
     encoder
         .encode_image(&rgb)
         .map_err(|e| format!("encode jpeg failed: {e}"))?;
@@ -279,7 +287,40 @@ pub fn compress_image_to_jpeg_base64(path_str: &str) -> Result<String, String> {
     Ok(B64.encode(&out))
 }
 
-fn format_attachment_text_blocks(prompt: &str, attachments: &[AttachmentPayload]) -> Vec<String> {
+/// Resizes image longest edge to <= 1536px and encodes JPEG (q=82) returning raw base64.
+pub fn compress_image_to_jpeg_base64(path_str: &str) -> Result<String, String> {
+    let path = Path::new(path_str);
+    let img = image::open(path).map_err(|e| format!("open image failed: {e}"))?;
+    encode_dynamic_image_jpeg_base64(&img, 2048, 86)
+}
+
+fn collect_all_user_jpegs(
+    attachments: &[AttachmentPayload],
+    live_frames: &[InlineImageFrame],
+) -> Vec<String> {
+    let mut jpegs = Vec::new();
+    for att in attachments {
+        if att.kind == "image" {
+            if let Some(fp) = &att.file_path {
+                if let Ok(raw_b64) = compress_image_to_jpeg_base64(fp) {
+                    jpegs.push(raw_b64);
+                }
+            }
+        }
+    }
+    for lf in live_frames {
+        if !lf.jpeg_b64.is_empty() {
+            jpegs.push(lf.jpeg_b64.clone());
+        }
+    }
+    jpegs
+}
+
+fn format_attachment_text_blocks(
+    prompt: &str,
+    attachments: &[AttachmentPayload],
+    live_frames: &[InlineImageFrame],
+) -> Vec<String> {
     let mut text_blocks: Vec<String> = Vec::new();
     if !prompt.trim().is_empty() {
         text_blocks.push(prompt.trim().to_string());
@@ -320,24 +361,27 @@ fn format_attachment_text_blocks(prompt: &str, attachments: &[AttachmentPayload]
             _ => {}
         }
     }
+
+    for lf in live_frames {
+        text_blocks.push(format!("[Live Screen Frame: {}]", lf.label));
+    }
+
     text_blocks
 }
 
-fn build_openai_user_content(prompt: &str, attachments: &[AttachmentPayload]) -> Value {
+fn build_openai_user_content(
+    prompt: &str,
+    attachments: &[AttachmentPayload],
+    live_frames: &[InlineImageFrame],
+) -> Value {
     let mut parts: Vec<Value> = Vec::new();
-    let text_blocks = format_attachment_text_blocks(prompt, attachments);
+    let text_blocks = format_attachment_text_blocks(prompt, attachments, live_frames);
 
-    for att in attachments {
-        if att.kind == "image" {
-            if let Some(fp) = &att.file_path {
-                if let Ok(raw_b64) = compress_image_to_jpeg_base64(fp) {
-                    parts.push(json!({
-                        "type": "image_url",
-                        "image_url": { "url": format!("data:image/jpeg;base64,{raw_b64}") }
-                    }));
-                }
-            }
-        }
+    for raw_b64 in collect_all_user_jpegs(attachments, live_frames) {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:image/jpeg;base64,{raw_b64}"), "detail": "high" }
+        }));
     }
 
     let combined_text = text_blocks.join("\n\n");
@@ -350,25 +394,23 @@ fn build_openai_user_content(prompt: &str, attachments: &[AttachmentPayload]) ->
     }
 }
 
-fn build_anthropic_user_content(prompt: &str, attachments: &[AttachmentPayload]) -> Value {
+fn build_anthropic_user_content(
+    prompt: &str,
+    attachments: &[AttachmentPayload],
+    live_frames: &[InlineImageFrame],
+) -> Value {
     let mut parts: Vec<Value> = Vec::new();
-    let text_blocks = format_attachment_text_blocks(prompt, attachments);
+    let text_blocks = format_attachment_text_blocks(prompt, attachments, live_frames);
 
-    for att in attachments {
-        if att.kind == "image" {
-            if let Some(fp) = &att.file_path {
-                if let Ok(raw_b64) = compress_image_to_jpeg_base64(fp) {
-                    parts.push(json!({
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/jpeg",
-                            "data": raw_b64
-                        }
-                    }));
-                }
+    for raw_b64 in collect_all_user_jpegs(attachments, live_frames) {
+        parts.push(json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": raw_b64
             }
-        }
+        }));
     }
 
     let combined_text = text_blocks.join("\n\n");
@@ -380,23 +422,21 @@ fn build_anthropic_user_content(prompt: &str, attachments: &[AttachmentPayload])
     }
 }
 
-fn build_gemini_user_parts(prompt: &str, attachments: &[AttachmentPayload]) -> Vec<Value> {
+fn build_gemini_user_parts(
+    prompt: &str,
+    attachments: &[AttachmentPayload],
+    live_frames: &[InlineImageFrame],
+) -> Vec<Value> {
     let mut parts: Vec<Value> = Vec::new();
-    let text_blocks = format_attachment_text_blocks(prompt, attachments);
+    let text_blocks = format_attachment_text_blocks(prompt, attachments, live_frames);
 
-    for att in attachments {
-        if att.kind == "image" {
-            if let Some(fp) = &att.file_path {
-                if let Ok(raw_b64) = compress_image_to_jpeg_base64(fp) {
-                    parts.push(json!({
-                        "inlineData": {
-                            "mimeType": "image/jpeg",
-                            "data": raw_b64
-                        }
-                    }));
-                }
+    for raw_b64 in collect_all_user_jpegs(attachments, live_frames) {
+        parts.push(json!({
+            "inlineData": {
+                "mimeType": "image/jpeg",
+                "data": raw_b64
             }
-        }
+        }));
     }
 
     let combined_text = text_blocks.join("\n\n");
@@ -410,13 +450,14 @@ fn build_gemini_contents(
     history: Vec<(String, String)>,
     prompt: &str,
     attachments: &[AttachmentPayload],
+    live_frames: &[InlineImageFrame],
 ) -> Vec<Value> {
     let mut turns: Vec<(String, Vec<Value>)> = Vec::new();
 
     for (role, content) in history
         .into_iter()
         .rev()
-        .take(12)
+        .take(20)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -443,7 +484,7 @@ fn build_gemini_contents(
 
     turns.push((
         "user".to_string(),
-        build_gemini_user_parts(prompt, attachments),
+        build_gemini_user_parts(prompt, attachments, live_frames),
     ));
 
     turns
@@ -456,13 +497,14 @@ fn build_anthropic_history(
     history: Vec<(String, String)>,
     prompt: &str,
     attachments: &[AttachmentPayload],
+    live_frames: &[InlineImageFrame],
 ) -> Vec<Value> {
     let mut msgs: Vec<(String, Value)> = Vec::new();
 
     for (role, content) in history
         .into_iter()
         .rev()
-        .take(12)
+        .take(20)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -491,7 +533,7 @@ fn build_anthropic_history(
 
     msgs.push((
         "user".to_string(),
-        build_anthropic_user_content(prompt, attachments),
+        build_anthropic_user_content(prompt, attachments, live_frames),
     ));
 
     msgs.into_iter()
@@ -504,6 +546,7 @@ fn build_openai_history(
     history: Vec<(String, String)>,
     prompt: &str,
     attachments: &[AttachmentPayload],
+    live_frames: &[InlineImageFrame],
 ) -> Vec<Value> {
     let mut api_messages = vec![json!({
         "role": "system",
@@ -512,7 +555,7 @@ fn build_openai_history(
     for (role, content) in history
         .into_iter()
         .rev()
-        .take(12)
+        .take(20)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -523,7 +566,7 @@ fn build_openai_history(
     }
     api_messages.push(json!({
         "role": "user",
-        "content": build_openai_user_content(prompt, attachments)
+        "content": build_openai_user_content(prompt, attachments, live_frames)
     }));
     api_messages
 }
@@ -580,6 +623,7 @@ async fn run_openai_turn(
     model_id: &str,
     messages: &[Value],
     agent_mode: bool,
+    include_media_downloader: bool,
     thinking_level: &str,
     stream_id: &str,
     turn_idx: usize,
@@ -592,7 +636,7 @@ async fn run_openai_turn(
         "messages": messages
     });
     if agent_mode {
-        body["tools"] = openai_tools_json();
+        body["tools"] = openai_tools_json(include_media_downloader);
         body["tool_choice"] = json!("auto");
     }
 
@@ -747,6 +791,7 @@ async fn run_anthropic_turn(
     sys_prompt: &str,
     messages: &[Value],
     agent_mode: bool,
+    include_media_downloader: bool,
     thinking_level: &str,
     stream_id: &str,
     turn_idx: usize,
@@ -765,7 +810,7 @@ async fn run_anthropic_turn(
         "messages": messages
     });
     if agent_mode {
-        body["tools"] = anthropic_tools_json();
+        body["tools"] = anthropic_tools_json(include_media_downloader);
     }
 
     let mut resp = client
@@ -933,6 +978,7 @@ async fn run_gemini_turn(
     sys_prompt: &str,
     contents: &[Value],
     agent_mode: bool,
+    include_media_downloader: bool,
     thinking_level: &str,
     stream_id: &str,
     turn_idx: usize,
@@ -967,7 +1013,7 @@ async fn run_gemini_turn(
     }
 
     if agent_mode {
-        body["tools"] = gemini_tools_json();
+        body["tools"] = gemini_tools_json(include_media_downloader);
     }
 
     let mut resp = client
@@ -1109,6 +1155,8 @@ async fn run_tool_with_approval(
     app: &AppHandle,
     approval_mgr: &AgentApprovalManager,
     skills_mgr: &SkillsManager,
+    plugin_mgr: &PluginManager,
+    db: &Arc<MemoryDb>,
     mirror_prefix: &str,
     stream_id: &str,
     turn_idx: usize,
@@ -1300,6 +1348,88 @@ async fn run_tool_with_approval(
                 Err(e) => (false, format!("Error: {e}"), e),
             }
         }
+        "download_media" => {
+            let url = call.args["url"].as_str().unwrap_or("");
+            let fmt = call.args["format"].as_str().unwrap_or("audio_best");
+            let out_dir = call.args["output_dir"].as_str();
+            match run_media_download(app, plugin_mgr, url, fmt, out_dir).await {
+                Ok(out) => {
+                    let saved = out.outputs.first().cloned().unwrap_or_default();
+                    (
+                        true,
+                        format!("{}\nSaved Path: {saved}", out.summary),
+                        out.summary,
+                    )
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "search_memories" => {
+            let q = call.args["query"].as_str().unwrap_or("").trim();
+            let lim = call.args["limit"].as_u64().unwrap_or(8).clamp(1, 20) as usize;
+            if q.is_empty() {
+                (false, "Error: `query` cannot be empty".into(), "Empty query".into())
+            } else {
+                match db.list_memories(Some(q), lim) {
+                    Ok(items) if items.is_empty() => (
+                        true,
+                        format!("No memory matches found for `{q}`."),
+                        "0 hits".into(),
+                    ),
+                    Ok(items) => {
+                        let count = items.len();
+                        let text = items
+                            .into_iter()
+                            .map(|it| {
+                                let body = it
+                                    .content_text
+                                    .as_deref()
+                                    .unwrap_or(it.file_path.as_deref().unwrap_or("(image)"))
+                                    .chars()
+                                    .take(360)
+                                    .collect::<String>();
+                                format!("- [id={} kind={} tag={}] {}", it.id, it.kind, it.app_name, body)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        (true, text, format!("{count} memory hits"))
+                    }
+                    Err(e) => (false, format!("Error: {e}"), e),
+                }
+            }
+        }
+        "save_memory_fact" => {
+            let content = call.args["content"].as_str().unwrap_or("");
+            let category = call.args["category"].as_str();
+            match db.save_fact(content, category) {
+                Ok(item) => {
+                    let _ = app.emit("buddy://memory-cleaned", ());
+                    crate::logger::log_info("memory", &format!("saved fact id={}", item.id));
+                    (
+                        true,
+                        format!("Saved permanent memory fact [id={} tag={}]: {}", item.id, item.app_name, content.trim()),
+                        "Fact saved".into(),
+                    )
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "web_search" => {
+            let q = call.args["query"].as_str().unwrap_or("");
+            let lim = call.args["limit"].as_u64().unwrap_or(5).clamp(1, 8) as usize;
+            match execute_web_search(q, lim).await {
+                Ok(out) => (true, out, "Search done".into()),
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "fetch_web_page" => {
+            let url = call.args["url"].as_str().unwrap_or("");
+            let max_chars = call.args["max_chars"].as_u64().unwrap_or(8000).clamp(500, 16000) as usize;
+            match execute_fetch_web_page(url, max_chars).await {
+                Ok(out) => (true, out, "Page fetched".into()),
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
         _ => {
             let name_owned = call.name.clone();
             let args_owned = call.args.clone();
@@ -1327,6 +1457,255 @@ async fn run_tool_with_approval(
     (output, step)
 }
 
+fn classify_protocol(api_provider: &str, base_url: &str) -> (bool, bool, bool, String) {
+    let clean_url = base_url.trim().trim_end_matches('/').to_string();
+    let is_local = clean_url.contains("localhost") || clean_url.contains("127.0.0.1");
+    let is_anthropic = api_provider == "anthropic" || clean_url.contains("anthropic.com");
+    let is_gemini = api_provider == "gemini"
+        || (clean_url.contains("generativelanguage.googleapis.com")
+            && !clean_url.contains("/openai"));
+    (is_local, is_anthropic, is_gemini, clean_url)
+}
+
+/// Non-streaming one-shot multimodal call used by the background screen sentinel & text-model fallback.
+pub async fn run_oneshot_vision(
+    client: &reqwest::Client,
+    model: &ResolvedModelConfig,
+    api_key: &str,
+    sys_prompt: &str,
+    user_prompt: &str,
+    frames: &[InlineImageFrame],
+    max_tokens: u32,
+) -> Result<String, String> {
+    let (is_local, is_anthropic, is_gemini, base_url) =
+        classify_protocol(&model.api_provider, &model.base_url);
+
+    if api_key.trim().is_empty() && !is_local {
+        return Err("No API Key configured for Watch model.".to_string());
+    }
+
+    if is_gemini {
+        let model_clean = model.model_id.trim().trim_start_matches("models/");
+        let endpoint = if base_url.ends_with("/v1beta") || base_url.ends_with("/v1") {
+            format!("{base_url}/models/{model_clean}:generateContent")
+        } else {
+            format!("{base_url}/v1beta/models/{model_clean}:generateContent")
+        };
+        let mut parts: Vec<Value> = Vec::new();
+        for f in frames {
+            parts.push(json!({
+                "inlineData": { "mimeType": "image/jpeg", "data": f.jpeg_b64 }
+            }));
+        }
+        parts.push(json!({ "text": user_prompt }));
+
+        let mut body = json!({
+            "contents": [{ "role": "user", "parts": parts }],
+            "generationConfig": { "maxOutputTokens": max_tokens }
+        });
+        if !sys_prompt.trim().is_empty() {
+            body["systemInstruction"] = json!({ "parts": [{ "text": sys_prompt }] });
+        }
+
+        let resp = client
+            .post(&endpoint)
+            .header("x-goog-api-key", api_key.trim())
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Watch request failed: {e}"))?;
+        let status = resp.status();
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Watch parse failed: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("Watch HTTP {status}: {val}"));
+        }
+        let mut out = String::new();
+        if let Some(arr) = val
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array())
+        {
+            for p in arr {
+                if p.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
+                    continue;
+                }
+                if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
+                    out.push_str(t);
+                }
+            }
+        }
+        Ok(out.trim().to_string())
+    } else if is_anthropic {
+        let endpoint = if base_url.ends_with("/v1") {
+            format!("{base_url}/messages")
+        } else {
+            format!("{base_url}/v1/messages")
+        };
+        let mut content_parts: Vec<Value> = Vec::new();
+        for f in frames {
+            content_parts.push(json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/jpeg", "data": f.jpeg_b64 }
+            }));
+        }
+        content_parts.push(json!({ "type": "text", "text": user_prompt }));
+        let body = json!({
+            "model": model.model_id.trim(),
+            "max_tokens": max_tokens,
+            "system": sys_prompt,
+            "messages": [{ "role": "user", "content": content_parts }]
+        });
+        let resp = client
+            .post(&endpoint)
+            .header("x-api-key", api_key.trim())
+            .header("anthropic-version", "2023-06-01")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Watch request failed: {e}"))?;
+        let status = resp.status();
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Watch parse failed: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("Watch HTTP {status}: {val}"));
+        }
+        let mut out = String::new();
+        if let Some(arr) = val.get("content").and_then(|c| c.as_array()) {
+            for blk in arr {
+                if blk.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(t) = blk.get("text").and_then(|v| v.as_str()) {
+                        out.push_str(t);
+                    }
+                }
+            }
+        }
+        Ok(out.trim().to_string())
+    } else {
+        let endpoint = format!("{base_url}/chat/completions");
+        let mut user_parts: Vec<Value> = vec![json!({ "type": "text", "text": user_prompt })];
+        for f in frames {
+            user_parts.push(json!({
+                "type": "image_url",
+                "image_url": { "url": format!("data:image/jpeg;base64,{raw}", raw = f.jpeg_b64), "detail": "high" }
+            }));
+        }
+        let body = json!({
+            "model": model.model_id.trim(),
+            "max_tokens": max_tokens,
+            "messages": [
+                { "role": "system", "content": sys_prompt },
+                { "role": "user", "content": user_parts }
+            ]
+        });
+        let mut req = client.post(&endpoint).json(&body);
+        if !api_key.trim().is_empty() {
+            req = req.bearer_auth(api_key.trim());
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Watch request failed: {e}"))?;
+        let status = resp.status();
+        let val: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Watch parse failed: {e}"))?;
+        if !status.is_success() {
+            return Err(format!("Watch HTTP {status}: {val}"));
+        }
+        let text = val
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        Ok(text)
+    }
+}
+
+/// Proactive low-noise screen watch check. Returns `Ok(None)` when `[SILENT]`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_screen_watch_check(
+    client: &reqwest::Client,
+    model: &ResolvedModelConfig,
+    api_key: &str,
+    target_label: &str,
+    goal: &str,
+    cadence: &str,
+    ui_language: &str,
+    recent_whispers: &[String],
+    prev_frame: Option<&InlineImageFrame>,
+    curr_frame: &InlineImageFrame,
+) -> Result<Option<String>, String> {
+    let lang_rule = if ui_language == "zh" {
+        "Reply in concise natural Simplified Chinese."
+    } else {
+        "Reply in concise natural English (unless the user's goal text is in another language, then match it)."
+    };
+
+    let goal_line = if goal.trim().is_empty() {
+        "General co-working observation (UI, layout, errors, or helpful clarification)."
+    } else {
+        goal.trim()
+    };
+
+    let mut anti_repeat = String::new();
+    if !recent_whispers.is_empty() {
+        anti_repeat.push_str("\nAlready mentioned recently (DO NOT repeat these):\n");
+        for w in recent_whispers {
+            anti_repeat.push_str(&format!("- {w}\n"));
+        }
+    }
+
+    let posture_rule = if cadence == "active" {
+        "The user chose ACTIVE co-work mode and specifically wants you to speak up like a sharp design/coding partner. Whenever you see concrete visual content, layout/typography/color/hierarchy details to improve, an error/ambiguity, or a natural clarifying question about their goal, share 1 crisp specific suggestion or question! Only reply `[SILENT]` if the screen shows nothing meaningful or nothing new since your already-mentioned remarks."
+    } else {
+        "Output ONLY `[SILENT]` unless you spot a clear, actionable design/layout/contrast/alignment/typography flaw, a visible error/blocker, OR you have one genuinely useful clarifying question or suggestion that helps the user's work right now."
+    };
+
+    let sys_prompt = format!(
+        "You are Buddy quietly co-working alongside the user while watching their shared screen ({target_label}).\n\
+        Collaboration focus: {goal_line}\n\
+        Rules:\n\
+        1. Compare the current screen against the previous snapshot (if any).\n\
+        2. {posture_rule}\n\
+        3. Reference concrete visible UI elements, labels, code/error text, or layout areas you actually read on screen. Never give empty generic praise ('looks good') or guess unreadable tiny text, and never repeat recent remarks.\n\
+        4. When speaking, write ONLY 1-2 short, direct plain-text sentences (max ~90 Chinese chars or ~30 English words). No markdown headers or bullet lists.\n\
+        5. {lang_rule}{anti_repeat}"
+    );
+
+    let mut frames = Vec::new();
+    let mut user_desc = format!("Shared target: {target_label}.");
+    if let Some(pf) = prev_frame {
+        frames.push(pf.clone());
+        user_desc.push_str(" Image 1 is the earlier frame; Image 2 is the settled current frame.");
+    } else {
+        user_desc.push_str(" Attached is the initial screen snapshot.");
+    }
+    frames.push(curr_frame.clone());
+    user_desc.push_str(" Respond with [SILENT] or 1-2 concise sentences.");
+
+    let reply = run_oneshot_vision(client, model, api_key, &sys_prompt, &user_desc, &frames, 1024).await?;
+    let trimmed = reply.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("[SILENT]")
+        || trimmed.contains("[SILENT]")
+    {
+        return Ok(None);
+    }
+    Ok(Some(trimmed.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_chat_stream(
     app: AppHandle,
@@ -1342,19 +1721,19 @@ pub fn spawn_chat_stream(
     prompt: String,
     attachments: Vec<AttachmentPayload>,
     history: Vec<(String, String)>,
+    conversation_summary: Option<String>,
+    live_frames: Vec<InlineImageFrame>,
+    screen_goal: Option<String>,
+    watch_profile_override: Option<String>,
 ) {
     controller.cancel_flag.store(false, Ordering::Relaxed);
     let cancel_flag = controller.cancel_flag.clone();
 
     tauri::async_runtime::spawn(async move {
         let cfg = settings_mgr.get();
-        let api_key = settings_mgr.load_api_key().unwrap_or_default();
-        let base_url = cfg.base_url.trim().trim_end_matches('/').to_string();
-        let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
-        let is_anthropic = cfg.api_provider == "anthropic" || base_url.contains("anthropic.com");
-        let is_gemini = cfg.api_provider == "gemini"
-            || (base_url.contains("generativelanguage.googleapis.com")
-                && !base_url.contains("/openai"));
+        let (chat_model, api_key) = settings_mgr.resolve_chat_target();
+        let (is_local, is_anthropic, is_gemini, base_url) =
+            classify_protocol(&chat_model.api_provider, &chat_model.base_url);
 
         if api_key.is_empty() && !is_local {
             let _ = app.emit(
@@ -1369,12 +1748,52 @@ pub fn spawn_chat_stream(
 
         let thinking_level = normalize_thinking_level(&cfg.thinking_level);
         let mirror_prefix = plugin_mgr.list().mirror_prefix;
+        let media_dl_ready = plugin_mgr.is_engine_ready("media_downloader");
         let mut sys_prompt = prompts_mgr.build_system_prompt(&cfg.persona_id);
+        if let Ok(facts) = db.list_active_facts(8) {
+            if !facts.is_empty() {
+                let fact_lines = facts
+                    .into_iter()
+                    .filter_map(|f| {
+                        f.content_text
+                            .map(|txt| format!("- [{}] {}", f.app_name, txt.trim()))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !fact_lines.is_empty() {
+                    sys_prompt.push_str(&format!(
+                        "\n\n[Saved User Facts & Preferences]\n{}",
+                        fact_lines
+                    ));
+                }
+            }
+        }
+        if let Some(summary) = conversation_summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            sys_prompt.push_str(&format!(
+                "\n\n[Earlier Conversation Summary]\n{}",
+                summary
+            ));
+        }
         if cfg.agent_mode {
-            sys_prompt.push_str(&build_agent_system_appendix(&cfg.agent_workspace));
+            sys_prompt.push_str(&build_agent_system_appendix(&cfg.agent_workspace, media_dl_ready));
             sys_prompt.push_str(&skills_mgr.build_prompt_appendix());
         }
         sys_prompt.push_str(&skills_mgr.build_explicit_slash_appendix(&prompt));
+        if !live_frames.is_empty() {
+            let goal_note = screen_goal
+                .as_deref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|g| format!(" Co-working goal: {g}."))
+                .unwrap_or_default();
+            sys_prompt.push_str(&format!(
+                "\n\n[LIVE SCREEN SHARE ACTIVE]\nThe user is actively sharing their screen with you right now. Use the attached live frame(s) to answer their question directly with specific visual feedback.{goal_note}"
+            ));
+        }
         sys_prompt.push_str(&build_thinking_appendix(thinking_level));
 
         let client = match reqwest::Client::builder()
@@ -1383,6 +1802,7 @@ pub fn spawn_chat_stream(
         {
             Ok(c) => c,
             Err(e) => {
+                crate::logger::log_error("ai", &format!("HTTP client error: {e}"));
                 let _ = app.emit(
                     "buddy://ai-error",
                     AiErrorPayload {
@@ -1394,6 +1814,37 @@ pub fn spawn_chat_stream(
             }
         };
 
+        // Fallback for text-only Chat models while Screen Share is active: ask Watch Vision model to transcribe live screen
+        let mut effective_prompt = prompt.clone();
+        let effective_live_frames = if !live_frames.is_empty() && !chat_model.supports_vision {
+            let (watch_model, watch_key) =
+                settings_mgr.resolve_watch_target(watch_profile_override.as_deref());
+            if watch_model.supports_vision {
+                let vision_sys = "Summarize the key layout, visible UI text, colors, errors, and details on this screen concisely and accurately for another AI assistant.";
+                if let Ok(summary) = run_oneshot_vision(
+                    &client,
+                    &watch_model,
+                    &watch_key,
+                    vision_sys,
+                    "Describe the current screen state accurately.",
+                    &live_frames,
+                    420,
+                )
+                .await
+                {
+                    if !summary.trim().is_empty() {
+                        effective_prompt.push_str(&format!(
+                            "\n\n[Live Screen Summary from Watch Vision Model]\n{}",
+                            summary.trim()
+                        ));
+                    }
+                }
+            }
+            Vec::new()
+        } else {
+            live_frames
+        };
+
         let workspace_hint = derive_workspace_hint(&cfg.agent_workspace, &attachments);
         let mut full_text = String::new();
         let mut full_thought = String::new();
@@ -1401,17 +1852,33 @@ pub fn spawn_chat_stream(
         let mut approve_all_turn = false;
 
         let mut openai_msgs = if !is_anthropic && !is_gemini {
-            build_openai_history(&sys_prompt, history.clone(), &prompt, &attachments)
+            build_openai_history(
+                &sys_prompt,
+                history.clone(),
+                &effective_prompt,
+                &attachments,
+                &effective_live_frames,
+            )
         } else {
             Vec::new()
         };
         let mut anthropic_msgs = if is_anthropic {
-            build_anthropic_history(history.clone(), &prompt, &attachments)
+            build_anthropic_history(
+                history.clone(),
+                &effective_prompt,
+                &attachments,
+                &effective_live_frames,
+            )
         } else {
             Vec::new()
         };
         let mut gemini_contents = if is_gemini {
-            build_gemini_contents(history, &prompt, &attachments)
+            build_gemini_contents(
+                history,
+                &effective_prompt,
+                &attachments,
+                &effective_live_frames,
+            )
         } else {
             Vec::new()
         };
@@ -1434,10 +1901,11 @@ pub fn spawn_chat_stream(
                     &client,
                     &base_url,
                     &api_key,
-                    &cfg.model_id,
+                    &chat_model.model_id,
                     &sys_prompt,
                     &gemini_contents,
                     cfg.agent_mode,
+                    media_dl_ready,
                     thinking_level,
                     &stream_id,
                     turn_idx,
@@ -1450,10 +1918,11 @@ pub fn spawn_chat_stream(
                     &client,
                     &base_url,
                     &api_key,
-                    &cfg.model_id,
+                    &chat_model.model_id,
                     &sys_prompt,
                     &anthropic_msgs,
                     cfg.agent_mode,
+                    media_dl_ready,
                     thinking_level,
                     &stream_id,
                     turn_idx,
@@ -1466,9 +1935,10 @@ pub fn spawn_chat_stream(
                     &client,
                     &base_url,
                     &api_key,
-                    &cfg.model_id,
+                    &chat_model.model_id,
                     &openai_msgs,
                     cfg.agent_mode,
+                    media_dl_ready,
                     thinking_level,
                     &stream_id,
                     turn_idx,
@@ -1480,6 +1950,7 @@ pub fn spawn_chat_stream(
             match turn_res {
                 Err(err) => {
                     approval_mgr.reject_for_stream(&stream_id);
+                    crate::logger::log_error("ai", &format!("chat turn failed: {err}"));
                     let _ = app.emit(
                         "buddy://ai-error",
                         AiErrorPayload {
@@ -1571,6 +2042,8 @@ pub fn spawn_chat_stream(
                             &app,
                             &approval_mgr,
                             &skills_mgr,
+                            &plugin_mgr,
+                            &db,
                             &mirror_prefix,
                             &stream_id,
                             turn_idx,
@@ -1658,6 +2131,74 @@ pub fn spawn_chat_stream(
                 full_thought,
             },
         );
+
+        // Background rolling compaction when uncompacted conversation messages exceed threshold
+        if !cancel_flag.load(Ordering::Relaxed) {
+            if let Ok(Some((prev_summary, old_msgs, up_to_id))) =
+                db.list_messages_to_compact(conversation_id, 22, 12)
+            {
+                let db_compact = db.clone();
+                let compact_client = client.clone();
+                let compact_model = chat_model.clone();
+                let compact_key = api_key.clone();
+                tauri::async_runtime::spawn(async move {
+                    let msg_count = old_msgs.len();
+                    let transcript = old_msgs
+                        .into_iter()
+                        .map(|m| {
+                            let body: String = m.content.chars().take(500).collect();
+                            format!("{}: {}", m.role, body)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let user_body = match prev_summary {
+                        Some(prev) => format!(
+                            "[Existing Summary]\n{prev}\n\n[Additional Older Turns]\n{transcript}"
+                        ),
+                        None => format!("[Older Conversation Turns]\n{transcript}"),
+                    };
+                    let compact_sys = "Summarize this conversation segment concisely (max ~220 words). Preserve key user goals, file paths, decisions, constraints, and unresolved questions verbatim.";
+                    match run_oneshot_vision(
+                        &compact_client,
+                        &compact_model,
+                        &compact_key,
+                        compact_sys,
+                        &user_body,
+                        &[],
+                        1536,
+                    )
+                    .await
+                    {
+                        Ok(summary) if !summary.trim().is_empty() => {
+                            if let Err(e) = db_compact.update_conversation_summary(
+                                conversation_id,
+                                up_to_id,
+                                &summary,
+                            ) {
+                                crate::logger::log_warn(
+                                    "compaction",
+                                    &format!("failed saving summary for conv={conversation_id}: {e}"),
+                                );
+                            } else {
+                                crate::logger::log_info(
+                                    "compaction",
+                                    &format!(
+                                        "compacted {msg_count} messages in conv={conversation_id} up_to_id={up_to_id}"
+                                    ),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            crate::logger::log_warn(
+                                "compaction",
+                                &format!("background summary skipped for conv={conversation_id}: {e}"),
+                            );
+                        }
+                        _ => {}
+                    }
+                });
+            }
+        }
     });
 }
 

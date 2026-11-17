@@ -15,6 +15,7 @@ import {
   ImageDown,
   Loader2,
   Lock,
+  Music,
   Pin,
   Pipette,
   Play,
@@ -86,6 +87,8 @@ function PluginIcon({ id }: { id: string }) {
       return <FileText className={`${cls} text-indigo-400`} />;
     case "media_gif":
       return <Film className={`${cls} text-violet-400`} />;
+    case "media_downloader":
+      return <Music className={`${cls} text-emerald-400`} />;
     default:
       return <FileText className={`${cls} text-white/70`} />;
   }
@@ -145,6 +148,13 @@ export default function PluginsTab({
   const [mediaPath, setMediaPath] = useState("");
   const [mediaOut, setMediaOut] = useState<PluginToolOutput | null>(null);
 
+  const [dlUrl, setDlUrl] = useState("");
+  const [dlDir, setDlDir] = useState("");
+  const [dlFmt, setDlFmt] = useState<"audio_best" | "mp4_lossless" | "audio_flac" | "audio_mp3">(
+    "audio_best"
+  );
+  const [dlOut, setDlOut] = useState<PluginToolOutput | null>(null);
+
   const [toolError, setToolError] = useState<string | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
 
@@ -174,8 +184,11 @@ export default function PluginsTab({
       setPinPath(first);
       setImgPathsText(droppedPathsHint.join("\n"));
     }
-    if (/\.(mp4|mov|mkv|webm|avi)$/i.test(lower)) {
+    if (/\.(mp4|mov|mkv|webm|avi|m4v|flv|ts|wmv|gif|mp3|wav|flac|m4a)$/i.test(lower)) {
       setMediaPath(first);
+    }
+    if (/^https?:\/\//i.test(first.trim())) {
+      setDlUrl(first.trim());
     }
     if (/\.(pdf|md|txt|doc|docx|ppt|pptx|xls|xlsx|png|jpg|jpeg)$/i.test(lower)) {
       setPdfPathsText(droppedPathsHint.join("\n"));
@@ -226,6 +239,38 @@ export default function PluginsTab({
       .split(/\r?\n/)
       .map((x) => x.trim().replace(/^"(.*)"$/, "$1"))
       .filter(Boolean);
+
+  const browseFiles = async (
+    title: string,
+    multiple: boolean,
+    filterName: string,
+    filterSpec: string
+  ): Promise<string[]> => {
+    try {
+      return await invoke<string[]>("pick_files", {
+        title,
+        multiple,
+        filterName,
+        filterSpec,
+        initialDir: null,
+      });
+    } catch (err) {
+      setToolError(String(err));
+      return [];
+    }
+  };
+
+  const browseFolder = async (title: string, initialDir?: string): Promise<string | null> => {
+    try {
+      return await invoke<string | null>("pick_folder", {
+        title,
+        initialDir: initialDir?.trim() || null,
+      });
+    } catch (err) {
+      setToolError(String(err));
+      return null;
+    }
+  };
 
   return (
     <div className="flex-1 flex flex-col min-h-0 space-y-2">
@@ -300,12 +345,14 @@ export default function PluginsTab({
       )}
 
       {toolError && (
-        <div className="rounded-xl bg-rose-500/15 border border-rose-400/30 px-2.5 py-1.5 text-[10.5px] text-rose-200 flex items-center justify-between gap-2 shrink-0">
-          <span className="truncate">{toolError}</span>
+        <div className="rounded-xl bg-rose-500/15 border border-rose-400/30 px-2.5 py-1.5 text-[10.5px] text-rose-200 flex items-start justify-between gap-2 shrink-0">
+          <span className="break-words whitespace-pre-wrap max-h-20 overflow-y-auto flex-1">
+            {toolError}
+          </span>
           <button
             type="button"
             onClick={() => setToolError(null)}
-            className="text-rose-200/70 hover:text-white text-[10px]"
+            className="text-rose-200/70 hover:text-white text-[10px] shrink-0"
           >
             ✕
           </button>
@@ -622,6 +669,8 @@ export default function PluginsTab({
                           ? s.nativeBadge
                           : p.installed
                           ? `${s.installedBadge} · ${formatBytes(p.size_bytes)}`
+                          : p.id === "pdf_suite"
+                          ? `${s.pdfBuiltInBadge} · ${p.engine_hint ?? "qpdf"}`
                           : p.engine_hint ?? s.notInstalledBadge}
                       </span>
                       {isOpen ? (
@@ -708,8 +757,25 @@ export default function PluginsTab({
                       value={ocrPath}
                       onChange={(e) => setOcrPath(e.target.value)}
                       placeholder={s.ocrHint}
-                      className="flex-1 rounded-lg bg-black/35 border border-white/10 px-2 py-1 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none"
+                      className="flex-1 min-w-0 rounded-lg bg-black/35 border border-white/10 px-2 py-1 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none"
                     />
+                    <button
+                      type="button"
+                      title={s.browseBtn}
+                      onClick={() => {
+                        void browseFiles(
+                          name,
+                          false,
+                          "Images",
+                          "*.png;*.jpg;*.jpeg;*.webp;*.bmp"
+                        ).then((files) => {
+                          if (files[0]) setOcrPath(files[0]);
+                        });
+                      }}
+                      className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-white/80 transition"
+                    >
+                      <FolderOpen className="w-3.5 h-3.5" />
+                    </button>
                     <button
                       type="button"
                       disabled={ocrBusy || !ocrPath.trim()}
@@ -763,8 +829,25 @@ export default function PluginsTab({
                     value={pinPath}
                     onChange={(e) => setPinPath(e.target.value)}
                     placeholder="C:\...\image.png"
-                    className="flex-1 rounded-lg bg-black/35 border border-white/10 px-2 py-1 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none"
+                    className="flex-1 min-w-0 rounded-lg bg-black/35 border border-white/10 px-2 py-1 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none"
                   />
+                  <button
+                    type="button"
+                    title={s.browseBtn}
+                    onClick={() => {
+                      void browseFiles(
+                        name,
+                        false,
+                        "Images",
+                        "*.png;*.jpg;*.jpeg;*.webp;*.bmp"
+                      ).then((files) => {
+                        if (files[0]) setPinPath(files[0]);
+                      });
+                    }}
+                    className="px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-white/80 transition"
+                  >
+                    <FolderOpen className="w-3.5 h-3.5" />
+                  </button>
                   <button
                     type="button"
                     disabled={!pinPath.trim()}
@@ -1027,13 +1110,33 @@ export default function PluginsTab({
 
               {isOpen && p.id === "image_optimizer" && (
                 <div className="pt-1.5 border-t border-white/[0.08] space-y-1.5">
-                  <textarea
-                    rows={2}
-                    value={imgPathsText}
-                    onChange={(e) => setImgPathsText(e.target.value)}
-                    placeholder={s.imgPathPlaceholder}
-                    className="w-full rounded-lg bg-black/35 border border-white/10 p-1.5 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none resize-none"
-                  />
+                  <div className="flex gap-1.5 items-start">
+                    <textarea
+                      rows={2}
+                      value={imgPathsText}
+                      onChange={(e) => setImgPathsText(e.target.value)}
+                      placeholder={s.imgPathPlaceholder}
+                      className="flex-1 min-w-0 rounded-lg bg-black/35 border border-white/10 p-1.5 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none resize-none"
+                    />
+                    <button
+                      type="button"
+                      title={s.browseBtn}
+                      onClick={() => {
+                        void browseFiles(
+                          name,
+                          true,
+                          "Images",
+                          "*.png;*.jpg;*.jpeg;*.webp;*.bmp"
+                        ).then((files) => {
+                          if (files.length > 0) setImgPathsText(files.join("\n"));
+                        });
+                      }}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[10px] text-white/85 transition"
+                    >
+                      <FolderOpen className="w-3 h-3 text-sky-300" />
+                      <span>{s.browseBtn}</span>
+                    </button>
+                  </div>
                   <div className="flex items-center gap-1.5 flex-wrap">
                     {(["webp", "jpg", "png"] as const).map((fmt) => (
                       <button
@@ -1094,13 +1197,33 @@ export default function PluginsTab({
 
               {isOpen && p.id === "pdf_suite" && (
                 <div className="pt-1.5 border-t border-white/[0.08] space-y-1.5">
-                  <textarea
-                    rows={2}
-                    value={pdfPathsText}
-                    onChange={(e) => setPdfPathsText(e.target.value)}
-                    placeholder={s.pdfPathPlaceholder}
-                    className="w-full rounded-lg bg-black/35 border border-white/10 p-1.5 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none resize-none"
-                  />
+                  <div className="flex gap-1.5 items-start">
+                    <textarea
+                      rows={2}
+                      value={pdfPathsText}
+                      onChange={(e) => setPdfPathsText(e.target.value)}
+                      placeholder={s.pdfPathPlaceholder}
+                      className="flex-1 min-w-0 rounded-lg bg-black/35 border border-white/10 p-1.5 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none resize-none"
+                    />
+                    <button
+                      type="button"
+                      title={s.browseBtn}
+                      onClick={() => {
+                        void browseFiles(
+                          name,
+                          true,
+                          "PDF, Docs & Images",
+                          "*.pdf;*.md;*.txt;*.docx;*.png;*.jpg;*.jpeg;*.webp"
+                        ).then((files) => {
+                          if (files.length > 0) setPdfPathsText(files.join("\n"));
+                        });
+                      }}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[10px] text-white/85 transition"
+                    >
+                      <FolderOpen className="w-3 h-3 text-sky-300" />
+                      <span>{s.browseBtn}</span>
+                    </button>
+                  </div>
                   <div className="flex items-center gap-1.5 flex-wrap">
                     <button
                       type="button"
@@ -1194,6 +1317,11 @@ export default function PluginsTab({
                       </>
                     )}
                   </div>
+                  {!p.installed && (
+                    <div className="text-[10px] text-white/45 leading-snug">
+                      {s.pdfQpdfHint}
+                    </div>
+                  )}
                   {pdfOut && (
                     <div className="flex items-center justify-between text-[10px] text-emerald-300 bg-black/35 rounded-lg px-2 py-1">
                       <span className="truncate">{pdfOut.summary}</span>
@@ -1216,41 +1344,73 @@ export default function PluginsTab({
 
               {isOpen && p.id === "media_gif" && p.installed && (
                 <div className="pt-1.5 border-t border-white/[0.08] space-y-1.5">
-                  <input
-                    type="text"
-                    value={mediaPath}
-                    onChange={(e) => setMediaPath(e.target.value)}
-                    placeholder={s.mediaPathPlaceholder}
-                    className="w-full rounded-lg bg-black/35 border border-white/10 px-2 py-1 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none"
-                  />
-                  <div className="flex gap-1.5 flex-wrap">
-                    {(
-                      [
-                        { act: "gif", label: s.toGif },
-                        { act: "compress", label: s.compressMp4 },
-                        { act: "audio", label: s.extractMp3 },
-                      ] as const
-                    ).map((m) => (
+                  <div className="flex gap-1.5 items-center">
+                    <input
+                      type="text"
+                      value={mediaPath}
+                      onChange={(e) => setMediaPath(e.target.value)}
+                      placeholder={s.mediaPathPlaceholder}
+                      className="flex-1 min-w-0 rounded-lg bg-black/35 border border-white/10 px-2 py-1 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none"
+                    />
+                    <button
+                      type="button"
+                      title={s.browseBtn}
+                      onClick={() => {
+                        void browseFiles(
+                          name,
+                          false,
+                          "Video / Audio",
+                          "*.mp4;*.mkv;*.mov;*.webm;*.avi;*.mp3;*.wav;*.m4a"
+                        ).then((files) => {
+                          if (files[0]) setMediaPath(files[0]);
+                        });
+                      }}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[10px] text-white/85 transition"
+                    >
+                      <FolderOpen className="w-3 h-3 text-sky-300" />
+                      <span>{s.browseBtn}</span>
+                    </button>
+                  </div>
+                  <div className="flex gap-1.5 flex-wrap items-center">
+                    {isRunning ? (
                       <button
-                        key={m.act}
                         type="button"
-                        disabled={!mediaPath.trim() || Boolean(isRunning)}
-                        onClick={() => {
-                          setToolError(null);
-                          void invoke<PluginToolOutput>("plugin_run_media_tool", {
-                            action: m.act,
-                            inputPath: mediaPath.trim().replace(/^"(.*)"$/, "$1"),
-                            maxWidth: 540,
-                            fps: 12,
-                          })
-                            .then(setMediaOut)
-                            .catch((e) => setToolError(String(e)));
-                        }}
-                        className="px-2.5 py-1 rounded-lg bg-violet-500/80 hover:bg-violet-400 disabled:opacity-40 text-[10px] text-white"
+                        onClick={() => void invoke("cancel_plugin_task")}
+                        className="px-2.5 py-1 rounded-lg bg-rose-500/75 hover:bg-rose-500 text-[10px] text-white flex items-center gap-1"
                       >
-                        {m.label}
+                        <Square className="w-2.5 h-2.5 fill-current" />
+                        <span>{s.cancelBtn}</span>
                       </button>
-                    ))}
+                    ) : (
+                      (
+                        [
+                          { act: "gif", label: s.toGif },
+                          { act: "compress", label: s.compressMp4 },
+                          { act: "audio", label: s.extractMp3 },
+                        ] as const
+                      ).map((m) => (
+                        <button
+                          key={m.act}
+                          type="button"
+                          disabled={!mediaPath.trim()}
+                          onClick={() => {
+                            setToolError(null);
+                            setMediaOut(null);
+                            void invoke<PluginToolOutput>("plugin_run_media_tool", {
+                              action: m.act,
+                              inputPath: mediaPath.trim().replace(/^"(.*)"$/, "$1"),
+                              maxWidth: 540,
+                              fps: 12,
+                            })
+                              .then(setMediaOut)
+                              .catch((e) => setToolError(String(e)));
+                          }}
+                          className="px-2.5 py-1 rounded-lg bg-violet-500/80 hover:bg-violet-400 disabled:opacity-40 text-[10px] text-white"
+                        >
+                          {m.label}
+                        </button>
+                      ))
+                    )}
                   </div>
                   {mediaOut && (
                     <div className="flex items-center justify-between text-[10px] text-emerald-300 bg-black/35 rounded-lg px-2 py-1">
@@ -1260,6 +1420,113 @@ export default function PluginsTab({
                           type="button"
                           onClick={() =>
                             void invoke("plugin_open_folder", { path: mediaOut.outputs[0] })
+                          }
+                          className="shrink-0 ml-2 inline-flex items-center gap-1 text-sky-300 hover:underline"
+                        >
+                          <FolderOpen className="w-3 h-3" />
+                          <span>{s.openFolder}</span>
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {isOpen && p.id === "media_downloader" && p.installed && (
+                <div className="pt-1.5 border-t border-white/[0.08] space-y-1.5">
+                  <input
+                    type="text"
+                    value={dlUrl}
+                    onChange={(e) => setDlUrl(e.target.value)}
+                    placeholder={s.dlUrlPlaceholder}
+                    className="w-full rounded-lg bg-black/35 border border-white/10 px-2 py-1 text-[10.5px] font-mono text-white placeholder:text-white/30 outline-none"
+                  />
+                  <div className="flex gap-1.5 items-center">
+                    <input
+                      type="text"
+                      value={dlDir}
+                      onChange={(e) => setDlDir(e.target.value)}
+                      placeholder={s.dlFolderPlaceholder}
+                      className="flex-1 min-w-0 rounded-lg bg-black/35 border border-white/10 px-2 py-1 text-[10px] font-mono text-white placeholder:text-white/30 outline-none"
+                    />
+                    <button
+                      type="button"
+                      title={s.browseBtn}
+                      onClick={() => {
+                        void browseFolder(name, dlDir).then((dir) => {
+                          if (dir) setDlDir(dir);
+                        });
+                      }}
+                      className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/10 hover:bg-white/20 text-[10px] text-white/85 transition"
+                    >
+                      <FolderOpen className="w-3 h-3 text-sky-300" />
+                      <span>{s.browseBtn}</span>
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-2 gap-1">
+                    {(
+                      [
+                        { id: "audio_best", label: s.dlFmtAudioBest },
+                        { id: "mp4_lossless", label: s.dlFmtMp4 },
+                        { id: "audio_flac", label: s.dlFmtFlac },
+                        { id: "audio_mp3", label: s.dlFmtMp3 },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setDlFmt(opt.id)}
+                        className={`px-2 py-1 rounded-lg border text-[10px] font-medium transition ${
+                          dlFmt === opt.id
+                            ? "bg-emerald-500/20 border-emerald-400/50 text-emerald-200"
+                            : "bg-black/25 border-white/10 text-white/60 hover:text-white"
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="text-[9.5px] text-white/45 leading-snug">{s.dlHint}</div>
+                  <div className="flex items-center gap-1.5">
+                    {isRunning ? (
+                      <button
+                        type="button"
+                        onClick={() => void invoke("cancel_plugin_task")}
+                        className="px-2.5 py-1 rounded-lg bg-rose-500/75 hover:bg-rose-500 text-[10px] text-white flex items-center gap-1"
+                      >
+                        <Square className="w-2.5 h-2.5 fill-current" />
+                        <span>{s.cancelBtn}</span>
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        disabled={!dlUrl.trim() || !p.enabled}
+                        onClick={() => {
+                          setToolError(null);
+                          setDlOut(null);
+                          void invoke<PluginToolOutput>("plugin_download_media", {
+                            url: dlUrl.trim(),
+                            format: dlFmt,
+                            outputDir: dlDir.trim() ? dlDir.trim() : null,
+                          })
+                            .then(setDlOut)
+                            .catch((e) => setToolError(String(e)));
+                        }}
+                        className="px-2.5 py-1 rounded-lg bg-emerald-500/85 hover:bg-emerald-400 disabled:opacity-40 text-[10.5px] font-medium text-slate-950 flex items-center gap-1"
+                      >
+                        <Download className="w-3 h-3" />
+                        <span>{s.dlRun}</span>
+                      </button>
+                    )}
+                  </div>
+                  {dlOut && (
+                    <div className="flex items-center justify-between text-[10px] text-emerald-300 bg-black/35 rounded-lg px-2 py-1">
+                      <span className="truncate">{dlOut.summary}</span>
+                      {dlOut.outputs[0] && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void invoke("plugin_open_folder", { path: dlOut.outputs[0] })
                           }
                           className="shrink-0 ml-2 inline-flex items-center gap-1 text-sky-300 hover:underline"
                         >

@@ -14,13 +14,14 @@ use image::ImageFormat;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{Cursor, Write};
+use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Mutex as AsyncMutex;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -124,6 +125,7 @@ pub struct PluginManager {
     plugins_dir: PathBuf,
     state_path: PathBuf,
     store: Mutex<PersistedPluginStore>,
+    install_lock: AsyncMutex<()>,
     cancel_download: AtomicBool,
     cancel_task: AtomicBool,
     timer_id: AtomicU64,
@@ -258,6 +260,20 @@ fn default_plugin_defs() -> Vec<PluginInfo> {
             sha256: None,
             engine_hint: Some("ffmpeg (~95 MB)".into()),
         },
+        PluginInfo {
+            id: "media_downloader".into(),
+            kind: "engine".into(),
+            name_en: "Lossless Link Downloader (YTMP3+)".into(),
+            name_zh: "音视频链接无损下载".into(),
+            desc_en: "On-demand yt-dlp engine (reuses FFmpeg) to save links as Lossless Audio (Original / FLAC), Zero Re-encode MP4, or 320k MP3.".into(),
+            desc_zh: "按需下载 yt-dlp 引擎（自动复用 FFmpeg），发链接即可保存原声无损 / FLAC、原画无损封装 MP4 或 320k MP3。".into(),
+            enabled: false,
+            installed: false,
+            version: "latest".into(),
+            size_bytes: 0,
+            sha256: None,
+            engine_hint: Some("yt-dlp (~16 MB) + ffmpeg".into()),
+        },
     ]
 }
 
@@ -276,6 +292,7 @@ impl PluginManager {
             plugins_dir,
             state_path,
             store: Mutex::new(store),
+            install_lock: AsyncMutex::new(()),
             cancel_download: AtomicBool::new(false),
             cancel_task: AtomicBool::new(false),
             timer_id: AtomicU64::new(0),
@@ -293,34 +310,21 @@ impl PluginManager {
 
     fn sync_disk_installs(&self) {
         if let Ok(mut g) = self.store.lock() {
-            let qpdf_ok = self.engine_binary_path("pdf_suite").exists();
-            let qpdf_sz = dir_size(&self.plugins_dir.join("pdf_suite"));
-            let e_pdf = g.entries.entry("pdf_suite".into()).or_insert_with(|| PersistedPluginEntry {
-                enabled: qpdf_ok,
-                installed: qpdf_ok,
-                version: "latest".into(),
-                size_bytes: qpdf_sz,
-                sha256: None,
-            });
-            e_pdf.installed = qpdf_ok;
-            e_pdf.size_bytes = qpdf_sz;
-            if !qpdf_ok {
-                e_pdf.enabled = false;
-            }
-
-            let ff_ok = self.engine_binary_path("media_gif").exists();
-            let ff_sz = dir_size(&self.plugins_dir.join("media_gif"));
-            let e_ff = g.entries.entry("media_gif".into()).or_insert_with(|| PersistedPluginEntry {
-                enabled: ff_ok,
-                installed: ff_ok,
-                version: "latest".into(),
-                size_bytes: ff_sz,
-                sha256: None,
-            });
-            e_ff.installed = ff_ok;
-            e_ff.size_bytes = ff_sz;
-            if !ff_ok {
-                e_ff.enabled = false;
+            for id in ["pdf_suite", "media_gif", "media_downloader"] {
+                let ok = self.engine_binary_path(id).exists();
+                let sz = dir_size(&self.plugins_dir.join(id));
+                let entry = g.entries.entry(id.into()).or_insert_with(|| PersistedPluginEntry {
+                    enabled: ok,
+                    installed: ok,
+                    version: "latest".into(),
+                    size_bytes: sz,
+                    sha256: None,
+                });
+                entry.installed = ok;
+                entry.size_bytes = sz;
+                if !ok {
+                    entry.enabled = false;
+                }
             }
             self.save_store(&g);
         }
@@ -330,8 +334,45 @@ impl PluginManager {
         match id {
             "pdf_suite" => self.plugins_dir.join("pdf_suite").join("qpdf.exe"),
             "media_gif" => self.plugins_dir.join("media_gif").join("ffmpeg.exe"),
+            "media_downloader" => self.plugins_dir.join("media_downloader").join("yt-dlp.exe"),
             _ => self.plugins_dir.join(id),
         }
+    }
+
+    pub fn is_engine_ready(&self, id: &str) -> bool {
+        let bin_ok = self.engine_binary_path(id).exists();
+        if !bin_ok {
+            return false;
+        }
+        self.store
+            .lock()
+            .ok()
+            .and_then(|g| g.entries.get(id).map(|e| e.enabled && e.installed))
+            .unwrap_or(false)
+    }
+
+    pub fn resolve_ffmpeg_path(&self) -> Option<PathBuf> {
+        let bundled = self.engine_binary_path("media_gif");
+        if bundled.exists() {
+            return Some(bundled);
+        }
+        let local_copy = self.plugins_dir.join("media_downloader").join("ffmpeg.exe");
+        if local_copy.exists() {
+            return Some(local_copy);
+        }
+        if let Some(paths) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&paths) {
+                let cand = dir.join("ffmpeg.exe");
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn cancel_active_task(&self) {
+        self.cancel_task.store(true, Ordering::Relaxed);
     }
 
     pub fn list(&self) -> PluginListResponse {
@@ -414,8 +455,185 @@ impl PluginManager {
         Ok(self.list())
     }
 
+    async fn stream_download_to_temp(
+        &self,
+        client: &reqwest::Client,
+        app: &AppHandle,
+        progress_plugin_id: &str,
+        final_url: &str,
+        temp_path: &Path,
+        pct_start: u32,
+        pct_span: u32,
+        label: &str,
+    ) -> Result<String, String> {
+        if temp_path.exists() {
+            let _ = fs::remove_file(temp_path);
+        }
+        let mut resp = client
+            .get(final_url)
+            .send()
+            .await
+            .map_err(|e| format!("Download failed ({label}): {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {} downloading {label}", resp.status()));
+        }
+
+        let total = resp.content_length().unwrap_or(0);
+        let mut downloaded: u64 = 0;
+        let mut hasher = Sha256::new();
+        let mut file = File::create(temp_path).map_err(|e| e.to_string())?;
+        let mut last_pct = 0u32;
+
+        loop {
+            if self.cancel_download.load(Ordering::Relaxed) {
+                drop(file);
+                let _ = fs::remove_file(temp_path);
+                return Err("Download cancelled".into());
+            }
+            let chunk_opt = resp.chunk().await.map_err(|e| {
+                let _ = fs::remove_file(temp_path);
+                format!("Stream error ({label}): {e}")
+            })?;
+            let Some(chunk) = chunk_opt else {
+                break;
+            };
+            hasher.update(&chunk);
+            file.write_all(&chunk).map_err(|e| e.to_string())?;
+            downloaded += chunk.len() as u64;
+
+            let rel_pct = if total > 0 {
+                ((downloaded * pct_span as u64) / total).min(pct_span as u64) as u32
+            } else {
+                pct_span / 2
+            };
+            let pct = (pct_start + rel_pct).clamp(2, 96);
+            if pct != last_pct {
+                last_pct = pct;
+                let mb = downloaded as f64 / (1024.0 * 1024.0);
+                let _ = app.emit(
+                    "buddy://plugin-progress",
+                    PluginProgressPayload {
+                        plugin_id: progress_plugin_id.into(),
+                        stage: "downloading".into(),
+                        percent: pct,
+                        detail: format!("{label}: {mb:.1} MB"),
+                    },
+                );
+            }
+        }
+        drop(file);
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+
+    fn record_installed_engine(
+        &self,
+        id: &str,
+        version_tag: String,
+        size_bytes: u64,
+        sha_hex: String,
+    ) {
+        if let Ok(mut g) = self.store.lock() {
+            g.entries.insert(
+                id.to_string(),
+                PersistedPluginEntry {
+                    enabled: true,
+                    installed: true,
+                    version: version_tag,
+                    size_bytes,
+                    sha256: Some(sha_hex),
+                },
+            );
+            self.save_store(&g);
+        }
+    }
+
+    async fn install_zip_engine(
+        &self,
+        client: &reqwest::Client,
+        app: &AppHandle,
+        progress_plugin_id: &str,
+        engine_id: &str,
+        mirror: &str,
+        pct_start: u32,
+        pct_span: u32,
+    ) -> Result<(), String> {
+        let (download_url, version_tag) = if engine_id == "pdf_suite" {
+            resolve_qpdf_asset(client).await?
+        } else {
+            resolve_ffmpeg_asset(client).await?
+        };
+        let final_url = apply_mirror(&download_url, mirror);
+        let temp_zip = self.plugins_dir.join(format!("{engine_id}_download.zip.tmp"));
+        let label = if engine_id == "pdf_suite" { "qpdf" } else { "ffmpeg" };
+
+        let sha_hex = self
+            .stream_download_to_temp(
+                client,
+                app,
+                progress_plugin_id,
+                &final_url,
+                &temp_zip,
+                pct_start,
+                pct_span,
+                label,
+            )
+            .await?;
+
+        let _ = app.emit(
+            "buddy://plugin-progress",
+            PluginProgressPayload {
+                plugin_id: progress_plugin_id.into(),
+                stage: "extracting".into(),
+                percent: (pct_start + pct_span + 2).min(97),
+                detail: format!("Extracting {label}..."),
+            },
+        );
+
+        let dest_dir = self.plugins_dir.join(engine_id);
+        let temp_zip_clone = temp_zip.clone();
+        let dest_clone = dest_dir.clone();
+        let id_str = engine_id.to_string();
+        let extract_res = tokio::task::spawn_blocking(move || {
+            extract_engine_zip(&id_str, &temp_zip_clone, &dest_clone)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        let _ = fs::remove_file(&temp_zip);
+        extract_res?;
+
+        if !self.engine_binary_path(engine_id).exists() {
+            let _ = fs::remove_dir_all(&dest_dir);
+            return Err("Downloaded archive did not contain expected binary".into());
+        }
+
+        let size_bytes = dir_size(&dest_dir);
+        self.record_installed_engine(engine_id, version_tag, size_bytes, sha_hex);
+        Ok(())
+    }
+
     pub async fn install_engine(&self, app: &AppHandle, id: &str) -> Result<PluginListResponse, String> {
-        if id != "pdf_suite" && id != "media_gif" {
+        let _install_guard = self.install_lock.lock().await;
+        match self.install_engine_inner(app, id).await {
+            Ok(res) => Ok(res),
+            Err(err) => {
+                crate::logger::log_error("plugin", &format!("install `{id}` failed: {err}"));
+                let _ = app.emit(
+                    "buddy://plugin-progress",
+                    PluginProgressPayload {
+                        plugin_id: id.into(),
+                        stage: "error".into(),
+                        percent: 0,
+                        detail: err.chars().take(80).collect(),
+                    },
+                );
+                Err(err)
+            }
+        }
+    }
+
+    async fn install_engine_inner(&self, app: &AppHandle, id: &str) -> Result<PluginListResponse, String> {
+        if id != "pdf_suite" && id != "media_gif" && id != "media_downloader" {
             return Err("Only engine plugins require download".into());
         }
         self.cancel_download.store(false, Ordering::Relaxed);
@@ -442,113 +660,61 @@ impl PluginManager {
             .build()
             .map_err(|e| e.to_string())?;
 
-        let (download_url, version_tag) = if id == "pdf_suite" {
-            resolve_qpdf_asset(&client).await?
+        if id == "media_downloader" {
+            let need_ffmpeg = self.resolve_ffmpeg_path().is_none();
+            let yt_span = if need_ffmpeg { 42 } else { 88 };
+            let (dl_url, ver_tag) = resolve_ytdlp_asset(&client).await?;
+            let final_url = apply_mirror(&dl_url, &mirror);
+            let dest_dir = self.plugins_dir.join("media_downloader");
+            fs::create_dir_all(&dest_dir).map_err(|e| e.to_string())?;
+            let temp_exe = dest_dir.join("yt-dlp.exe.tmp");
+            let sha_hex = self
+                .stream_download_to_temp(
+                    &client,
+                    app,
+                    "media_downloader",
+                    &final_url,
+                    &temp_exe,
+                    2,
+                    yt_span,
+                    "yt-dlp.exe",
+                )
+                .await?;
+
+            // Validate Windows PE signature ("MZ") and reasonable size before committing
+            let valid_pe = File::open(&temp_exe)
+                .and_then(|mut f| {
+                    let meta_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                    let mut magic = [0u8; 2];
+                    let _ = f.read(&mut magic)?;
+                    Ok(meta_len >= 1_000_000 && &magic == b"MZ")
+                })
+                .unwrap_or(false);
+            if !valid_pe {
+                let _ = fs::remove_file(&temp_exe);
+                return Err("Downloaded yt-dlp binary failed PE verification.".into());
+            }
+
+            if need_ffmpeg {
+                if let Err(ff_err) = self
+                    .install_zip_engine(&client, app, "media_downloader", "media_gif", &mirror, 45, 45)
+                    .await
+                {
+                    let _ = fs::remove_file(&temp_exe);
+                    return Err(ff_err);
+                }
+            }
+
+            let final_exe = self.engine_binary_path("media_downloader");
+            if final_exe.exists() {
+                let _ = fs::remove_file(&final_exe);
+            }
+            fs::rename(&temp_exe, &final_exe).map_err(|e| e.to_string())?;
+            let sz = dir_size(&dest_dir);
+            self.record_installed_engine("media_downloader", ver_tag, sz, sha_hex);
         } else {
-            resolve_ffmpeg_asset(&client).await?
-        };
-
-        let final_url = apply_mirror(&download_url, &mirror);
-        let temp_zip = self.plugins_dir.join(format!("{id}_download.zip.tmp"));
-        if temp_zip.exists() {
-            let _ = fs::remove_file(&temp_zip);
-        }
-
-        let mut resp = client
-            .get(&final_url)
-            .send()
-            .await
-            .map_err(|e| format!("Download failed: {e}"))?;
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {} downloading engine package", resp.status()));
-        }
-
-        let total = resp.content_length().unwrap_or(0);
-        let mut downloaded: u64 = 0;
-        let mut hasher = Sha256::new();
-        let mut file = File::create(&temp_zip).map_err(|e| e.to_string())?;
-        let mut last_pct = 0u32;
-
-        loop {
-            if self.cancel_download.load(Ordering::Relaxed) {
-                drop(file);
-                let _ = fs::remove_file(&temp_zip);
-                return Err("Download cancelled".into());
-            }
-            let chunk_opt = resp.chunk().await.map_err(|e| {
-                let _ = fs::remove_file(&temp_zip);
-                format!("Stream error: {e}")
-            })?;
-            let Some(chunk) = chunk_opt else {
-                break;
-            };
-            hasher.update(&chunk);
-            file.write_all(&chunk).map_err(|e| e.to_string())?;
-            downloaded += chunk.len() as u64;
-
-            let pct = if total > 0 {
-                ((downloaded * 85) / total).min(85) as u32
-            } else {
-                35
-            };
-            if pct != last_pct {
-                last_pct = pct;
-                let mb = downloaded as f64 / (1024.0 * 1024.0);
-                let _ = app.emit(
-                    "buddy://plugin-progress",
-                    PluginProgressPayload {
-                        plugin_id: id.into(),
-                        stage: "downloading".into(),
-                        percent: pct.max(5),
-                        detail: format!("{mb:.1} MB downloaded"),
-                    },
-                );
-            }
-        }
-        drop(file);
-
-        let sha_hex = format!("{:x}", hasher.finalize());
-        let _ = app.emit(
-            "buddy://plugin-progress",
-            PluginProgressPayload {
-                plugin_id: id.into(),
-                stage: "extracting".into(),
-                percent: 90,
-                detail: "Verifying & extracting engine binaries...".into(),
-            },
-        );
-
-        let dest_dir = self.plugins_dir.join(id);
-        let temp_zip_clone = temp_zip.clone();
-        let dest_clone = dest_dir.clone();
-        let id_str = id.to_string();
-        let extract_res = tokio::task::spawn_blocking(move || {
-            extract_engine_zip(&id_str, &temp_zip_clone, &dest_clone)
-        })
-        .await
-        .map_err(|e| e.to_string())?;
-
-        let _ = fs::remove_file(&temp_zip);
-        extract_res?;
-
-        if !self.engine_binary_path(id).exists() {
-            let _ = fs::remove_dir_all(&dest_dir);
-            return Err("Downloaded archive did not contain expected binary".into());
-        }
-
-        let size_bytes = dir_size(&dest_dir);
-        if let Ok(mut g) = self.store.lock() {
-            g.entries.insert(
-                id.to_string(),
-                PersistedPluginEntry {
-                    enabled: true,
-                    installed: true,
-                    version: version_tag,
-                    size_bytes,
-                    sha256: Some(sha_hex),
-                },
-            );
-            self.save_store(&g);
+            self.install_zip_engine(&client, app, id, id, &mirror, 2, 85)
+                .await?;
         }
 
         let _ = app.emit(
@@ -696,11 +862,46 @@ async fn resolve_ffmpeg_asset(client: &reqwest::Client) -> Result<(String, Strin
     {
         if let Ok(rel) = resp.json::<serde_json::Value>().await {
             if let Some(assets) = rel["assets"].as_array() {
+                // Prefer lighter gpl-shared archive (~91 MB) before 202 MB static archive
+                for preferred in [
+                    "ffmpeg-master-latest-win64-gpl-shared.zip",
+                    "ffmpeg-master-latest-win64-gpl.zip",
+                ] {
+                    if let Some(url) = assets.iter().find_map(|a| {
+                        let name = a["name"].as_str().unwrap_or("");
+                        if name == preferred {
+                            a["browser_download_url"].as_str().map(str::to_string)
+                        } else {
+                            None
+                        }
+                    }) {
+                        return Ok((url, "latest".into()));
+                    }
+                }
+            }
+        }
+    }
+    Ok((
+        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip"
+            .into(),
+        "latest".into(),
+    ))
+}
+
+async fn resolve_ytdlp_asset(client: &reqwest::Client) -> Result<(String, String), String> {
+    if let Ok(resp) = client
+        .get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest")
+        .send()
+        .await
+    {
+        if let Ok(rel) = resp.json::<serde_json::Value>().await {
+            let tag = rel["tag_name"].as_str().unwrap_or("latest").to_string();
+            if let Some(assets) = rel["assets"].as_array() {
                 for a in assets {
                     let name = a["name"].as_str().unwrap_or("");
-                    if name == "ffmpeg-master-latest-win64-gpl.zip" {
+                    if name == "yt-dlp.exe" {
                         if let Some(url) = a["browser_download_url"].as_str() {
-                            return Ok((url.to_string(), "latest".into()));
+                            return Ok((url.to_string(), tag));
                         }
                     }
                 }
@@ -708,52 +909,85 @@ async fn resolve_ffmpeg_asset(client: &reqwest::Client) -> Result<(String, Strin
         }
     }
     Ok((
-        "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
-            .into(),
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe".into(),
         "latest".into(),
     ))
 }
 
 fn extract_engine_zip(id: &str, zip_path: &Path, dest_dir: &Path) -> Result<(), String> {
-    if dest_dir.exists() {
-        let _ = fs::remove_dir_all(dest_dir);
+    let parent = dest_dir.parent().unwrap_or_else(|| Path::new("."));
+    let staging = parent.join(format!(".staging_{id}_{}", std::process::id()));
+    if staging.exists() {
+        let _ = fs::remove_dir_all(&staging);
     }
-    fs::create_dir_all(dest_dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
 
-    let file = File::open(zip_path).map_err(|e| format!("Cannot open downloaded zip: {e}"))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {e}"))?;
+    let work_res: Result<(), String> = (|| {
+        let file = File::open(zip_path).map_err(|e| format!("Cannot open downloaded zip: {e}"))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("Invalid zip archive: {e}"))?;
 
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
-        if entry.is_dir() {
-            continue;
-        }
-        let raw_name = entry.name().replace('\\', "/");
-        let file_name = Path::new(&raw_name)
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-
-        let keep = match id {
-            "media_gif" => file_name == "ffmpeg.exe" || file_name == "ffprobe.exe",
-            "pdf_suite" => {
-                raw_name.contains("/bin/") && (file_name.ends_with(".exe") || file_name.ends_with(".dll"))
+        for i in 0..archive.len() {
+            let mut entry = archive.by_index(i).map_err(|e| e.to_string())?;
+            if entry.is_dir() {
+                continue;
             }
-            _ => false,
-        };
+            let raw_name = entry.name().replace('\\', "/");
+            let file_name = Path::new(&raw_name)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
 
-        if keep {
-            let out_path = dest_dir.join(
-                Path::new(&raw_name)
-                    .file_name()
-                    .ok_or("Invalid filename in archive")?,
-            );
-            let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
-            std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+            let keep = match id {
+                "media_gif" => {
+                    (raw_name.contains("/bin/") || !raw_name.contains('/'))
+                        && (file_name == "ffmpeg.exe" || file_name.ends_with(".dll"))
+                }
+                "pdf_suite" => {
+                    raw_name.contains("/bin/")
+                        && (file_name.ends_with(".exe") || file_name.ends_with(".dll"))
+                }
+                _ => false,
+            };
+
+            if keep {
+                let out_path = staging.join(
+                    Path::new(&raw_name)
+                        .file_name()
+                        .ok_or("Invalid filename in archive")?,
+                );
+                let mut out_file = File::create(&out_path).map_err(|e| e.to_string())?;
+                std::io::copy(&mut entry, &mut out_file).map_err(|e| e.to_string())?;
+            }
         }
+
+        let expected = match id {
+            "media_gif" => "ffmpeg.exe",
+            "pdf_suite" => "qpdf.exe",
+            _ => "",
+        };
+        if !expected.is_empty() && !staging.join(expected).exists() {
+            return Err(format!("Downloaded archive did not contain `{expected}`"));
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = work_res {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
     }
 
+    if dest_dir.exists() {
+        fs::remove_dir_all(dest_dir).map_err(|e| {
+            let _ = fs::remove_dir_all(&staging);
+            format!("Failed clearing old plugin directory: {e}")
+        })?;
+    }
+    fs::rename(&staging, dest_dir).map_err(|e| {
+        let _ = fs::remove_dir_all(&staging);
+        format!("Failed committing extracted plugin: {e}")
+    })?;
     Ok(())
 }
 
@@ -1502,6 +1736,90 @@ fn run_qpdf_action(
 // 6. Media / GIF Converter (On-demand FFmpeg Engine)
 // ============================================================================
 
+fn emit_plugin_progress(app: &AppHandle, plugin_id: &str, stage: &str, percent: u32, detail: &str) {
+    let _ = app.emit(
+        "buddy://plugin-progress",
+        PluginProgressPayload {
+            plugin_id: plugin_id.to_string(),
+            stage: stage.to_string(),
+            percent,
+            detail: detail.chars().take(80).collect(),
+        },
+    );
+}
+
+fn spawn_cancel_watchdog(child_pid: u32, done_flag: Arc<AtomicBool>, cancel_mirror: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let _ = child_pid;
+        while !done_flag.load(Ordering::Relaxed) {
+            if cancel_mirror.load(Ordering::Relaxed) {
+                #[cfg(windows)]
+                {
+                    let mut tk = Command::new("taskkill");
+                    tk.args(["/PID", &child_pid.to_string(), "/T", "/F"]);
+                    tk.creation_flags(CREATE_NO_WINDOW);
+                    let _ = tk.output();
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(120));
+        }
+    });
+}
+
+/// Lossy line reader that splits on `\n` or `\r` without failing on non-UTF-8 Windows console bytes.
+fn for_each_lossy_line<R: Read, F: FnMut(&str)>(reader: R, mut on_line: F) {
+    let mut br = BufReader::new(reader);
+    let mut buf = Vec::with_capacity(256);
+    loop {
+        buf.clear();
+        let Ok(n) = br.read_until(b'\n', &mut buf) else {
+            break;
+        };
+        if n == 0 {
+            break;
+        }
+        let chunk = String::from_utf8_lossy(&buf);
+        for part in chunk.split('\r') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                on_line(trimmed);
+            }
+        }
+    }
+}
+
+fn parse_ffmpeg_secs(tag: &str) -> Option<f64> {
+    let mut parts = tag.trim().split(':');
+    let h: f64 = parts.next()?.parse().ok()?;
+    let m: f64 = parts.next()?.parse().ok()?;
+    let s: f64 = parts.next()?.parse().ok()?;
+    Some(h * 3600.0 + m * 60.0 + s)
+}
+
+fn parse_ffmpeg_progress_line(line: &str, total_secs: &mut Option<f64>) -> Option<u32> {
+    if let Some(pos) = line.find("Duration:") {
+        let rest = line[pos + 9..].trim();
+        let dur_str = rest.split(',').next().unwrap_or("");
+        if let Some(secs) = parse_ffmpeg_secs(dur_str) {
+            if secs > 0.1 {
+                *total_secs = Some(secs);
+            }
+        }
+    }
+    if let Some(pos) = line.find("time=") {
+        let rest = line[pos + 5..].trim();
+        let time_str = rest.split_whitespace().next().unwrap_or("");
+        if let Some(cur) = parse_ffmpeg_secs(time_str) {
+            if let Some(tot) = *total_secs {
+                let pct = ((cur / tot) * 85.0 + 10.0).clamp(10.0, 95.0) as u32;
+                return Some(pct);
+            }
+        }
+    }
+    None
+}
+
 pub async fn run_media_tool(
     app: &AppHandle,
     mgr: &PluginManager,
@@ -1510,13 +1828,31 @@ pub async fn run_media_tool(
     max_width: Option<u32>,
     fps: Option<u32>,
 ) -> Result<PluginToolOutput, String> {
-    let ffmpeg = mgr.engine_binary_path("media_gif");
+    match run_media_tool_inner(app, mgr, action, input_path, max_width, fps).await {
+        Ok(out) => Ok(out),
+        Err(err) => {
+            crate::logger::log_error("media_gif", &format!("ffmpeg `{action}` failed: {err}"));
+            emit_plugin_progress(app, "media_gif", "error", 0, &err);
+            Err(err)
+        }
+    }
+}
+
+async fn run_media_tool_inner(
+    app: &AppHandle,
+    mgr: &PluginManager,
+    action: &str,
+    input_path: &str,
+    max_width: Option<u32>,
+    fps: Option<u32>,
+) -> Result<PluginToolOutput, String> {
+    let ffmpeg = mgr.resolve_ffmpeg_path().unwrap_or_else(|| mgr.engine_binary_path("media_gif"));
     if !ffmpeg.exists() {
         return Err("FFmpeg engine not installed yet. Install Media / GIF Converter first.".into());
     }
     let src = Path::new(input_path.trim());
     if !src.exists() {
-        return Err(format!("Video file not found: {input_path}"));
+        return Err(format!("Media file not found: {input_path}"));
     }
 
     mgr.cancel_task.store(false, Ordering::Relaxed);
@@ -1530,7 +1866,7 @@ pub async fn run_media_tool(
         "gif" => {
             let out = unique_output_path(dir, stem, "gif");
             let vf = format!(
-                "fps={fps_val},scale={width}:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse"
+                "fps={fps_val},scale='min({width},iw)':-1:flags=lanczos,split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5"
             );
             (
                 out.clone(),
@@ -1569,12 +1905,20 @@ pub async fn run_media_tool(
                     "-y".into(),
                     "-i".into(),
                     src.to_string_lossy().into(),
+                    "-vf".into(),
+                    "scale=trunc(iw/2)*2:trunc(ih/2)*2".into(),
                     "-vcodec".into(),
                     "libx264".into(),
+                    "-pix_fmt".into(),
+                    "yuv420p".into(),
                     "-crf".into(),
                     "26".into(),
                     "-preset".into(),
                     "veryfast".into(),
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    "160k".into(),
                     "-movflags".into(),
                     "+faststart".into(),
                     out.to_string_lossy().into(),
@@ -1583,43 +1927,73 @@ pub async fn run_media_tool(
         }
     };
 
-    let _ = app.emit(
-        "buddy://plugin-progress",
-        PluginProgressPayload {
-            plugin_id: "media_gif".into(),
-            stage: "running".into(),
-            percent: 25,
-            detail: format!("Running FFmpeg ({action})..."),
-        },
-    );
+    emit_plugin_progress(app, "media_gif", "running", 8, &format!("Running FFmpeg ({action})..."));
 
-    let ff_clone = ffmpeg.clone();
-    let res = tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(ff_clone);
-        cmd.args(&args);
-        #[cfg(windows)]
-        cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.output()
-    })
-    .await
-    .map_err(|e| e.to_string())?
-    .map_err(|e| format!("Failed starting ffmpeg: {e}"))?;
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.args(&args).stdout(Stdio::null()).stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
-    if !res.status.success() || !out_path.exists() {
-        let err = String::from_utf8_lossy(&res.stderr);
-        let tail: String = err.chars().rev().take(260).collect::<String>().chars().rev().collect();
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed starting ffmpeg: {e}"))?;
+    let child_pid = child.id();
+    let stderr = child.stderr.take();
+
+    let cancel_done = Arc::new(AtomicBool::new(false));
+    let cancel_mirror = Arc::new(AtomicBool::new(false));
+    spawn_cancel_watchdog(child_pid, Arc::clone(&cancel_done), Arc::clone(&cancel_mirror));
+
+    let app_c = app.clone();
+    let action_owned = action.to_string();
+    let blocking_fut = tokio::task::spawn_blocking(move || {
+        let mut tail = Vec::<String>::new();
+        let mut total_secs: Option<f64> = None;
+        let mut last_pct = 8u32;
+        if let Some(se) = stderr {
+            for_each_lossy_line(se, |line| {
+                if let Some(pct) = parse_ffmpeg_progress_line(line, &mut total_secs) {
+                    if pct > last_pct {
+                        last_pct = pct;
+                        emit_plugin_progress(
+                            &app_c,
+                            "media_gif",
+                            "running",
+                            pct,
+                            &format!("Converting ({action_owned}) {pct}%"),
+                        );
+                    }
+                }
+                tail.push(line.to_string());
+                if tail.len() > 10 {
+                    tail.remove(0);
+                }
+            });
+        }
+        let status = child.wait().map_err(|e| format!("Wait error: {e}"))?;
+        Ok::<(std::process::ExitStatus, String), String>((status, tail.join("\n")))
+    });
+
+    while !blocking_fut.is_finished() {
+        if mgr.cancel_task.load(Ordering::Relaxed) {
+            cancel_mirror.store(true, Ordering::Relaxed);
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    let (status, err_tail) = blocking_fut.await.map_err(|e| e.to_string())??;
+    cancel_done.store(true, Ordering::Relaxed);
+
+    if mgr.cancel_task.load(Ordering::Relaxed) {
+        let _ = fs::remove_file(&out_path);
+        return Err("Conversion cancelled.".into());
+    }
+
+    if !status.success() || !out_path.exists() {
+        let tail: String = err_tail.chars().rev().take(280).collect::<String>().chars().rev().collect();
         return Err(format!("FFmpeg failed: {}", tail.trim()));
     }
 
-    let _ = app.emit(
-        "buddy://plugin-progress",
-        PluginProgressPayload {
-            plugin_id: "media_gif".into(),
-            stage: "done".into(),
-            percent: 100,
-            detail: "Completed".into(),
-        },
-    );
+    emit_plugin_progress(app, "media_gif", "done", 100, "Completed");
 
     Ok(PluginToolOutput {
         outputs: vec![out_path.to_string_lossy().to_string()],
@@ -1644,4 +2018,414 @@ pub fn open_output_in_explorer(path: &str) {
     }
     #[cfg(not(windows))]
     {}
+}
+
+// ============================================================================
+// 7. Lossless Link Media & Audio Downloader (On-demand yt-dlp + FFmpeg)
+// ============================================================================
+
+pub fn default_downloads_dir() -> PathBuf {
+    let dl = crate::agent_tools::user_home_dir().join("Downloads");
+    if dl.exists() {
+        dl
+    } else {
+        crate::agent_tools::user_home_dir()
+    }
+}
+
+fn validate_media_url(raw: &str) -> Result<String, String> {
+    let clean = raw.trim().trim_matches('"').to_string();
+    if !(clean.starts_with("https://") || clean.starts_with("http://")) {
+        return Err("URL must begin with http:// or https://".into());
+    }
+    if clean.len() < 12 || clean.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("Invalid URL format (no spaces or control characters allowed).".into());
+    }
+    Ok(clean)
+}
+
+fn build_ytdlp_command_args(
+    format_key: &str,
+    url: &str,
+    out_dir: &Path,
+    ffmpeg_path: Option<&Path>,
+) -> (&'static str, Vec<String>) {
+    let mut args = vec![
+        "--no-playlist".to_string(),
+        "--encoding".to_string(),
+        "utf-8".to_string(),
+        "--windows-filenames".to_string(),
+        "--newline".to_string(),
+        "--no-simulate".to_string(),
+        "--print".to_string(),
+        "after_move:filepath".to_string(),
+        "-P".to_string(),
+        out_dir.to_string_lossy().into_owned(),
+        "-o".to_string(),
+        "%(title).120B [%(id)s].%(ext)s".to_string(),
+    ];
+
+    if let Some(ff) = ffmpeg_path {
+        let loc = ff.parent().unwrap_or(ff);
+        args.push("--ffmpeg-location".to_string());
+        args.push(loc.to_string_lossy().into_owned());
+    }
+
+    let label = match format_key.trim().to_ascii_lowercase().as_str() {
+        "mp4" | "mp4_lossless" | "video" => {
+            args.extend([
+                "-f".to_string(),
+                "bv*[vcodec^=avc1]+ba[acodec^=mp4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b".to_string(),
+                "--merge-output-format".to_string(),
+                "mp4".to_string(),
+            ]);
+            "MP4 (Zero Re-encode)"
+        }
+        "flac" | "audio_flac" => {
+            args.extend([
+                "-f".to_string(),
+                "bestaudio/best".to_string(),
+                "-x".to_string(),
+                "--audio-format".to_string(),
+                "flac".to_string(),
+                "--add-metadata".to_string(),
+            ]);
+            "FLAC (Lossless)"
+        }
+        "mp3" | "audio_mp3" => {
+            args.extend([
+                "-f".to_string(),
+                "bestaudio/best".to_string(),
+                "-x".to_string(),
+                "--audio-format".to_string(),
+                "mp3".to_string(),
+                "--audio-quality".to_string(),
+                "320K".to_string(),
+                "--add-metadata".to_string(),
+            ]);
+            "MP3 320k"
+        }
+        _ => {
+            // Best native original audio stream (no lossy re-encoding; never fetch full 4K video)
+            args.extend([
+                "-f".to_string(),
+                "bestaudio/best".to_string(),
+                "-x".to_string(),
+                "--audio-format".to_string(),
+                "best".to_string(),
+                "--add-metadata".to_string(),
+            ]);
+            "Original Audio (Zero Re-encode)"
+        }
+    };
+
+    args.push("--".to_string());
+    args.push(url.to_string());
+    (label, args)
+}
+
+fn parse_ytdlp_progress_line(line: &str) -> Option<(u32, String)> {
+    let trimmed = line.trim();
+    if trimmed.contains("[ExtractAudio]") || trimmed.contains("[Merger]") {
+        return Some((94, "Remuxing / extracting lossless stream via FFmpeg...".into()));
+    }
+    if !trimmed.starts_with("[download]") {
+        return None;
+    }
+    if let Some(pct_idx) = trimmed.find('%') {
+        let prefix = &trimmed[..pct_idx];
+        let num_str: String = prefix
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+        if let Ok(val) = num_str.parse::<f32>() {
+            let pct = val.round().clamp(1.0, 92.0) as u32;
+            let detail = trimmed
+                .strip_prefix("[download]")
+                .unwrap_or(trimmed)
+                .trim()
+                .chars()
+                .take(56)
+                .collect();
+            return Some((pct, detail));
+        }
+    }
+    None
+}
+
+fn find_newest_media_in_dir(dir: &Path, since: SystemTime) -> Option<String> {
+    let cutoff = since.checked_sub(Duration::from_secs(2)).unwrap_or(since);
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    let rd = fs::read_dir(dir).ok()?;
+    for entry in rd.flatten() {
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if name.ends_with(".part") || name.ends_with(".ytdl") || name.ends_with(".tmp") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            if let Ok(mtime) = meta.modified() {
+                if mtime >= cutoff && best.as_ref().map(|b| mtime > b.0).unwrap_or(true) {
+                    best = Some((mtime, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p.to_string_lossy().to_string())
+}
+
+pub async fn run_media_download(
+    app: &AppHandle,
+    mgr: &PluginManager,
+    url: &str,
+    format: &str,
+    output_dir: Option<&str>,
+) -> Result<PluginToolOutput, String> {
+    match run_media_download_inner(app, mgr, url, format, output_dir).await {
+        Ok(out) => Ok(out),
+        Err(err) => {
+            crate::logger::log_error("media_downloader", &format!("download failed: {err}"));
+            emit_plugin_progress(app, "media_downloader", "error", 0, &err);
+            Err(err)
+        }
+    }
+}
+
+async fn run_media_download_inner(
+    app: &AppHandle,
+    mgr: &PluginManager,
+    url: &str,
+    format: &str,
+    output_dir: Option<&str>,
+) -> Result<PluginToolOutput, String> {
+    let yt_dlp = mgr.engine_binary_path("media_downloader");
+    if !yt_dlp.exists() {
+        return Err("Media Downloader engine is not installed yet. Install it from Plugins Hub.".into());
+    }
+    if !mgr.is_engine_ready("media_downloader") {
+        return Err("Media Downloader plugin is disabled. Enable it in Plugins Hub.".into());
+    }
+
+    let clean_url = validate_media_url(url)?;
+    let out_dir = match output_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(custom) => crate::agent_tools::resolve_user_path(custom, None)?,
+        None => default_downloads_dir(),
+    };
+    crate::agent_tools::check_path_allowed(&out_dir, true)?;
+    if !out_dir.exists() {
+        fs::create_dir_all(&out_dir).map_err(|e| format!("Failed creating folder: {e}"))?;
+    }
+
+    let ffmpeg_path = mgr.resolve_ffmpeg_path().ok_or_else(|| {
+        "FFmpeg dependency is missing. Re-install Lossless Link Downloader or Media / GIF Converter in Plugins.".to_string()
+    })?;
+
+    mgr.cancel_task.store(false, Ordering::Relaxed);
+    let started_at = SystemTime::now();
+    let (label, args) = build_ytdlp_command_args(format, &clean_url, &out_dir, Some(&ffmpeg_path));
+
+    emit_plugin_progress(
+        app,
+        "media_downloader",
+        "running",
+        3,
+        &format!("Fetching metadata ({label})..."),
+    );
+
+    let app_c = app.clone();
+    let cancel_watch_done = Arc::new(AtomicBool::new(false));
+    let mgr_cancel_poll = &mgr.cancel_task;
+
+    let mut cmd = Command::new(&yt_dlp);
+    cmd.args(&args)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed starting yt-dlp: {e}"))?;
+    let child_pid = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Forward stderr lines lossily in background so pipes never deadlock or stop on non-UTF-8
+    let err_tail = Arc::new(Mutex::new(Vec::<String>::new()));
+    let err_tail_c = Arc::clone(&err_tail);
+    let stderr_handle = std::thread::spawn(move || {
+        if let Some(se) = stderr {
+            for_each_lossy_line(se, |line| {
+                if let Ok(mut buf) = err_tail_c.lock() {
+                    buf.push(line.to_string());
+                    if buf.len() > 8 {
+                        buf.remove(0);
+                    }
+                }
+            });
+        }
+    });
+
+    let cancel_mirror = Arc::new(AtomicBool::new(false));
+    spawn_cancel_watchdog(child_pid, Arc::clone(&cancel_watch_done), Arc::clone(&cancel_mirror));
+
+    let blocking_fut = tokio::task::spawn_blocking(move || {
+        let mut last_printed_file: Option<String> = None;
+        if let Some(so) = stdout {
+            for_each_lossy_line(so, |trimmed| {
+                if let Some((pct, detail)) = parse_ytdlp_progress_line(trimmed) {
+                    emit_plugin_progress(&app_c, "media_downloader", "running", pct, &detail);
+                } else {
+                    let cand_str = trimmed.trim_matches('"');
+                    if Path::new(cand_str).is_file() {
+                        last_printed_file = Some(cand_str.to_string());
+                    }
+                }
+            });
+        }
+        let status = child.wait().map_err(|e| format!("Wait error: {e}"))?;
+        let _ = stderr_handle.join();
+        Ok::<(std::process::ExitStatus, Option<String>), String>((status, last_printed_file))
+    });
+
+    while !blocking_fut.is_finished() {
+        if mgr_cancel_poll.load(Ordering::Relaxed) {
+            cancel_mirror.store(true, Ordering::Relaxed);
+        }
+        tokio::time::sleep(Duration::from_millis(120)).await;
+    }
+    let (status, file_opt) = blocking_fut.await.map_err(|e| e.to_string())??;
+    cancel_watch_done.store(true, Ordering::Relaxed);
+
+    if mgr.cancel_task.load(Ordering::Relaxed) {
+        return Err("Download cancelled.".into());
+    }
+
+    if !status.success() {
+        let err_msg = err_tail
+            .lock()
+            .ok()
+            .map(|b| b.join("\n"))
+            .unwrap_or_default();
+        let detail = err_msg.chars().rev().take(280).collect::<String>().chars().rev().collect::<String>();
+        return Err(format!("yt-dlp error: {}", detail.trim()));
+    }
+
+    let final_path = file_opt
+        .or_else(|| find_newest_media_in_dir(&out_dir, started_at))
+        .ok_or_else(|| {
+            "Download finished, but output file path could not be verified.".to_string()
+        })?;
+    let file_name = Path::new(&final_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("media")
+        .to_string();
+
+    let _ = app.emit(
+        "buddy://plugin-progress",
+        PluginProgressPayload {
+            plugin_id: "media_downloader".into(),
+            stage: "done".into(),
+            percent: 100,
+            detail: file_name.clone(),
+        },
+    );
+
+    Ok(PluginToolOutput {
+        outputs: vec![final_path],
+        summary: format!("Saved ({label}): {file_name}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_media_urls_and_builds_lossless_ytdlp_args() {
+        assert!(validate_media_url("javascript:alert(1)").is_err());
+        assert!(validate_media_url("https://example.com/a b").is_err());
+        let ok = validate_media_url("  https://www.youtube.com/watch?v=dQw4w9WgXcQ  ").unwrap();
+        assert_eq!(ok, "https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+
+        let out_dir = Path::new("C:\\Users\\Test\\Downloads");
+        let ff = Path::new("C:\\AppData\\plugins\\media_gif\\ffmpeg.exe");
+        let (lbl_mp4, args_mp4) = build_ytdlp_command_args("mp4_lossless", &ok, out_dir, Some(ff));
+        assert_eq!(lbl_mp4, "MP4 (Zero Re-encode)");
+        assert!(args_mp4.contains(&"--merge-output-format".to_string()));
+        assert!(args_mp4.contains(&"C:\\AppData\\plugins\\media_gif".to_string()));
+        assert!(args_mp4.contains(&"--no-playlist".to_string()));
+
+        let (lbl_best, args_best) = build_ytdlp_command_args("audio_best", &ok, out_dir, Some(ff));
+        assert_eq!(lbl_best, "Original Audio (Zero Re-encode)");
+        assert!(args_best.contains(&"bestaudio/best".to_string()));
+        assert!(args_best.contains(&"utf-8".to_string()));
+        assert!(!args_best.contains(&"mp3".to_string()));
+
+        let (lbl_flac, args_flac) = build_ytdlp_command_args("audio_flac", &ok, out_dir, Some(ff));
+        assert_eq!(lbl_flac, "FLAC (Lossless)");
+        assert!(args_flac.contains(&"bestaudio/best".to_string()));
+        assert!(args_flac.contains(&"flac".to_string()));
+
+        let (lbl_mp3, args_mp3) = build_ytdlp_command_args("audio_mp3", &ok, out_dir, Some(ff));
+        assert_eq!(lbl_mp3, "MP3 320k");
+        assert!(args_mp3.contains(&"320K".to_string()));
+    }
+
+    #[test]
+    fn extract_engine_zip_handles_shared_ffmpeg_and_cleans_on_invalid_zip() {
+        let base = std::env::temp_dir().join(format!("buddy_extract_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        let dest = base.join("media_gif");
+        let bad_zip = base.join("bad.zip");
+        fs::write(&bad_zip, b"not a zip").unwrap();
+        assert!(extract_engine_zip("media_gif", &bad_zip, &dest).is_err());
+        assert!(!dest.exists(), "failed extraction must never leave empty folder");
+
+        let ok_zip = base.join("ok.zip");
+        {
+            let f = File::create(&ok_zip).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = zip::write::SimpleFileOptions::default();
+            zw.start_file("ffmpeg-master-latest-win64-gpl-shared/bin/ffmpeg.exe", opts).unwrap();
+            zw.write_all(b"MZ_FAKE_FFMPEG").unwrap();
+            zw.start_file("ffmpeg-master-latest-win64-gpl-shared/bin/avcodec-63.dll", opts).unwrap();
+            zw.write_all(b"FAKE_DLL").unwrap();
+            zw.start_file("ffmpeg-master-latest-win64-gpl-shared/bin/ffplay.exe", opts).unwrap();
+            zw.write_all(b"SKIP_ME").unwrap();
+            zw.finish().unwrap();
+        }
+        extract_engine_zip("media_gif", &ok_zip, &dest).unwrap();
+        assert!(dest.join("ffmpeg.exe").exists());
+        assert!(dest.join("avcodec-63.dll").exists());
+        assert!(!dest.join("ffplay.exe").exists());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parses_ytdlp_progress_lines_cleanly() {
+        let p = parse_ytdlp_progress_line("[download]  47.8% of   24.30MiB at    3.21MiB/s ETA 00:04").unwrap();
+        assert_eq!(p.0, 48);
+        assert!(p.1.contains("47.8%"));
+        let remux = parse_ytdlp_progress_line("[Merger] Merging formats into \"song.mp4\"").unwrap();
+        assert_eq!(remux.0, 94);
+        assert!(parse_ytdlp_progress_line("C:\\Users\\Test\\Downloads\\song.mp4").is_none());
+    }
 }

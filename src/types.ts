@@ -168,6 +168,7 @@ export interface ChatMessage {
   thought?: string;
   attachments?: AttachmentPayload[];
   steps?: AgentStep[];
+  outputPaths?: string[];
   isError?: boolean;
 }
 
@@ -182,6 +183,16 @@ export interface ConversationSummary {
 export interface PersonalityOption {
   id: string;
   label: string;
+}
+
+export interface ModelProfile {
+  id: string;
+  name: string;
+  api_provider: "openai" | "anthropic" | "gemini" | string;
+  base_url: string;
+  model_id: string;
+  supports_vision: boolean;
+  has_api_key: boolean;
 }
 
 export interface AppSettings {
@@ -201,6 +212,46 @@ export interface AppSettings {
   dock_cx?: number | null;
   dock_cy?: number | null;
   update_endpoint?: string;
+  model_profiles?: ModelProfile[];
+  chat_profile_id?: string;
+  watch_profile_id?: string;
+}
+
+export interface ShareTargetInfo {
+  id: string;
+  kind: "auto_cursor" | "monitor" | "window" | string;
+  title: string;
+  app_name: string;
+  width: number;
+  height: number;
+  is_primary: boolean;
+  hwnd: number;
+}
+
+export interface ShareStatePayload {
+  active: boolean;
+  paused: boolean;
+  minimized: boolean;
+  analyzing: boolean;
+  target_id: string;
+  target_kind: "monitor" | "window" | string;
+  target_label: string;
+  target_hwnd: number;
+  dock_edge: string;
+  goal: string;
+  cadence: "quiet" | "balanced" | "active" | string;
+  show_border: boolean;
+  watch_profile_id: string;
+  frame_count: number;
+  reason: string;
+  last_error?: string;
+}
+
+export interface ShareWhisperPayload {
+  id: string;
+  text: string;
+  timestamp_ms: number;
+  target_label: string;
 }
 
 export interface SkillInfo {

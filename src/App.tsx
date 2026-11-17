@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Clock, Download, MessageSquare, Puzzle, Settings, X } from "lucide-react";
+import { Clock, Download, MessageSquare, Pause, Play, Puzzle, Settings, Square, X } from "lucide-react";
 import ChatTab, { memoryToAttachment } from "./components/ChatTab";
 import MemoryTab from "./components/MemoryTab";
 import PluginsTab from "./components/PluginsTab";
@@ -25,6 +25,9 @@ import type {
   OcrResult,
   PluginListResponse,
   PluginProgressPayload,
+  PluginToolOutput,
+  ShareStatePayload,
+  ShareWhisperPayload,
   SkillInfo,
   TabId,
   ThinkingLevel,
@@ -177,6 +180,9 @@ export default function App() {
   const [pluginProgress, setPluginProgress] = useState<Record<string, PluginProgressPayload>>({});
   const [lastPickedColor, setLastPickedColor] = useState<ColorPickedPayload | null>(null);
   const [timerState, setTimerState] = useState<TimerTickPayload | null>(null);
+  const [shareState, setShareState] = useState<ShareStatePayload | null>(null);
+  const [activeWhisper, setActiveWhisper] = useState<ShareWhisperPayload | null>(null);
+  const [whisperHovered, setWhisperHovered] = useState(false);
   const [droppedPathsHint, setDroppedPathsHint] = useState<string[]>([]);
   const [focusedPluginId, setFocusedPluginId] = useState<string | null>(null);
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -193,6 +199,9 @@ export default function App() {
   const [activeStreamId, setActiveStreamId] = useState<string | null>(null);
 
   const stateRef = useRef<BuddyState>("idle");
+  const shareStateRef = useRef<ShareStatePayload | null>(null);
+  const whisperRef = useRef<HTMLDivElement | null>(null);
+  const whisperTimerRef = useRef<number | null>(null);
   const activeConversationIdRef = useRef<number | null>(null);
   const focusedRef = useRef(false);
   const thinkingRef = useRef(false);
@@ -340,6 +349,13 @@ export default function App() {
     const pillFill = pose.isHappyGreen ? "#6ee7b7" : "#ffffff";
     const arcStroke = pose.isHappyGreen ? "#6ee7b7" : "#ffffff";
     const glintCy = Math.max(10, py + pose.pillH * 0.28);
+    const glintRy = Math.min(4.5, Math.max(0.8, pose.pillH * 0.14));
+    const glintFade = Math.min(1, Math.max(0, (pose.pillH - 7) / 14));
+    const effectiveGlintOp = pose.glintOp * glintFade * Math.min(1, pose.pillOp);
+    const glowRx = Math.max(5, pose.pillW * 0.5 + 1.5);
+    const glowRy =
+      pose.pillOp < 0.2 ? 5.5 : Math.max(4.5, pose.pillH * 0.5 + 1.5);
+    const effectiveGlowOp = pose.pillOp < 0.2 ? 0 : pose.glowOp;
     const dStr = `M 8 22 Q 22 ${(22 + pose.arcBend).toFixed(2)} 36 22`;
 
     const applySide = (
@@ -349,7 +365,9 @@ export default function App() {
       arc: SVGPathElement | null
     ) => {
       if (glow) {
-        glow.setAttribute("opacity", pose.glowOp.toFixed(2));
+        glow.setAttribute("rx", glowRx.toFixed(2));
+        glow.setAttribute("ry", glowRy.toFixed(2));
+        glow.setAttribute("opacity", effectiveGlowOp.toFixed(2));
         glow.setAttribute("fill", "#ffffff");
       }
       if (pill) {
@@ -363,7 +381,8 @@ export default function App() {
       }
       if (glint) {
         glint.setAttribute("cy", glintCy.toFixed(2));
-        glint.setAttribute("opacity", pose.glintOp.toFixed(2));
+        glint.setAttribute("ry", glintRy.toFixed(2));
+        glint.setAttribute("opacity", effectiveGlintOp.toFixed(2));
       }
       if (arc) {
         arc.setAttribute("d", dStr);
@@ -548,21 +567,14 @@ export default function App() {
     syncMusicOverlay(next);
 
     if (next === "idle") {
+      const sharing = Boolean(shareStateRef.current?.active);
       s.tEyeSize = 26;
-      setCapsuleSizeTarget(152, 42, 21, 42);
-      if (f.wasDrowsy) {
-        f.idleBehavior = "settle_drowsy";
-        f.idleElapsed = 0;
-        f.idleDuration = 2.6;
-        f.idleEyeMode = "open";
-        renderEyeSvg("open", 7.5);
-      } else {
-        f.idleBehavior = "settle_drowsy";
-        f.idleElapsed = 0;
-        f.idleDuration = 3.2;
-        f.idleEyeMode = "open";
-        renderEyeSvg("open", 8.0);
-      }
+      setCapsuleSizeTarget(sharing ? 224 : 152, 42, 21, 42);
+      f.idleBehavior = sharing ? "look_around" : "settle_drowsy";
+      f.idleElapsed = 0;
+      f.idleDuration = sharing ? 4.0 : f.wasDrowsy ? 2.6 : 3.2;
+      f.idleEyeMode = "open";
+      renderEyeSvg("open", sharing ? 9.5 : f.wasDrowsy ? 7.5 : 8.0);
     } else if (next === "sleep") {
       s.tEyeSize = 24;
       setCapsuleSizeTarget(138, 38, 19, 38);
@@ -588,16 +600,17 @@ export default function App() {
         height: side ? 230 : 64,
       });
     } else if (next === "peek") {
+      const sharing = Boolean(shareStateRef.current?.active);
       if (musicRef.current.playing) {
         s.tEyeSize = 26;
-        setCapsuleSizeTarget(204, 48, 24, 48);
+        setCapsuleSizeTarget(sharing ? 236 : 204, 48, 24, 48);
         musicRef.current.renderedStyle = musicRef.current.style;
         if (f.wakeKind === "none") {
           renderEyeSvg("open", 10.0);
         }
       } else {
         s.tEyeSize = 30;
-        setCapsuleSizeTarget(186, 50, 25, 50);
+        setCapsuleSizeTarget(sharing ? 236 : 186, 50, 25, 50);
         if (f.wakeKind === "none") {
           renderEyeSvg("open", 10.0);
         }
@@ -625,7 +638,7 @@ export default function App() {
       }
     } else if (next === "stealth") {
       setCapsuleSizeTarget(148, 42, 21, 42, false);
-      s.tCapY = -70;
+      s.tCapY = 0;
     }
   };
 
@@ -795,6 +808,13 @@ export default function App() {
       } catch {
         // ignore
       }
+      try {
+        const sh = await invoke<ShareStatePayload>("get_share_state");
+        shareStateRef.current = sh;
+        setShareState(sh);
+      } catch {
+        // ignore
+      }
       let loadedLang: UiLang = "en";
       try {
         const cfg = await invoke<AppSettings>("get_settings");
@@ -839,7 +859,9 @@ export default function App() {
       listen<StealthPayload>("buddy://stealth", (event) => {
         if (event.payload.active) {
           transitionTo("stealth");
-        } else {
+        } else if (stateRef.current === "stealth") {
+          springRef.current.capY = 0;
+          springRef.current.vCapY = 0;
           transitionTo("peek");
           window.setTimeout(() => {
             if (stateRef.current === "peek") {
@@ -992,6 +1014,18 @@ export default function App() {
       listen("buddy://collapse", () => {
         if (stateRef.current === "expanded") transitionTo(restStateOrMusic());
       }),
+      listen<boolean>("buddy://toggle-panel", (e) => {
+        if (e.payload) {
+          activeTabRef.current = "chat";
+          setActiveTab("chat");
+          transitionTo("expanded");
+          window.setTimeout(() => {
+            window.dispatchEvent(new Event("buddy-focus-chat-input"));
+          }, 45);
+        } else if (stateRef.current === "expanded") {
+          transitionTo(restStateOrMusic());
+        }
+      }),
       listen<boolean>("buddy://auto-hide-changed", (e) => {
         setSettings((prev) => ({ ...prev, auto_hide_stealth: e.payload }));
       }),
@@ -1044,6 +1078,37 @@ export default function App() {
             applyVisualTargets(stateRef.current);
           }
         }, 1600);
+      }),
+      listen<ShareStatePayload>("buddy://share-state", (e) => {
+        const wasActive = Boolean(shareStateRef.current?.active);
+        const nextShare = e.payload;
+        shareStateRef.current = nextShare;
+        setShareState(nextShare);
+        if (!nextShare.active) {
+          setActiveWhisper(null);
+        } else if (stateRef.current === "sleep") {
+          transitionTo("idle");
+        }
+        if (wasActive !== nextShare.active && stateRef.current !== "expanded") {
+          applyVisualTargets(stateRef.current);
+        }
+      }),
+      listen<ShareWhisperPayload>("buddy://share-whisper", (e) => {
+        const w = e.payload;
+        if (stateRef.current === "expanded") {
+          const cid = activeConversationIdRef.current;
+          if (cid !== null) {
+            void invoke("accept_share_whisper", { conversationId: cid, text: w.text }).catch(
+              () => {}
+            );
+          }
+          setMessages((prev) => [
+            ...prev,
+            { id: Date.now(), role: "assistant", text: w.text },
+          ]);
+        } else {
+          setActiveWhisper(w);
+        }
       })
     );
 
@@ -1107,7 +1172,7 @@ export default function App() {
       const s = springRef.current;
       drainTypewriter(now);
 
-      if (st === "stealth") {
+      if (st === "stealth" && document.hidden) {
         lastTime = now;
         rafId = requestAnimationFrame(tick);
         return;
@@ -1213,41 +1278,59 @@ export default function App() {
       };
 
       if (st === "idle") {
-        f.idleElapsed += dt;
-        if (f.idleElapsed >= f.idleDuration) {
-          if (f.idleBehavior === "settle_drowsy") {
-            f.idleBehavior = "long_doze";
-            f.idleElapsed = 0;
-            f.idleDuration = 8.0 + Math.random() * 5.0;
-            f.idleEyeMode = "doze";
-            renderEyeSvg("doze", 4.5);
-            setCapsuleSizeTarget(152, 42, 21, 42);
+        const liveShare = shareStateRef.current;
+        if (liveShare?.active) {
+          // Attentive watching gaze while sharing screen (subtle sweep + focused analyze glint)
+          f.idleEyeMode = "open";
+          if (liveShare.analyzing) {
+            eyeMorphRef.current.target = { ...EYE_POSES.open, pillH: 8.2, glintOp: 0, glowOp: 0 };
+            f.eyeSpeed = 12.0;
+            s.tex = Math.sin(t * 2.8) * 3.0;
+            s.tey = 1.2;
           } else {
-            pickNextIdleBehavior(f.idleBehavior);
-          }
-        }
-
-        const el = f.idleElapsed;
-        const dur = f.idleDuration;
-        const kind = f.idleBehavior;
-
-        if (kind === "settle_drowsy") {
-          const p = Math.min(1, el / dur);
-          s.tex = Math.sin(t * 0.8) * (1 - p) * 1.8;
-          s.tey = p * 1.4;
-          s.tCapScale = 1 + Math.sin(t * 1.4) * 0.01;
-          s.tCapRot = 0;
-          if (p > 0.42) {
-            // Gradually let eyelids feel heavy and droop toward doze
-            f.idleEyeMode = "doze";
-            eyeMorphRef.current.target = { ...EYE_POSES.doze };
-            f.eyeSpeed = 3.2;
-          } else {
-            f.idleEyeMode = "open";
             eyeMorphRef.current.target = { ...EYE_POSES.open };
-            f.eyeSpeed = 6.0;
+            f.eyeSpeed = 7.5;
+            s.tex = Math.sin(t * 0.75) * 4.2;
+            s.tey = 1.6 + Math.sin(t * 0.42) * 0.8;
           }
-        } else if (kind === "long_doze") {
+          s.tCapScale = 1;
+          s.tCapRot = 0;
+        } else {
+          f.idleElapsed += dt;
+          if (f.idleElapsed >= f.idleDuration) {
+            if (f.idleBehavior === "settle_drowsy") {
+              f.idleBehavior = "long_doze";
+              f.idleElapsed = 0;
+              f.idleDuration = 8.0 + Math.random() * 5.0;
+              f.idleEyeMode = "doze";
+              renderEyeSvg("doze", 4.5);
+              setCapsuleSizeTarget(152, 42, 21, 42);
+            } else {
+              pickNextIdleBehavior(f.idleBehavior);
+            }
+          }
+
+          const el = f.idleElapsed;
+          const dur = f.idleDuration;
+          const kind = f.idleBehavior;
+
+          if (kind === "settle_drowsy") {
+            const p = Math.min(1, el / dur);
+            s.tex = Math.sin(t * 0.8) * (1 - p) * 1.8;
+            s.tey = p * 1.4;
+            s.tCapScale = 1 + Math.sin(t * 1.4) * 0.01;
+            s.tCapRot = 0;
+            if (p > 0.42) {
+              // Gradually let eyelids feel heavy and droop toward doze
+              f.idleEyeMode = "doze";
+              eyeMorphRef.current.target = { ...EYE_POSES.doze };
+              f.eyeSpeed = 3.2;
+            } else {
+              f.idleEyeMode = "open";
+              eyeMorphRef.current.target = { ...EYE_POSES.open };
+              f.eyeSpeed = 6.0;
+            }
+          } else if (kind === "long_doze") {
           const nodCycle = (el * 0.45) % 1;
           const nodDrop =
             nodCycle > 0.78 ? Math.sin(((nodCycle - 0.78) / 0.22) * Math.PI) * 3.8 : 0;
@@ -1312,6 +1395,7 @@ export default function App() {
           s.tey = -0.5;
           s.tCapRot = 2.6 * f.idleDir * w;
           s.tCapScale = 1 + w * 0.025;
+        }
         }
       } else if (st === "sleep") {
         s.tex = 0;
@@ -1411,6 +1495,11 @@ export default function App() {
         s.tesy = 1;
         s.tCapScale = 1 + punch * 0.015;
         s.tCapRot = 0;
+      } else if (st === "stealth") {
+        s.tex = 0;
+        s.tey = 0;
+        s.tCapRot = 0;
+        s.tCapScale = 1;
       } else if (st === "expanded") {
         const m = musicRef.current;
         const punch = m.playing ? stepMusicOverlay(true) : 0;
@@ -1679,7 +1768,10 @@ export default function App() {
       }
 
       if (morphLayerRef.current) {
-        morphLayerRef.current.style.transform = `translateY(${s.capY.toFixed(2)}px) rotate(${s.capRot.toFixed(2)}deg) scale(${s.capScale.toFixed(4)})`;
+        morphLayerRef.current.style.transform =
+          st === "expanded"
+            ? ""
+            : `translateY(${s.capY.toFixed(2)}px) rotate(${s.capRot.toFixed(2)}deg) scale(${s.capScale.toFixed(4)})`;
       }
 
       if (eyesStageRef.current) {
@@ -1721,6 +1813,56 @@ export default function App() {
     rafId = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafId);
   }, []);
+
+  useLayoutEffect(() => {
+    const s = springRef.current;
+    const dims = layoutDims;
+    const dock = dockEdge;
+    const side = isSideDock(dock);
+    const cw = Math.min(dims.canvas_w - dims.pad * 2, Math.max(36, s.w));
+    const ch = Math.min(dims.canvas_h - dims.pad * 2, Math.max(36, s.h));
+    let bx = (dims.canvas_w - cw) / 2;
+    let by = dims.pad;
+    if (dock === "left") {
+      bx = dims.pad;
+      by = (dims.canvas_h - ch) / 2;
+    } else if (dock === "right") {
+      bx = dims.canvas_w - dims.pad - cw;
+      by = (dims.canvas_h - ch) / 2;
+    } else if (dock === "bottom") {
+      bx = (dims.canvas_w - cw) / 2;
+      by = dims.canvas_h - dims.pad - ch;
+    }
+    const rad = Math.min(s.r, cw / 2, ch / 2);
+    if (pillRectRef.current && pillShadowRef.current) {
+      pillRectRef.current.setAttribute("x", bx.toFixed(1));
+      pillRectRef.current.setAttribute("y", by.toFixed(1));
+      pillRectRef.current.setAttribute("width", cw.toFixed(1));
+      pillRectRef.current.setAttribute("height", ch.toFixed(1));
+      pillRectRef.current.setAttribute("rx", rad.toFixed(1));
+      pillShadowRef.current.setAttribute("x", (bx - 1.5).toFixed(1));
+      pillShadowRef.current.setAttribute("y", (by + 1).toFixed(1));
+      pillShadowRef.current.setAttribute("width", (cw + 3).toFixed(1));
+      pillShadowRef.current.setAttribute("height", (ch + 3).toFixed(1));
+      pillShadowRef.current.setAttribute("rx", (rad + 1.5).toFixed(1));
+    }
+    if (clipBoxRef.current) {
+      const top = Math.max(0, by).toFixed(1);
+      const left = Math.max(0, bx).toFixed(1);
+      const right = Math.max(0, dims.canvas_w - bx - cw).toFixed(1);
+      const bottom = Math.max(0, dims.canvas_h - by - ch).toFixed(1);
+      clipBoxRef.current.style.clipPath = `inset(${top}px ${right}px ${bottom}px ${left}px round ${rad.toFixed(1)}px)`;
+    }
+    if (eyesStageRef.current) {
+      if (side) {
+        eyesStageRef.current.style.width = `${s.stageW.toFixed(1)}px`;
+        eyesStageRef.current.style.height = "100%";
+      } else {
+        eyesStageRef.current.style.width = "100%";
+        eyesStageRef.current.style.height = `${s.stageH.toFixed(1)}px`;
+      }
+    }
+  }, [layoutDims, dockEdge]);
 
   const handleSendChat = async (
     promptOverride?: string,
@@ -1849,6 +1991,65 @@ export default function App() {
     );
   };
 
+  useEffect(() => {
+    if (whisperTimerRef.current) {
+      window.clearTimeout(whisperTimerRef.current);
+      whisperTimerRef.current = null;
+    }
+    const visible =
+      Boolean(activeWhisper) &&
+      Boolean(shareState?.active) &&
+      buddyState !== "expanded" &&
+      buddyState !== "stealth";
+
+    if (visible && whisperRef.current) {
+      const el = whisperRef.current;
+      const bounds: [number, number, number, number] = [
+        el.offsetLeft,
+        el.offsetTop,
+        el.offsetWidth,
+        el.offsetHeight,
+      ];
+      void invoke("set_whisper_bounds", { bounds }).catch(() => {});
+      if (!whisperHovered) {
+        whisperTimerRef.current = window.setTimeout(() => {
+          setActiveWhisper(null);
+        }, 14_000);
+      }
+    } else {
+      void invoke("set_whisper_bounds", { bounds: null }).catch(() => {});
+    }
+
+    return () => {
+      if (whisperTimerRef.current) {
+        window.clearTimeout(whisperTimerRef.current);
+      }
+    };
+  }, [activeWhisper, shareState?.active, buddyState, dockEdge, layoutDims, whisperHovered]);
+
+  const handleAcceptWhisper = async () => {
+    if (!activeWhisper) return;
+    const w = activeWhisper;
+    setActiveWhisper(null);
+    let convId = activeConversationIdRef.current;
+    if (convId === null) {
+      try {
+        convId = await invoke<number>("ensure_active_conversation");
+        activeConversationIdRef.current = convId;
+        setActiveConversationId(convId);
+      } catch {
+        convId = 1;
+      }
+    }
+    try {
+      await invoke("accept_share_whisper", { conversationId: convId, text: w.text });
+    } catch {
+      // ignore
+    }
+    setMessages((prev) => [...prev, { id: Date.now(), role: "assistant", text: w.text }]);
+    transitionTo("expanded");
+  };
+
   const handleSelectConversation = (convId: number) => {
     if (isThinking) return;
     void loadConversationMessages(convId);
@@ -1902,6 +2103,18 @@ export default function App() {
     if (e.button !== 0) return;
     const target = e.target as HTMLElement | null;
     if (target?.closest("button, input, textarea, select, a")) return;
+    // When collapsed, expand/drag ONLY if click lands directly inside Buddy's visible capsule body.
+    if (stateRef.current !== "expanded" && pillRectRef.current) {
+      const pr = pillRectRef.current.getBoundingClientRect();
+      if (
+        e.clientX < pr.left ||
+        e.clientX > pr.right ||
+        e.clientY < pr.top ||
+        e.clientY > pr.bottom
+      ) {
+        return;
+      }
+    }
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
@@ -2010,6 +2223,36 @@ export default function App() {
         ]);
       });
   };
+
+  const handleQuickDownloadUrl = (url: string, format: string) => {
+    setChatInput("");
+    setMessages((prev) => [
+      ...prev,
+      { id: Date.now(), role: "user", text: `${url} (${format})` },
+    ]);
+    void invoke<PluginToolOutput>("plugin_download_media", {
+      url,
+      format,
+      outputDir: null,
+    })
+      .then((res) => {
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: Date.now() + 1,
+            role: "assistant",
+            text: `**${res.summary}**\n\`${res.outputs[0] ?? ""}\``,
+            outputPaths: res.outputs,
+          },
+        ]);
+      })
+      .catch((err) => {
+        setMessages((prev) => [
+          ...prev,
+          { id: Date.now() + 1, role: "assistant", text: String(err), isError: true },
+        ]);
+      });
+  };
   const dims = layoutDims;
   const activeDims: [number, number] = sideDocked
     ? [dims.h_w, dims.h_h]
@@ -2059,19 +2302,15 @@ export default function App() {
   const ui = getStrings(lang);
 
   return (
-    <div className="w-full h-full bg-transparent">
+    <div className="w-full h-full bg-transparent relative pointer-events-none">
       <div
         ref={morphLayerRef}
-        onPointerDown={handleDragPointerDown}
-        onPointerMove={handleDragPointerMove}
-        onPointerUp={handleDragPointerUp}
-        onPointerCancel={handleDragPointerUp}
-        className={`relative ${isExpanded ? "cursor-default" : "cursor-grab active:cursor-grabbing"}`}
+        className="relative pointer-events-none"
         style={{
           width: dims.canvas_w,
           height: dims.canvas_h,
           transformOrigin: "center center",
-          willChange: "transform",
+          willChange: isExpanded ? undefined : "transform",
         }}
       >
         <svg
@@ -2082,20 +2321,10 @@ export default function App() {
         >
           <rect
             ref={pillShadowRef}
-            x={(dims.canvas_w - 152) / 2 - 1.5}
-            y={dims.pad + 1}
-            width="155"
-            height="45"
-            rx="22.5"
             fill="rgba(0,0,0,0.34)"
           />
           <rect
             ref={pillRectRef}
-            x={(dims.canvas_w - 152) / 2}
-            y={dims.pad}
-            width="152"
-            height="42"
-            rx="21"
             fill="#050507"
             stroke={snapPreview ? "rgba(56,189,248,0.65)" : "rgba(255,255,255,0.14)"}
             strokeWidth={snapPreview ? "1.6" : "1"}
@@ -2119,11 +2348,14 @@ export default function App() {
 
         <div
           ref={clipBoxRef}
-          className="relative w-full h-full"
-          style={{
-            clipPath: `inset(${dims.pad}px ${(dims.canvas_w - 152) / 2}px ${dims.canvas_h - dims.pad - 42}px ${(dims.canvas_w - 152) / 2}px round 21px)`,
-            willChange: "clip-path",
-          }}
+          onPointerDown={handleDragPointerDown}
+          onPointerMove={handleDragPointerMove}
+          onPointerUp={handleDragPointerUp}
+          onPointerCancel={handleDragPointerUp}
+          className={`relative w-full h-full pointer-events-auto ${
+            isExpanded ? "cursor-default" : "cursor-grab active:cursor-grabbing"
+          }`}
+          style={{ willChange: "clip-path" }}
         >
           <div
             ref={cardFrameRef}
@@ -2155,7 +2387,6 @@ export default function App() {
                   ? "border-t border-white/[0.06]"
                   : ""
               }`}
-              style={sideDocked ? { width: 42, height: "100%" } : { width: "100%", height: 42 }}
             >
               <div
                 ref={facePivotRef}
@@ -2242,6 +2473,96 @@ export default function App() {
                   </span>
                   <span>{ui.captureToast}</span>
                 </div>
+
+                {/* Live Screen Share Left/Right Animations (centered relative to facePivot so never clipped!) */}
+                {shareState?.active && !isExpanded && (
+                  <>
+                    {shareState.analyzing && (
+                      <div className="pointer-events-none absolute left-1/2 -translate-x-1/2 top-0 bottom-0 w-[224px] overflow-hidden z-10">
+                        <div className="buddy-scan-beam absolute inset-y-0 w-16 bg-gradient-to-r from-transparent via-white/30 to-transparent" />
+                      </div>
+                    )}
+
+                    {/* Left of Buddy's face: pulsing red LIVE beacon */}
+                    <div className="pointer-events-none absolute left-[calc(50%-96px)] top-1/2 -translate-y-1/2 z-20 flex items-center gap-1.5">
+                      <span className="relative flex w-2.5 h-2.5 items-center justify-center">
+                        {!shareState.paused && !shareState.minimized && (
+                          <span className="absolute inset-0 rounded-full bg-red-500/75 animate-ping" />
+                        )}
+                        <span
+                          className={`relative w-2 h-2 rounded-full ${
+                            shareState.paused || shareState.minimized
+                              ? "bg-white/40"
+                              : "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.95)]"
+                          }`}
+                        />
+                      </span>
+                      <span className="text-[8.5px] font-semibold tracking-wider text-white/85">
+                        {shareState.paused || shareState.minimized ? "PAUSE" : "LIVE"}
+                      </span>
+                    </div>
+
+                    {/* Right of Buddy's face: animated optical telemetry waves when idle, quick buttons when hovering */}
+                    {buddyState === "peek" ? (
+                      <div
+                        onPointerDown={(e) => e.stopPropagation()}
+                        className="pointer-events-auto absolute left-[calc(50%+54px)] top-1/2 -translate-y-1/2 z-30 flex items-center gap-1"
+                      >
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void invoke("toggle_screen_share_pause").catch(() => {});
+                          }}
+                          title={shareState.paused ? ui.chat.shareResume : ui.chat.sharePause}
+                          className="w-5 h-5 rounded-full bg-white/15 hover:bg-white/25 text-white flex items-center justify-center transition"
+                        >
+                          {shareState.paused ? (
+                            <Play className="w-2.5 h-2.5" />
+                          ) : (
+                            <Pause className="w-2.5 h-2.5" />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void invoke("stop_screen_share").catch(() => {});
+                          }}
+                          title={ui.chat.shareStop}
+                          className="w-5 h-5 rounded-full bg-rose-500/25 hover:bg-rose-500/45 text-rose-200 flex items-center justify-center transition"
+                        >
+                          <Square className="w-2 h-2 fill-current" />
+                        </button>
+                      </div>
+                    ) : (
+                      !musicRef.current.playing && (
+                        <div className="pointer-events-none absolute left-[calc(50%+62px)] top-1/2 -translate-y-1/2 z-20 flex items-center gap-[3px] h-4">
+                          {[0, 1, 2].map((barIdx) => (
+                            <span
+                              key={barIdx}
+                              className={`w-[2.5px] rounded-full ${
+                                shareState.paused || shareState.minimized
+                                  ? "bg-white/30 h-1.5"
+                                  : shareState.analyzing
+                                  ? "buddy-share-bar bg-white h-3.5"
+                                  : "buddy-share-bar bg-white/75 h-2.5"
+                              }`}
+                              style={
+                                !shareState.paused && !shareState.minimized
+                                  ? {
+                                      animationDelay: `${barIdx * 170}ms`,
+                                      animationDuration: shareState.analyzing ? "0.65s" : "1.15s",
+                                    }
+                                  : undefined
+                              }
+                            />
+                          ))}
+                        </div>
+                      )
+                    )}
+                  </>
+                )}
               </div>
 
               <button
@@ -2340,6 +2661,11 @@ export default function App() {
                     switchTab("plugins");
                   }}
                   onQuickOcr={handleQuickOcr}
+                  onQuickDownloadUrl={handleQuickDownloadUrl}
+                  pluginProgress={pluginProgress}
+                  shareState={shareState}
+                  modelProfiles={settings.model_profiles ?? []}
+                  defaultWatchProfileId={settings.watch_profile_id ?? ""}
                 />
               )}
 
@@ -2436,6 +2762,65 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* Floating Whisper Mini Bubble (kept outside morphLayerRef so text renders crisp at integer pixels) */}
+      {activeWhisper && shareState?.active && !isExpanded && buddyState !== "stealth" && (
+        <div
+          ref={whisperRef}
+          onPointerDown={(e) => e.stopPropagation()}
+          onMouseEnter={() => setWhisperHovered(true)}
+          onMouseLeave={() => setWhisperHovered(false)}
+          style={
+            dockEdge === "bottom"
+              ? {
+                  left: Math.round((dims.canvas_w - 296) / 2),
+                  bottom: Math.round(dims.pad + 50),
+                  width: 296,
+                }
+              : dockEdge === "left"
+              ? {
+                  left: Math.round(dims.pad + 50),
+                  top: Math.max(dims.pad, Math.round((dims.canvas_h - 110) / 2)),
+                  width: 280,
+                }
+              : dockEdge === "right"
+              ? {
+                  left: Math.round(dims.canvas_w - dims.pad - 50 - 280),
+                  top: Math.max(dims.pad, Math.round((dims.canvas_h - 110) / 2)),
+                  width: 280,
+                }
+              : {
+                  left: Math.round((dims.canvas_w - 296) / 2),
+                  top: Math.round(dims.pad + 50),
+                  width: 296,
+                }
+          }
+          className="pointer-events-auto absolute z-40 rounded-2xl bg-[#0b0d14] border border-white/20 shadow-[0_12px_30px_rgba(0,0,0,0.72)] px-3 py-2 text-[12px] text-[#f8fafc]"
+        >
+          <div className="flex items-start gap-2">
+            <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
+            <div className="flex-1 min-w-0">
+              <p className="leading-snug text-[#f8fafc] break-words">{activeWhisper.text}</p>
+              <div className="mt-1.5 flex items-center justify-end gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setActiveWhisper(null)}
+                  className="px-2 py-0.5 rounded-full text-[10.5px] text-white/60 hover:text-white hover:bg-white/[0.08] transition"
+                >
+                  {ui.chat.whisperDismiss}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleAcceptWhisper()}
+                  className="px-2.5 py-0.5 rounded-full bg-white text-black font-medium text-[10.5px] hover:bg-white/90 transition"
+                >
+                  {ui.chat.whisperReply}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

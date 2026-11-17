@@ -1,6 +1,7 @@
 //! Local SQLite persistence (%LOCALAPPDATA%/Buddy/buddy.db) with FTS5 search,
 //! cross-channel SHA-256 deduplication, and 7-day automatic expiration cleanup.
 
+use crate::media_utils::text_sha256;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -68,7 +69,31 @@ fn resolve_data_dir() -> PathBuf {
 
 impl MemoryDb {
     pub fn open() -> Result<Self, String> {
-        let data_dir = resolve_data_dir();
+        Self::open_with_dir(resolve_data_dir())
+    }
+
+    #[cfg(test)]
+    pub fn open_at(data_dir: PathBuf) -> Result<Self, String> {
+        Self::open_with_dir(data_dir)
+    }
+
+    fn ensure_column(conn: &Connection, table: &str, col: &str, alter_sql: &str) -> Result<(), String> {
+        let pragma = format!("PRAGMA table_info({table})");
+        let cols: Vec<String> = conn
+            .prepare(&pragma)
+            .and_then(|mut s| {
+                let rows = s.query_map([], |r| r.get::<_, String>(1))?;
+                Ok(rows.filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default();
+        if !cols.iter().any(|c| c == col) {
+            conn.execute(alter_sql, [])
+                .map_err(|e| format!("migrate {table}.{col} failed: {e}"))?;
+        }
+        Ok(())
+    }
+
+    fn open_with_dir(data_dir: PathBuf) -> Result<Self, String> {
         let screenshots_dir = data_dir.join("screenshots");
         let thumbnails_dir = data_dir.join("thumbnails");
 
@@ -146,36 +171,36 @@ impl MemoryDb {
         )
         .map_err(|e| format!("init schema failed: {e}"))?;
 
-        // Migrate legacy chat_messages columns if missing
-        let cols: Vec<String> = conn
-            .prepare("PRAGMA table_info(chat_messages)")
-            .and_then(|mut s| {
-                let rows = s.query_map([], |r| r.get::<_, String>(1))?;
-                Ok(rows.filter_map(Result::ok).collect())
-            })
-            .unwrap_or_default();
-
-        if !cols.iter().any(|c| c == "conversation_id") {
-            conn.execute(
-                "ALTER TABLE chat_messages ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 1",
-                [],
-            )
-            .map_err(|e| format!("migrate chat_messages failed: {e}"))?;
-        }
-        if !cols.iter().any(|c| c == "agent_steps_json") {
-            conn.execute(
-                "ALTER TABLE chat_messages ADD COLUMN agent_steps_json TEXT",
-                [],
-            )
-            .map_err(|e| format!("migrate agent_steps_json failed: {e}"))?;
-        }
-        if !cols.iter().any(|c| c == "thought_text") {
-            conn.execute(
-                "ALTER TABLE chat_messages ADD COLUMN thought_text TEXT",
-                [],
-            )
-            .map_err(|e| format!("migrate thought_text failed: {e}"))?;
-        }
+        Self::ensure_column(
+            &conn,
+            "chat_messages",
+            "conversation_id",
+            "ALTER TABLE chat_messages ADD COLUMN conversation_id INTEGER NOT NULL DEFAULT 1",
+        )?;
+        Self::ensure_column(
+            &conn,
+            "chat_messages",
+            "agent_steps_json",
+            "ALTER TABLE chat_messages ADD COLUMN agent_steps_json TEXT",
+        )?;
+        Self::ensure_column(
+            &conn,
+            "chat_messages",
+            "thought_text",
+            "ALTER TABLE chat_messages ADD COLUMN thought_text TEXT",
+        )?;
+        Self::ensure_column(
+            &conn,
+            "conversations",
+            "summary_text",
+            "ALTER TABLE conversations ADD COLUMN summary_text TEXT",
+        )?;
+        Self::ensure_column(
+            &conn,
+            "conversations",
+            "summarized_up_to_id",
+            "ALTER TABLE conversations ADD COLUMN summarized_up_to_id INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         // Ensure orphaned legacy messages belong to an existing conversation row
         let msg_count: i64 = conn
@@ -390,7 +415,7 @@ impl MemoryDb {
         };
         let cutoff = now_ms() - (7 * 24 * 60 * 60 * 1000);
         let mut stmt = match conn.prepare(
-            "SELECT id, file_path, thumb_path FROM memories WHERE is_starred = 0 AND updated_at < ?1",
+            "SELECT id, file_path, thumb_path FROM memories WHERE is_starred = 0 AND kind != 'fact' AND updated_at < ?1",
         ) {
             Ok(s) => s,
             Err(_) => return 0,
@@ -597,5 +622,302 @@ impl MemoryDb {
             .collect();
         rows.reverse();
         Ok(rows)
+    }
+
+    /// Save a durable long-term memory fact (`kind = 'fact'`, starred, immune to 7-day cleanup).
+    pub fn save_fact(&self, content: &str, category: Option<&str>) -> Result<MemoryItem, String> {
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            return Err("Memory fact cannot be empty".to_string());
+        }
+        let norm_cat = category
+            .map(|c| c.trim())
+            .filter(|c| !c.is_empty())
+            .unwrap_or("general");
+        let sha = format!(
+            "fact:{}",
+            text_sha256(&trimmed.to_ascii_lowercase())
+        );
+
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let ts = now_ms();
+
+        let existing_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM memories WHERE sha256 = ?1 ORDER BY updated_at DESC LIMIT 1",
+                params![sha],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if let Some(id) = existing_id {
+            conn.execute(
+                "UPDATE memories SET content_text = ?1, app_name = ?2, is_starred = 1, updated_at = ?3 WHERE id = ?4",
+                params![trimmed, norm_cat, ts, id],
+            )
+            .map_err(|e| e.to_string())?;
+            return Self::get_by_id_locked(&conn, id);
+        }
+
+        conn.execute(
+            "INSERT INTO memories (kind, content_text, file_path, thumb_path, sha256, app_name, is_starred, created_at, updated_at)
+             VALUES ('fact', ?1, NULL, NULL, ?2, ?3, 1, ?4, ?4)",
+            params![trimmed, sha, norm_cat, ts],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = conn.last_insert_rowid();
+        Self::get_by_id_locked(&conn, id)
+    }
+
+    /// Return most recently updated durable facts (`kind = 'fact'`).
+    pub fn list_active_facts(&self, limit: usize) -> Result<Vec<MemoryItem>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, kind, content_text, file_path, thumb_path, sha256, app_name, is_starred, created_at, updated_at
+                 FROM memories
+                 WHERE kind = 'fact'
+                 ORDER BY updated_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![limit as i64], Self::row_to_item)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
+    /// Fetch `(rolling_summary, verbatim_recent_messages)` for a conversation context window.
+    pub fn list_chat_context(
+        &self,
+        conversation_id: i64,
+        recent_limit: usize,
+    ) -> Result<(Option<String>, Vec<StoredChatMessage>), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let (summary_opt, up_to_id): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT summary_text, summarized_up_to_id FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((None, 0));
+
+        let summary_clean = summary_opt.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        });
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, conversation_id, role, content, attachments_json, agent_steps_json, thought_text, created_at
+                 FROM chat_messages
+                 WHERE conversation_id = ?1 AND id > ?2
+                 ORDER BY id DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| e.to_string())?;
+        let mut rows: Vec<StoredChatMessage> = stmt
+            .query_map(params![conversation_id, up_to_id, recent_limit as i64], |r| {
+                Ok(StoredChatMessage {
+                    id: r.get(0)?,
+                    conversation_id: r.get(1)?,
+                    role: r.get(2)?,
+                    content: r.get(3)?,
+                    attachments_json: r.get(4)?,
+                    agent_steps_json: r.get(5)?,
+                    thought_text: r.get(6)?,
+                    created_at: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        rows.reverse();
+        Ok((summary_clean, rows))
+    }
+
+    /// If uncompacted messages exceed `trigger_threshold`, return `(prev_summary, old_chunk_to_compact, new_summarized_up_to_id)` keeping newest `keep_recent` intact.
+    pub fn list_messages_to_compact(
+        &self,
+        conversation_id: i64,
+        trigger_threshold: usize,
+        keep_recent: usize,
+    ) -> Result<Option<(Option<String>, Vec<StoredChatMessage>, i64)>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let (prev_summary, up_to_id): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT summary_text, summarized_up_to_id FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((None, 0));
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, conversation_id, role, content, attachments_json, agent_steps_json, thought_text, created_at
+                 FROM chat_messages
+                 WHERE conversation_id = ?1 AND id > ?2
+                 ORDER BY id ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let all_unsummarized: Vec<StoredChatMessage> = stmt
+            .query_map(params![conversation_id, up_to_id], |r| {
+                Ok(StoredChatMessage {
+                    id: r.get(0)?,
+                    conversation_id: r.get(1)?,
+                    role: r.get(2)?,
+                    content: r.get(3)?,
+                    attachments_json: r.get(4)?,
+                    agent_steps_json: r.get(5)?,
+                    thought_text: r.get(6)?,
+                    created_at: r.get(7)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+
+        if all_unsummarized.len() <= trigger_threshold || all_unsummarized.len() <= keep_recent {
+            return Ok(None);
+        }
+
+        let compact_count = all_unsummarized.len() - keep_recent;
+        let to_compact = all_unsummarized.into_iter().take(compact_count).collect::<Vec<_>>();
+        let new_up_to_id = to_compact.last().map(|m| m.id).unwrap_or(up_to_id);
+        let clean_prev = prev_summary.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        });
+        Ok(Some((clean_prev, to_compact, new_up_to_id)))
+    }
+
+    /// Persist compacted summary text + watermark atomically if newer than existing watermark.
+    pub fn update_conversation_summary(
+        &self,
+        conversation_id: i64,
+        up_to_id: i64,
+        summary: &str,
+    ) -> Result<(), String> {
+        let trimmed = summary.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE conversations
+             SET summary_text = ?1, summarized_up_to_id = ?2
+             WHERE id = ?3 AND summarized_up_to_id < ?2",
+            params![trimmed, up_to_id, conversation_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_dir(label: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "buddy_db_test_{label}_{}_{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn facts_survive_seven_day_cleanup_and_match_fts() {
+        let dir = temp_db_dir("facts");
+        let db = MemoryDb::open_at(dir.clone()).unwrap();
+
+        let fact = db
+            .save_fact("User prefers concise TypeScript examples", Some("preference"))
+            .unwrap();
+        assert_eq!(fact.kind, "fact");
+        assert!(fact.is_starred);
+
+        let (clip, _) = db
+            .upsert_memory(
+                "clipboard_text",
+                Some("ephemeral clipboard snippet"),
+                None,
+                None,
+                "clip_sha_old",
+                "notepad.exe",
+            )
+            .unwrap();
+
+        // Force both rows older than 7 days
+        let stale_ts = now_ms() - (10 * 24 * 60 * 60 * 1000);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memories SET updated_at = ?1",
+                params![stale_ts],
+            )
+            .unwrap();
+        }
+
+        let deleted = db.cleanup_expired();
+        assert_eq!(deleted, 1, "only stale non-fact memory should expire");
+
+        let active_facts = db.list_active_facts(10).unwrap();
+        assert_eq!(active_facts.len(), 1);
+        assert_eq!(active_facts[0].id, fact.id);
+
+        let hits = db.list_memories(Some("TypeScript"), 10).unwrap();
+        assert!(hits.iter().any(|m| m.id == fact.id));
+        assert!(!hits.iter().any(|m| m.id == clip.id));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn compaction_splits_older_turns_while_keeping_recent_verbatim() {
+        let dir = temp_db_dir("compact");
+        let db = MemoryDb::open_at(dir.clone()).unwrap();
+        let conv = db.create_conversation(Some("Long session")).unwrap();
+
+        for i in 1..=25 {
+            let role = if i % 2 == 1 { "user" } else { "assistant" };
+            db.append_chat_message(
+                conv.id,
+                role,
+                &format!("message #{i}"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let job = db
+            .list_messages_to_compact(conv.id, 22, 12)
+            .unwrap()
+            .expect("25 messages should trigger compaction");
+        assert_eq!(job.1.len(), 13);
+        assert_eq!(job.1.first().unwrap().content, "message #1");
+        assert_eq!(job.1.last().unwrap().content, "message #13");
+
+        db.update_conversation_summary(conv.id, job.2, "User discussed steps 1..13.")
+            .unwrap();
+
+        let (summary, recent) = db.list_chat_context(conv.id, 20).unwrap();
+        assert_eq!(summary.as_deref(), Some("User discussed steps 1..13."));
+        assert_eq!(recent.len(), 12);
+        assert_eq!(recent.first().unwrap().content, "message #14");
+        assert_eq!(recent.last().unwrap().content, "message #25");
+
+        // Second check with 12 uncompacted messages should not re-trigger
+        assert!(db.list_messages_to_compact(conv.id, 22, 12).unwrap().is_none());
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

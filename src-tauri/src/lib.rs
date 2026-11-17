@@ -1,11 +1,14 @@
 mod agent_tools;
 mod ai_client;
 mod db;
+mod file_dialog;
+mod logger;
 mod media_utils;
 mod music_sensor;
 mod pin_window;
 mod plugins;
 mod prompts;
+mod screen_share;
 mod settings;
 mod skills;
 mod snip;
@@ -21,12 +24,16 @@ use db::{ConversationSummary, MemoryDb, MemoryItem, StoredChatMessage};
 use media_utils::SelfCopyGuard;
 use plugins::{
     apply_clean_paste_text, inspect_file_locks, open_output_in_explorer, optimize_images,
-    parse_clipboard_text, run_media_tool, run_offline_ocr, run_pdf_tool, terminate_locking_process,
-    ClipboardParseResult, LockProcessInfo, OcrResult, PluginListResponse, PluginManager,
-    PluginToolOutput,
+    parse_clipboard_text, run_media_download, run_media_tool, run_offline_ocr, run_pdf_tool,
+    terminate_locking_process, ClipboardParseResult, LockProcessInfo, OcrResult,
+    PluginListResponse, PluginManager, PluginToolOutput,
 };
 use prompts::{PersonalityOption, PromptsManager};
-use settings::{AppSettings, SettingsManager};
+use screen_share::{
+    enumerate_share_targets, start_share_hotkey_listener, ScreenShareManager, ShareStatePayload,
+    ShareTargetInfo, StartShareRequest,
+};
+use settings::{AppSettings, ModelProfile, SettingsManager};
 use skills::{
     search_github_skills, GithubSkillCandidate, SkillDetail, SkillInfo, SkillsManager,
 };
@@ -44,8 +51,8 @@ use tauri::{AppHandle, DragDropEvent, Emitter, Manager, WindowEvent};
 use tauri_plugin_updater::UpdaterExt;
 use win32_sensors::{
     apply_interaction_mode, apply_window_layout, begin_drag, compute_layout_dims, end_drag,
-    reset_dock_to_top, show_window_no_activate, start_sensor_loops, step_drag, AppSensorState,
-    DockStatePayload, LayoutDims,
+    reset_dock_to_top, show_window_no_activate, start_sensor_loops, start_toggle_hotkey_listener,
+    step_drag, AppSensorState, DockStatePayload, LayoutDims,
 };
 
 fn now_ms() -> u64 {
@@ -366,7 +373,9 @@ async fn verify_and_save_model_config(
     let key_to_test = match &new_api_key {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
         Some(_) => String::new(),
-        None => settings_mgr.load_api_key().unwrap_or_default(),
+        None => settings_mgr
+            .load_key_for_profile(&settings.chat_profile_id)
+            .unwrap_or_default(),
     };
 
     let latency_ms = verify_model_connection(
@@ -392,6 +401,65 @@ async fn verify_and_save_model_config(
         settings: saved,
         latency_ms,
     })
+}
+
+#[tauri::command]
+fn save_model_profile(
+    settings_mgr: tauri::State<'_, Arc<SettingsManager>>,
+    profile: ModelProfile,
+    new_api_key: Option<String>,
+    set_as_chat: bool,
+    set_as_watch: bool,
+) -> Result<AppSettings, String> {
+    settings_mgr.save_profile(profile, new_api_key, set_as_chat, set_as_watch)
+}
+
+#[tauri::command]
+async fn verify_and_save_model_profile(
+    settings_mgr: tauri::State<'_, Arc<SettingsManager>>,
+    profile: ModelProfile,
+    new_api_key: Option<String>,
+    set_as_chat: bool,
+    set_as_watch: bool,
+) -> Result<VerifySaveResult, String> {
+    let key_to_test = match &new_api_key {
+        Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+        Some(_) => String::new(),
+        None => settings_mgr
+            .load_key_for_profile(&profile.id)
+            .unwrap_or_default(),
+    };
+
+    let latency_ms = verify_model_connection(
+        &profile.api_provider,
+        &profile.base_url,
+        &profile.model_id,
+        &key_to_test,
+    )
+    .await?;
+
+    let saved = settings_mgr.save_profile(profile, new_api_key, set_as_chat, set_as_watch)?;
+    Ok(VerifySaveResult {
+        settings: saved,
+        latency_ms,
+    })
+}
+
+#[tauri::command]
+fn delete_model_profile(
+    settings_mgr: tauri::State<'_, Arc<SettingsManager>>,
+    profile_id: String,
+) -> Result<AppSettings, String> {
+    settings_mgr.delete_profile(&profile_id)
+}
+
+#[tauri::command]
+fn select_role_models(
+    settings_mgr: tauri::State<'_, Arc<SettingsManager>>,
+    chat_profile_id: Option<String>,
+    watch_profile_id: Option<String>,
+) -> Result<AppSettings, String> {
+    settings_mgr.select_role_models(chat_profile_id, watch_profile_id)
 }
 
 #[tauri::command]
@@ -462,6 +530,7 @@ fn send_chat_message(
     prompts_mgr: tauri::State<'_, Arc<PromptsManager>>,
     skills_mgr: tauri::State<'_, Arc<SkillsManager>>,
     plugin_mgr: tauri::State<'_, Arc<PluginManager>>,
+    share_mgr: tauri::State<'_, Arc<ScreenShareManager>>,
     db: tauri::State<'_, Arc<MemoryDb>>,
     controller: tauri::State<'_, Arc<AiStreamController>>,
     approval_mgr: tauri::State<'_, Arc<AgentApprovalManager>>,
@@ -470,9 +539,10 @@ fn send_chat_message(
     prompt: String,
     attachments: Vec<AttachmentPayload>,
 ) -> Result<(), String> {
-    let prior = db
-        .list_chat_messages(conversation_id, 16)
-        .unwrap_or_default()
+    let (summary_opt, prior_msgs) = db
+        .list_chat_context(conversation_id, 20)
+        .unwrap_or_default();
+    let prior = prior_msgs
         .into_iter()
         .map(|m| (m.role, m.content))
         .collect::<Vec<_>>();
@@ -496,6 +566,8 @@ fn send_chat_message(
         None,
     );
 
+    let (live_frames, screen_goal, watch_override) = share_mgr.grab_frames_for_chat();
+
     spawn_chat_stream(
         app,
         settings_mgr.inner().clone(),
@@ -510,8 +582,124 @@ fn send_chat_message(
         stored_prompt,
         attachments,
         prior,
+        summary_opt,
+        live_frames,
+        screen_goal,
+        watch_override,
     );
     Ok(())
+}
+
+#[tauri::command]
+fn list_share_targets() -> Vec<ShareTargetInfo> {
+    enumerate_share_targets()
+}
+
+#[tauri::command]
+fn get_share_state(
+    share_mgr: tauri::State<'_, Arc<ScreenShareManager>>,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+) -> ShareStatePayload {
+    share_mgr.get_state(&sensor_state)
+}
+
+#[tauri::command]
+fn start_screen_share(
+    app: AppHandle,
+    share_mgr: tauri::State<'_, Arc<ScreenShareManager>>,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+    settings_mgr: tauri::State<'_, Arc<SettingsManager>>,
+    ai_ctrl: tauri::State<'_, Arc<AiStreamController>>,
+    request: StartShareRequest,
+) -> Result<ShareStatePayload, String> {
+    share_mgr.inner().clone().start(
+        app,
+        sensor_state.inner().clone(),
+        settings_mgr.inner().clone(),
+        ai_ctrl.inner().clone(),
+        request,
+    )
+}
+
+#[tauri::command]
+fn stop_screen_share(
+    app: AppHandle,
+    share_mgr: tauri::State<'_, Arc<ScreenShareManager>>,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+) -> ShareStatePayload {
+    share_mgr.stop(&app, &sensor_state, "user_stopped")
+}
+
+#[tauri::command]
+fn toggle_screen_share_pause(
+    app: AppHandle,
+    share_mgr: tauri::State<'_, Arc<ScreenShareManager>>,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+) -> ShareStatePayload {
+    share_mgr.toggle_pause(&app, &sensor_state)
+}
+
+#[tauri::command]
+fn update_screen_share_options(
+    app: AppHandle,
+    share_mgr: tauri::State<'_, Arc<ScreenShareManager>>,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+    goal: Option<String>,
+    cadence: Option<String>,
+    show_border: Option<bool>,
+    watch_profile_id: Option<String>,
+) -> ShareStatePayload {
+    share_mgr.update_live_options(
+        &app,
+        &sensor_state,
+        goal,
+        cadence,
+        show_border,
+        watch_profile_id,
+    )
+}
+
+#[tauri::command]
+fn set_window_dock_preset(
+    app: AppHandle,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+    share_mgr: tauri::State<'_, Arc<ScreenShareManager>>,
+    edge: String,
+    ratio: f64,
+) -> ShareStatePayload {
+    let st = share_mgr.get_state(&sensor_state);
+    if st.active && st.target_kind == "window" && st.target_hwnd != 0 {
+        if let Some(win) = app.get_webview_window("main") {
+            win32_sensors::attach_dock_to_window(
+                &app,
+                &win,
+                &sensor_state,
+                st.target_hwnd,
+                &edge,
+                ratio,
+            );
+        }
+    }
+    share_mgr.get_state(&sensor_state)
+}
+
+#[tauri::command]
+fn set_whisper_bounds(
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+    bounds: Option<(f64, f64, f64, f64)>,
+) {
+    if let Ok(mut g) = sensor_state.whisper_bounds.lock() {
+        *g = bounds;
+    }
+}
+
+#[tauri::command]
+fn accept_share_whisper(
+    db: tauri::State<'_, Arc<MemoryDb>>,
+    conversation_id: i64,
+    text: String,
+) -> Result<i64, String> {
+    db.append_chat_message(conversation_id, "assistant", &text, None, None, None)
 }
 
 #[tauri::command]
@@ -776,8 +964,65 @@ async fn plugin_run_media_tool(
 }
 
 #[tauri::command]
+async fn plugin_download_media(
+    app: AppHandle,
+    pm: tauri::State<'_, Arc<PluginManager>>,
+    url: String,
+    format: String,
+    output_dir: Option<String>,
+) -> Result<PluginToolOutput, String> {
+    run_media_download(&app, &pm, &url, &format, output_dir.as_deref()).await
+}
+
+#[tauri::command]
+fn cancel_plugin_task(pm: tauri::State<'_, Arc<PluginManager>>) {
+    pm.cancel_active_task();
+}
+
+#[tauri::command]
 fn plugin_open_folder(path: String) {
     open_output_in_explorer(&path);
+}
+
+#[tauri::command]
+fn open_logs_folder() -> String {
+    let dir = logger::logs_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let path_str = dir.to_string_lossy().to_string();
+    open_output_in_explorer(&path_str);
+    path_str
+}
+
+#[tauri::command]
+async fn pick_folder(
+    app: AppHandle,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+    title: Option<String>,
+    initial_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    file_dialog::pick_folder(&app, &sensor_state, title, initial_dir).await
+}
+
+#[tauri::command]
+async fn pick_files(
+    app: AppHandle,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+    title: Option<String>,
+    multiple: Option<bool>,
+    filter_name: Option<String>,
+    filter_spec: Option<String>,
+    initial_dir: Option<String>,
+) -> Result<Vec<String>, String> {
+    file_dialog::pick_files(
+        &app,
+        &sensor_state,
+        title,
+        multiple.unwrap_or(false),
+        filter_name,
+        filter_spec,
+        initial_dir,
+    )
+    .await
 }
 
 // ============================================================================
@@ -849,6 +1094,7 @@ fn open_skills_folder(sm: tauri::State<'_, Arc<SkillsManager>>, id: Option<Strin
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db = Arc::new(MemoryDb::open().expect("failed to initialize buddy.db"));
+    let _ = logger::init_logger(&db.data_dir);
     let settings_mgr = Arc::new(SettingsManager::load(&db.data_dir));
     let prompts_mgr = Arc::new(PromptsManager::init(&db.data_dir));
     let plugin_mgr = Arc::new(PluginManager::init(&db.data_dir));
@@ -878,6 +1124,12 @@ pub fn run() {
     let snip_state = Arc::new(SnipState::default());
     let ai_controller = Arc::new(AiStreamController::default());
     let approval_mgr = Arc::new(AgentApprovalManager::default());
+    let share_mgr = Arc::new(ScreenShareManager::default());
+
+    let boot_settings = settings_mgr.clone();
+    std::thread::spawn(move || {
+        boot_settings.sync_autostart_on_boot();
+    });
 
     let _ = db.cleanup_expired();
 
@@ -899,6 +1151,7 @@ pub fn run() {
         .manage(approval_mgr.clone())
         .manage(plugin_mgr.clone())
         .manage(skills_mgr.clone())
+        .manage(share_mgr.clone())
         .invoke_handler(tauri::generate_handler![
             set_expanded,
             update_pill_bounds,
@@ -922,6 +1175,10 @@ pub fn run() {
             get_settings,
             save_settings,
             verify_and_save_model_config,
+            save_model_profile,
+            verify_and_save_model_profile,
+            delete_model_profile,
+            select_role_models,
             list_personalities,
             open_prompts_folder,
             ensure_active_conversation,
@@ -932,6 +1189,15 @@ pub fn run() {
             send_chat_message,
             resolve_agent_approval,
             cancel_chat_stream,
+            list_share_targets,
+            get_share_state,
+            start_screen_share,
+            stop_screen_share,
+            toggle_screen_share_pause,
+            update_screen_share_options,
+            set_window_dock_preset,
+            set_whisper_bounds,
+            accept_share_whisper,
             trigger_snip,
             get_snip_preview,
             finish_snip,
@@ -957,7 +1223,12 @@ pub fn run() {
             plugin_optimize_images,
             plugin_run_pdf_tool,
             plugin_run_media_tool,
+            plugin_download_media,
+            cancel_plugin_task,
             plugin_open_folder,
+            open_logs_folder,
+            pick_folder,
+            pick_files,
             list_skills,
             get_skill_detail,
             toggle_skill,
@@ -1027,7 +1298,7 @@ pub fn run() {
             let stealth_toggle = CheckMenuItem::with_id(
                 app,
                 "auto_hide",
-                "Auto-Hide in Games & Meetings",
+                "Auto-Hide During Games",
                 true,
                 initial_cfg.auto_hide_stealth,
                 None::<&str>,
@@ -1061,6 +1332,7 @@ pub fn run() {
             let tray_snip = snip_state.clone();
             let tray_settings = settings_mgr.clone();
             let tray_plugins = plugin_mgr.clone();
+            let tray_share = share_mgr.clone();
             let stealth_item_ref = stealth_toggle.clone();
             let music_item_ref = music_toggle.clone();
             let mut tray_builder = TrayIconBuilder::new()
@@ -1075,8 +1347,9 @@ pub fn run() {
                 .on_menu_event(move |app, event| match event.id.as_ref() {
                     "expand" => {
                         if let Some(win) = app.get_webview_window("main") {
-                            tray_state.is_stealth.store(false, Ordering::Relaxed);
-                            let _ = win.show();
+                            let _vis_guard = tray_state.visibility_lock.lock();
+                            tray_state.is_stealth.store(false, Ordering::Release);
+                            show_window_no_activate(&win);
                             let _ = app.emit("buddy://expand", ());
                         }
                     }
@@ -1119,6 +1392,7 @@ pub fn run() {
                         );
                     }
                     "quit" => {
+                        tray_share.stop(app, &tray_state, "quit");
                         let _ = tray_plugins.set_keep_awake(false);
                         pin_window::close_all_pins();
                         tray_db.checkpoint_wal();
@@ -1134,6 +1408,7 @@ pub fn run() {
                 WindowEvent::Focused(false) => {
                     if focus_state.is_expanded.load(Ordering::Relaxed)
                         && !focus_state.is_dragging.load(Ordering::Relaxed)
+                        && !focus_state.suspend_auto_collapse.load(Ordering::Acquire)
                     {
                         let elapsed =
                             now_ms().saturating_sub(focus_state.last_expand_ms.load(Ordering::Relaxed));
@@ -1168,6 +1443,8 @@ pub fn run() {
             );
             watchers::start_screenshot_folder_watcher(app.handle().clone(), db.clone());
             start_snip_hotkey_listener(app.handle().clone(), snip_state.clone());
+            start_share_hotkey_listener(app.handle().clone(), sensor_state.clone(), share_mgr.clone());
+            start_toggle_hotkey_listener(app.handle().clone(), sensor_state.clone());
             music_sensor::start_music_sensor(app.handle().clone(), sensor_state.clone());
 
             Ok(())

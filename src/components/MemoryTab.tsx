@@ -188,7 +188,9 @@ export default function MemoryTab({
   const imageItems = baseItems.filter(
     (m) => m.kind === "screenshot" || m.kind === "clipboard_image"
   );
-  const textItems = baseItems.filter((m) => m.kind === "clipboard_text");
+  const textItems = baseItems.filter(
+    (m) => m.kind === "clipboard_text" || m.kind === "fact"
+  );
 
   const showImages = filter === "all" || filter === "images";
   const showTexts = filter === "all" || filter === "clipboard";
@@ -401,8 +403,14 @@ export default function MemoryTab({
                         onClick={() => setSelectedItem(item)}
                         className="flex items-center gap-1.5 min-w-0 text-[10.5px] text-white/55 hover:text-white/85 transition text-left"
                       >
-                        <span className="px-1.5 py-0.5 rounded bg-white/10 text-white/80 shrink-0">
-                          {s.clipboard}
+                        <span
+                          className={`px-1.5 py-0.5 rounded shrink-0 ${
+                            item.kind === "fact"
+                              ? "bg-amber-500/20 text-amber-200"
+                              : "bg-white/10 text-white/80"
+                          }`}
+                        >
+                          {item.kind === "fact" ? "Fact" : s.clipboard}
                         </span>
                         <span className="truncate">{item.app_name}</span>
                         <span>·</span>
@@ -485,7 +493,11 @@ export default function MemoryTab({
             <div className="flex items-center justify-between gap-2 shrink-0">
               <div className="min-w-0 text-[11px] text-white/60 truncate">
                 <span className="text-white font-medium">
-                  {selectedItem.kind === "clipboard_text" ? s.clipboard : s.screenshot}
+                  {selectedItem.kind === "fact"
+                    ? "Fact"
+                    : selectedItem.kind === "clipboard_text"
+                    ? s.clipboard
+                    : s.screenshot}
                 </span>{" "}
                 · {selectedItem.app_name} · {formatRelativeTime(selectedItem.updated_at, lang)}
               </div>
@@ -499,7 +511,7 @@ export default function MemoryTab({
             </div>
 
             {/* Modal Body */}
-            {selectedItem.kind === "clipboard_text" ? (
+            {selectedItem.kind === "clipboard_text" || selectedItem.kind === "fact" ? (
               <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-0.5">
                 <pre className="rounded-xl bg-black/60 border border-white/10 p-2.5 text-[11.5px] font-mono text-white/95 whitespace-pre-wrap break-words select-text leading-relaxed">
                   {selectedItem.content_text ?? ""}
@@ -558,7 +570,9 @@ export default function MemoryTab({
               </button>
 
               <div className="flex items-center gap-1 flex-wrap">
-                {selectedItem.kind !== "clipboard_text" && selectedItem.file_path && (
+                {selectedItem.kind !== "clipboard_text" &&
+                  selectedItem.kind !== "fact" &&
+                  selectedItem.file_path && (
                   <>
                     {enabledPlugins.offline_ocr !== false && (
                       <button

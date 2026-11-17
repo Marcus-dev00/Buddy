@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -211,7 +212,7 @@ fn is_blocked_path(path: &Path, is_write: bool) -> bool {
     false
 }
 
-fn check_path_allowed(path: &Path, is_write: bool) -> Result<(), String> {
+pub(crate) fn check_path_allowed(path: &Path, is_write: bool) -> Result<(), String> {
     if is_blocked_path(path, is_write) {
         return Err(format!(
             "Access blocked for protected OS or credential path: {}",
@@ -271,8 +272,8 @@ fn decode_text_lossy(bytes: &[u8]) -> Result<String, String> {
 }
 
 /// Canonical tool definitions for OpenAI, Anthropic, and Gemini schemas.
-fn raw_tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
-    vec![
+fn raw_tool_definitions(include_media_downloader: bool) -> Vec<(&'static str, &'static str, Value)> {
+    let mut defs = vec![
         (
             "list_dir",
             "List files and folders inside a directory on Windows. Supports `~`, `Desktop`, `Documents`, `Downloads`, or absolute paths.",
@@ -460,11 +461,84 @@ fn raw_tool_definitions() -> Vec<(&'static str, &'static str, Value)> {
                 "required": ["source"]
             }),
         ),
-    ]
+        (
+            "search_memories",
+            "Search Buddy's SQLite memory database (saved long-term facts, clipboard text/snippets, and screenshot records) by keywords.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search keywords." },
+                    "limit": { "type": "integer", "description": "Max items to return (default 8, max 20)." }
+                },
+                "required": ["query"]
+            }),
+        ),
+        (
+            "save_memory_fact",
+            "Persist an important long-term user fact, preference, stack choice, or project detail into permanent memory (exempt from 7-day cleanup).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "content": { "type": "string", "description": "Concise self-contained fact worth remembering across sessions." },
+                    "category": { "type": "string", "description": "Short tag: preference | project | workflow | general." }
+                },
+                "required": ["content"]
+            }),
+        ),
+        (
+            "web_search",
+            "Search the public web for up-to-date facts, docs, releases, or answers (read-only).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Web search query." },
+                    "limit": { "type": "integer", "description": "Max results (default 5, max 8)." }
+                },
+                "required": ["query"]
+            }),
+        ),
+        (
+            "fetch_web_page",
+            "Fetch a public http:// or https:// web page and extract readable plain text (SSRF-protected against localhost/LAN URLs).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Public http:// or https:// URL." },
+                    "max_chars": { "type": "integer", "description": "Maximum text characters to return (default 8000, max 16000)." }
+                },
+                "required": ["url"]
+            }),
+        ),
+    ];
+
+    if include_media_downloader {
+        defs.push((
+            "download_media",
+            "Download audio or video from a URL (YouTube, Bilibili, SoundCloud, etc.) using Buddy's yt-dlp + FFmpeg plugin. Prefer 'audio_best' (zero re-encode original audio stream, no secondary loss) or 'audio_flac' (lossless FLAC) for highest audio fidelity, 'mp4_lossless' (zero re-encode stream copy MP4) for video, or 'audio_mp3' (320kbps MP3) when explicit MP3 compatibility is requested. Always requires user approval.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Full http:// or https:// media/music URL." },
+                    "format": {
+                        "type": "string",
+                        "enum": ["audio_best", "mp4_lossless", "audio_flac", "audio_mp3"],
+                        "description": "Output mode. Use audio_best for zero secondary loss original audio, audio_flac for lossless FLAC, mp4_lossless for zero re-encode MP4 video, or audio_mp3 for 320kbps MP3."
+                    },
+                    "output_dir": {
+                        "type": "string",
+                        "description": "Optional target directory (defaults to Windows Downloads folder)."
+                    }
+                },
+                "required": ["url", "format"]
+            }),
+        ));
+    }
+
+    defs
 }
 
-pub fn openai_tools_json() -> Value {
-    let arr: Vec<Value> = raw_tool_definitions()
+pub fn openai_tools_json(include_media_downloader: bool) -> Value {
+    let arr: Vec<Value> = raw_tool_definitions(include_media_downloader)
         .into_iter()
         .map(|(name, desc, params)| {
             json!({
@@ -480,8 +554,8 @@ pub fn openai_tools_json() -> Value {
     Value::Array(arr)
 }
 
-pub fn anthropic_tools_json() -> Value {
-    let arr: Vec<Value> = raw_tool_definitions()
+pub fn anthropic_tools_json(include_media_downloader: bool) -> Value {
+    let arr: Vec<Value> = raw_tool_definitions(include_media_downloader)
         .into_iter()
         .map(|(name, desc, params)| {
             json!({
@@ -494,8 +568,8 @@ pub fn anthropic_tools_json() -> Value {
     Value::Array(arr)
 }
 
-pub fn gemini_tools_json() -> Value {
-    let decls: Vec<Value> = raw_tool_definitions()
+pub fn gemini_tools_json(include_media_downloader: bool) -> Value {
+    let decls: Vec<Value> = raw_tool_definitions(include_media_downloader)
         .into_iter()
         .map(|(name, desc, params)| {
             json!({
@@ -774,6 +848,65 @@ pub fn plan_tool_execution(
                 summary: format!("Offline OCR `{}`", truncate_chars(name, 36)),
                 preview: None,
                 requires_approval: false,
+                allow_approve_all: false,
+                is_destructive: false,
+            }
+        }
+        "search_memories" => {
+            let q = args["query"].as_str().unwrap_or("");
+            ToolExecutionPlan {
+                summary: format!("Search memories `{}`", truncate_chars(q, 32)),
+                preview: None,
+                requires_approval: false,
+                allow_approve_all: false,
+                is_destructive: false,
+            }
+        }
+        "save_memory_fact" => {
+            let fact = args["content"].as_str().unwrap_or("");
+            ToolExecutionPlan {
+                summary: format!("Save fact: `{}`", truncate_chars(fact, 36)),
+                preview: None,
+                requires_approval: false,
+                allow_approve_all: false,
+                is_destructive: false,
+            }
+        }
+        "web_search" => {
+            let q = args["query"].as_str().unwrap_or("");
+            ToolExecutionPlan {
+                summary: format!("Web search `{}`", truncate_chars(q, 34)),
+                preview: None,
+                requires_approval: false,
+                allow_approve_all: false,
+                is_destructive: false,
+            }
+        }
+        "fetch_web_page" => {
+            let url = args["url"].as_str().unwrap_or("");
+            ToolExecutionPlan {
+                summary: format!("Fetch `{}`", truncate_chars(url, 38)),
+                preview: None,
+                requires_approval: false,
+                allow_approve_all: false,
+                is_destructive: false,
+            }
+        }
+        "download_media" => {
+            let url = args["url"].as_str().unwrap_or("");
+            let fmt = args["format"].as_str().unwrap_or("audio_best");
+            let out_dir = args["output_dir"].as_str().unwrap_or("").trim();
+            let dir_note = if out_dir.is_empty() {
+                "Windows Downloads folder".to_string()
+            } else {
+                resolve_user_path(out_dir, workspace_hint)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| out_dir.to_string())
+            };
+            ToolExecutionPlan {
+                summary: format!("Download `{fmt}` via yt-dlp + FFmpeg"),
+                preview: Some(format!("URL: {}\nFormat: {fmt}\nSave to: {dir_note}", truncate_chars(url, 180))),
+                requires_approval: true,
                 allow_approve_all: false,
                 is_destructive: false,
             }
@@ -1408,7 +1541,7 @@ fn encode_powershell_utf16_base64(script: &str) -> String {
     B64.encode(&utf16_bytes)
 }
 
-pub fn build_agent_system_appendix(workspace_cfg: &str) -> String {
+pub fn build_agent_system_appendix(workspace_cfg: &str, media_downloader_ready: bool) -> String {
     let home = user_home_dir();
     let desktop = home.join("Desktop");
     let documents = home.join("Documents");
@@ -1418,6 +1551,11 @@ pub fn build_agent_system_appendix(workspace_cfg: &str) -> String {
     } else {
         format!("- Configured Workspace: {}", workspace_cfg.trim())
     };
+    let media_line = if media_downloader_ready {
+        "\n- Enabled Plugin Tool: `download_media` (yt-dlp + FFmpeg) is active! When user sends a music/video link and asks to save/download audio/MP3/FLAC/MP4, explain briefly whether original stream avoids secondary loss if helpful and call `download_media`."
+    } else {
+        ""
+    };
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -1425,7 +1563,7 @@ pub fn build_agent_system_appendix(workspace_cfg: &str) -> String {
 
     format!(
         "\n\n---\n\n# Desktop Agent Mode (Auto)\n\
-         You have local Windows file & PowerShell tools (`list_dir`, `find_files`, `search_text`, `read_file`, `create_dir`, `write_file`, `edit_file`, `move_or_rename`, `copy_file`, `delete_path`, `run_shell`).\n\
+         You have local Windows file & PowerShell tools (`list_dir`, `find_files`, `search_text`, `read_file`, `create_dir`, `write_file`, `edit_file`, `move_or_rename`, `copy_file`, `delete_path`, `run_shell`), persistent memory tools (`search_memories`, `save_memory_fact`), and read-only web tools (`web_search`, `fetch_web_page`).{media_line}\n\
          - User Profile: `{}`\n\
          - Desktop: `{}` | Documents: `{}` | Downloads: `{}`\n\
          {}\n\
@@ -1441,6 +1579,406 @@ pub fn build_agent_system_appendix(workspace_cfg: &str) -> String {
         downloads.display(),
         ws_line
     )
+}
+
+// ============================================================================
+// SSRF-Safe Web Read / Search Helpers
+// ============================================================================
+
+fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
+    let oct = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        // CGNAT 100.64.0.0/10
+        || (oct[0] == 100 && (oct[1] & 0b1100_0000) == 64)
+        // Reserved / protocol / bench ranges
+        || (oct[0] == 192 && oct[1] == 0 && oct[2] == 0)
+        || (oct[0] == 198 && (oct[1] == 18 || oct[1] == 19))
+        || oct[0] >= 240
+}
+
+fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_blocked_ipv4(v4);
+    }
+    let seg0 = ip.segments()[0];
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
+}
+
+pub fn is_blocked_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_blocked_ipv4(v4),
+        IpAddr::V6(v6) => is_blocked_ipv6(v6),
+    }
+}
+
+pub fn validate_public_url(raw_url: &str, resolve_dns: bool) -> Result<reqwest::Url, String> {
+    let trimmed = raw_url.trim();
+    let parsed = reqwest::Url::parse(trimmed).map_err(|e| format!("Invalid URL: {e}"))?;
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("Blocked non-HTTP URL scheme: {scheme}"));
+    }
+    let host_raw = parsed
+        .host_str()
+        .ok_or_else(|| "URL has no host".to_string())?;
+    let host = host_raw.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".lan")
+    {
+        return Err(format!("Blocked local/private host: {host}"));
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_ip(ip) {
+            return Err(format!("Blocked non-public IP: {ip}"));
+        }
+        return Ok(parsed);
+    }
+    if !host.contains('.') {
+        return Err(format!("Blocked single-label intranet host: {host}"));
+    }
+    if resolve_dns {
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        let addrs: Vec<_> = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|e| format!("DNS resolution failed for `{host}`: {e}"))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("No DNS addresses resolved for `{host}`"));
+        }
+        for sa in addrs {
+            if is_blocked_ip(sa.ip()) {
+                return Err(format!(
+                    "Blocked host `{host}` resolving to private/local IP {}",
+                    sa.ip()
+                ));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn strip_tag_block(html: &str, tag: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let open_pat = format!("<{tag}");
+    let close_pat = format!("</{tag}>");
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0usize;
+    while i < html.len() {
+        if let Some(rel_start) = lower[i..].find(&open_pat) {
+            let abs_start = i + rel_start;
+            out.push_str(&html[i..abs_start]);
+            if let Some(rel_end) = lower[abs_start..].find(&close_pat) {
+                i = abs_start + rel_end + close_pat.len();
+            } else {
+                break;
+            }
+        } else {
+            out.push_str(&html[i..]);
+            break;
+        }
+    }
+    out
+}
+
+fn decode_basic_entities(text: &str) -> String {
+    text.replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+        .replace("&#x27;", "'")
+}
+
+pub fn html_to_readable_text(html: &str, max_chars: usize) -> String {
+    let mut cleaned = strip_tag_block(html, "script");
+    cleaned = strip_tag_block(&cleaned, "style");
+    cleaned = strip_tag_block(&cleaned, "noscript");
+    cleaned = strip_tag_block(&cleaned, "svg");
+
+    let mut plain = String::with_capacity(cleaned.len() / 2);
+    let mut in_tag = false;
+    let mut tag_buf = String::new();
+    for ch in cleaned.chars() {
+        if in_tag {
+            if ch == '>' {
+                in_tag = false;
+                let tag_lower = tag_buf.trim().to_ascii_lowercase();
+                let name = tag_lower
+                    .trim_start_matches('/')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("");
+                if matches!(
+                    name,
+                    "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "section" | "article"
+                ) {
+                    plain.push('\n');
+                }
+                tag_buf.clear();
+            } else if tag_buf.len() < 40 {
+                tag_buf.push(ch);
+            }
+        } else if ch == '<' {
+            in_tag = true;
+            tag_buf.clear();
+        } else {
+            plain.push(ch);
+        }
+    }
+
+    let decoded = decode_basic_entities(&plain);
+    let mut lines = Vec::new();
+    for raw_line in decoded.lines() {
+        let collapsed = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !collapsed.is_empty() {
+            lines.push(collapsed);
+        }
+    }
+    truncate_chars(&lines.join("\n"), max_chars)
+}
+
+fn url_encode_query(q: &str) -> String {
+    let mut out = String::with_capacity(q.len() * 2);
+    for b in q.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            b' ' => out.push('+'),
+            other => {
+                out.push('%');
+                out.push_str(&format!("{other:02X}"));
+            }
+        }
+    }
+    out
+}
+
+fn percent_decode_lossy(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
+                if let Ok(val) = u8::from_str_radix(hex, 16) {
+                    out.push(val);
+                    i += 3;
+                    continue;
+                }
+            }
+        } else if bytes[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn extract_attr(tag: &str, attr: &str) -> Option<String> {
+    let needle = format!("{attr}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(decode_basic_entities(&tag[start..end]))
+}
+
+fn clean_ddg_href(raw_href: &str) -> String {
+    let normalized = if raw_href.starts_with("//") {
+        format!("https:{raw_href}")
+    } else {
+        raw_href.to_string()
+    };
+    if let Some(pos) = normalized.find("uddg=") {
+        let rest = &normalized[pos + 5..];
+        let end = rest.find('&').unwrap_or(rest.len());
+        return percent_decode_lossy(&rest[..end]);
+    }
+    normalized
+}
+
+pub fn parse_ddg_html(html: &str, limit: usize) -> Vec<(String, String, String)> {
+    let mut results = Vec::new();
+    let mut cursor = 0usize;
+    while results.len() < limit {
+        let Some(pos) = html[cursor..].find("result__a") else {
+            break;
+        };
+        let marker = cursor + pos;
+        let a_start = html[..marker].rfind("<a").unwrap_or(marker);
+        let Some(tag_end_rel) = html[a_start..].find('>') else {
+            break;
+        };
+        let tag_end = a_start + tag_end_rel;
+        let a_tag = &html[a_start..=tag_end];
+        let Some(close_rel) = html[tag_end + 1..].find("</a>") else {
+            break;
+        };
+        let title_raw = &html[tag_end + 1..tag_end + 1 + close_rel];
+        let title = html_to_readable_text(title_raw, 180);
+        let url = extract_attr(a_tag, "href")
+            .map(|h| clean_ddg_href(&h))
+            .unwrap_or_default();
+
+        let after_link = tag_end + 1 + close_rel + 4;
+        let window_end = (after_link + 2000).min(html.len());
+        let snippet = if let Some(sp) = html[after_link..window_end].find("result__snippet") {
+            let s_pos = after_link + sp;
+            if let Some(gt) = html[s_pos..window_end].find('>') {
+                let body_start = s_pos + gt + 1;
+                let end_tag = html[body_start..window_end]
+                    .find("</a>")
+                    .or_else(|| html[body_start..window_end].find("</div>"))
+                    .unwrap_or((window_end - body_start).min(400));
+                html_to_readable_text(&html[body_start..body_start + end_tag], 260)
+            } else {
+                String::new()
+            }
+        } else {
+            String::new()
+        };
+
+        if !title.is_empty() && url.starts_with("http") {
+            results.push((title, url, snippet));
+        }
+        cursor = after_link;
+    }
+    results
+}
+
+pub async fn execute_web_search(query: &str, limit: usize) -> Result<String, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Err("`query` cannot be empty".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode_query(trimmed));
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("Web search request failed: {e}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("Web search HTTP {status}"));
+    }
+    let html = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed reading search response: {e}"))?;
+    let hits = parse_ddg_html(&html, limit.clamp(1, 8));
+    if hits.is_empty() {
+        return Ok(format!("No web search results extracted for `{trimmed}`."));
+    }
+    let formatted = hits
+        .into_iter()
+        .enumerate()
+        .map(|(idx, (title, link, snippet))| {
+            if snippet.is_empty() {
+                format!("{}. **{}**\n   {}", idx + 1, title, link)
+            } else {
+                format!("{}. **{}**\n   {}\n   {}", idx + 1, title, link, snippet)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Ok(formatted)
+}
+
+pub async fn execute_fetch_web_page(raw_url: &str, max_chars: usize) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(18))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) BuddyDesktop/1.0")
+        .build()
+        .map_err(|e| format!("HTTP client error: {e}"))?;
+
+    let mut current = validate_public_url(raw_url, true)?;
+    let mut final_resp = None;
+
+    for _hop in 0..=3 {
+        let resp = client
+            .get(current.clone())
+            .send()
+            .await
+            .map_err(|e| format!("Fetch failed: {e}"))?;
+        if resp.status().is_redirection() {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| "Redirect missing Location header".to_string())?;
+            let next_url = current
+                .join(loc)
+                .map_err(|e| format!("Invalid redirect URL: {e}"))?;
+            current = validate_public_url(next_url.as_str(), true)?;
+            continue;
+        }
+        final_resp = Some(resp);
+        break;
+    }
+
+    let resp = final_resp.ok_or_else(|| "Too many redirects".to_string())?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status} from {current}"));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !content_type.is_empty()
+        && !content_type.contains("text/")
+        && !content_type.contains("json")
+        && !content_type.contains("xml")
+        && !content_type.contains("javascript")
+    {
+        return Err(format!("Unsupported binary content type: {content_type}"));
+    }
+
+    const MAX_BODY_BYTES: usize = 1_500_000;
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed reading response body: {e}"))?;
+    let slice = if bytes.len() > MAX_BODY_BYTES {
+        &bytes[..MAX_BODY_BYTES]
+    } else {
+        &bytes[..]
+    };
+    let raw_text = String::from_utf8_lossy(slice);
+    let cap = max_chars.clamp(500, 16_000);
+    let body = if content_type.contains("json") || content_type.contains("text/plain") {
+        truncate_chars(&raw_text, cap)
+    } else {
+        html_to_readable_text(&raw_text, cap)
+    };
+    Ok(format!("URL: {current}\n\n{body}"))
 }
 
 #[cfg(test)]
@@ -1506,5 +2044,40 @@ mod tests {
         assert!(find_out.contains("renamed.txt"));
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn ssrf_blocks_local_private_and_metadata_urls() {
+        assert!(validate_public_url("http://127.0.0.1:8080/admin", false).is_err());
+        assert!(validate_public_url("http://localhost:1420/", false).is_err());
+        assert!(validate_public_url("http://169.254.169.254/latest/meta-data", false).is_err());
+        assert!(validate_public_url("http://192.168.1.1/", false).is_err());
+        assert!(validate_public_url("http://[::1]:3000/", false).is_err());
+        assert!(validate_public_url("file:///C:/Windows/win.ini", false).is_err());
+        assert!(validate_public_url("https://example.com/docs", false).is_ok());
+    }
+
+    #[test]
+    fn extracts_readable_html_and_ddg_results() {
+        let html = r#"
+          <html><head><style>.a{color:red}</style><script>alert(1)</script></head>
+          <body><h1>Rust Docs</h1><p>Hello &amp; welcome!</p></body></html>
+        "#;
+        let text = html_to_readable_text(html, 500);
+        assert!(!text.contains("alert(1)"));
+        assert!(text.contains("Rust Docs"));
+        assert!(text.contains("Hello & welcome!"));
+
+        let ddg = r#"
+          <div class="result">
+            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F&amp;rut=1">Rust Language</a>
+            <a class="result__snippet">Systems programming language.</a>
+          </div>
+        "#;
+        let hits = parse_ddg_html(ddg, 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, "Rust Language");
+        assert_eq!(hits[0].1, "https://rust-lang.org/");
+        assert!(hits[0].2.contains("Systems programming"));
     }
 }

@@ -6,16 +6,28 @@ import {
   ChevronDown,
   Cpu,
   Download,
+  Eye,
+  EyeOff,
+  FolderOpen,
   Loader2,
+  MessageSquare,
+  Plus,
   RotateCcw,
   ShieldCheck,
   Sliders,
   Sparkles,
+  Trash2,
   Zap,
 } from "lucide-react";
 import { getStrings } from "../i18n";
 import { ThinkingSlider } from "./ChatTab";
-import type { AppSettings, ThinkingLevel, UiLang, UpdateInfo } from "../types";
+import type {
+  AppSettings,
+  ModelProfile,
+  ThinkingLevel,
+  UiLang,
+  UpdateInfo,
+} from "../types";
 
 interface SettingsTabProps {
   settings: AppSettings;
@@ -40,6 +52,7 @@ interface ModelPreset {
   provider: "openai" | "anthropic" | "gemini";
   baseUrl: string;
   modelId: string;
+  vision?: boolean;
 }
 
 const MODEL_PRESETS: ModelPreset[] = [
@@ -233,13 +246,30 @@ function ToggleSwitch({
   );
 }
 
-function detectPresetId(cfg: AppSettings): string {
+function detectPresetId(cfg: { api_provider: string; base_url: string; model_id: string }): string {
   const b = cfg.base_url.trim().replace(/\/+$/, "");
   const m = cfg.model_id.trim();
   const match = MODEL_PRESETS.find(
     (p) => p.id !== "custom" && p.provider === cfg.api_provider && p.baseUrl === b && p.modelId === m
   );
   return match?.id ?? "custom";
+}
+
+function makeFallbackProfiles(cfg: AppSettings): ModelProfile[] {
+  if (cfg.model_profiles && cfg.model_profiles.length > 0) {
+    return cfg.model_profiles;
+  }
+  return [
+    {
+      id: cfg.chat_profile_id || "prof_default",
+      name: cfg.model_id || "Default Model",
+      api_provider: cfg.api_provider,
+      base_url: cfg.base_url,
+      model_id: cfg.model_id,
+      supports_vision: true,
+      has_api_key: cfg.has_api_key,
+    },
+  ];
 }
 
 export default function SettingsTab({
@@ -258,7 +288,13 @@ export default function SettingsTab({
 }: SettingsTabProps) {
   const [section, setSection] = useState<SettingsSection>("model");
   const [draft, setDraft] = useState<AppSettings>(settings);
-  const [presetId, setPresetId] = useState<string>(() => detectPresetId(settings));
+  const initialProfiles = makeFallbackProfiles(settings);
+  const [editingProfile, setEditingProfile] = useState<ModelProfile>(
+    () =>
+      initialProfiles.find((p) => p.id === settings.chat_profile_id) ?? initialProfiles[0]
+  );
+  const [isNewProfile, setIsNewProfile] = useState(false);
+  const [presetId, setPresetId] = useState<string>(() => detectPresetId(editingProfile));
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [keyDirty, setKeyDirty] = useState(false);
   const [isTesting, setIsTesting] = useState(false);
@@ -268,37 +304,95 @@ export default function SettingsTab({
 
   useEffect(() => {
     setDraft(settings);
-  }, [settings]);
+    const profs = makeFallbackProfiles(settings);
+    setEditingProfile((cur) => {
+      if (isNewProfile) return cur;
+      return profs.find((p) => p.id === cur.id) ?? profs.find((p) => p.id === settings.chat_profile_id) ?? profs[0];
+    });
+  }, [settings, isNewProfile]);
 
   const lang: UiLang = draft.ui_language === "zh" ? "zh" : "en";
   const s = getStrings(lang).settings;
+  const profiles = makeFallbackProfiles(draft);
+  const activeChatId = draft.chat_profile_id || profiles[0]?.id || "prof_default";
+  const activeWatchId = draft.watch_profile_id || "";
+
+  const selectProfileToEdit = (prof: ModelProfile) => {
+    setIsNewProfile(false);
+    setEditingProfile(prof);
+    setPresetId(detectPresetId(prof));
+    setApiKeyInput("");
+    setKeyDirty(false);
+    setStatusMsg(null);
+  };
+
+  const handleStartNewProfile = () => {
+    const newId = `prof_${Date.now().toString(36)}`;
+    const blank: ModelProfile = {
+      id: newId,
+      name: "Gemini 2.5 Flash",
+      api_provider: "gemini",
+      base_url: "https://generativelanguage.googleapis.com",
+      model_id: "gemini-2.5-flash",
+      supports_vision: true,
+      has_api_key: false,
+    };
+    setIsNewProfile(true);
+    setEditingProfile(blank);
+    setPresetId("gemini_flash");
+    setApiKeyInput("");
+    setKeyDirty(false);
+    setStatusMsg(null);
+  };
 
   const handlePresetChange = (id: string) => {
     setPresetId(id);
     setStatusMsg(null);
     const preset = MODEL_PRESETS.find((p) => p.id === id);
     if (preset && preset.id !== "custom") {
-      setDraft((d) => ({
-        ...d,
+      setEditingProfile((p) => ({
+        ...p,
+        name: preset.label,
         api_provider: preset.provider,
         base_url: preset.baseUrl,
         model_id: preset.modelId,
+        supports_vision: preset.id === "deepseek" ? false : true,
       }));
     }
   };
 
-  const handleVerifyAndSave = async () => {
+  const handleRoleChange = async (nextChatId: string | null, nextWatchId: string | null) => {
+    setStatusMsg(null);
+    try {
+      const updated = await invoke<AppSettings>("select_role_models", {
+        chatProfileId: nextChatId,
+        watchProfileId: nextWatchId,
+      });
+      setDraft(updated);
+      onSaved(updated);
+    } catch (err) {
+      setStatusMsg({ ok: false, text: String(err) });
+    }
+  };
+
+  const handleVerifyAndSaveProfile = async () => {
     setIsTesting(true);
     setStatusMsg(null);
     try {
       const res = await invoke<{ settings: AppSettings; latency_ms: number }>(
-        "verify_and_save_model_config",
+        "verify_and_save_model_profile",
         {
-          settings: draft,
+          profile: editingProfile,
           newApiKey: keyDirty ? apiKeyInput : null,
+          setAsChat: isNewProfile ? false : editingProfile.id === activeChatId,
+          setAsWatch: false,
         }
       );
+      setIsNewProfile(false);
       setDraft(res.settings);
+      const savedProf =
+        makeFallbackProfiles(res.settings).find((p) => p.id === editingProfile.id) ?? editingProfile;
+      setEditingProfile(savedProf);
       setKeyDirty(false);
       setApiKeyInput("");
       onSaved(res.settings);
@@ -310,16 +404,51 @@ export default function SettingsTab({
     }
   };
 
+  const handleSaveProfileDirect = async () => {
+    setStatusMsg(null);
+    try {
+      const updated = await invoke<AppSettings>("save_model_profile", {
+        profile: editingProfile,
+        newApiKey: keyDirty ? apiKeyInput : null,
+        setAsChat: isNewProfile ? false : editingProfile.id === activeChatId,
+        setAsWatch: false,
+      });
+      setIsNewProfile(false);
+      setDraft(updated);
+      const savedProf =
+        makeFallbackProfiles(updated).find((p) => p.id === editingProfile.id) ?? editingProfile;
+      setEditingProfile(savedProf);
+      setKeyDirty(false);
+      setApiKeyInput("");
+      onSaved(updated);
+      setStatusMsg({ ok: true, text: s.savedNoTest });
+    } catch (err) {
+      setStatusMsg({ ok: false, text: String(err) });
+    }
+  };
+
+  const handleDeleteProfile = async (profileId: string) => {
+    setStatusMsg(null);
+    try {
+      const updated = await invoke<AppSettings>("delete_model_profile", { profileId });
+      setIsNewProfile(false);
+      setDraft(updated);
+      const profs = makeFallbackProfiles(updated);
+      setEditingProfile(profs.find((p) => p.id === updated.chat_profile_id) ?? profs[0]);
+      onSaved(updated);
+    } catch (err) {
+      setStatusMsg({ ok: false, text: String(err) });
+    }
+  };
+
   const handleSaveDirect = async (nextDraft = draft, showBanner = true) => {
     if (showBanner) setStatusMsg(null);
     try {
       const updated = await invoke<AppSettings>("save_settings", {
         settings: nextDraft,
-        newApiKey: keyDirty ? apiKeyInput : null,
+        newApiKey: null,
       });
       setDraft(updated);
-      setKeyDirty(false);
-      setApiKeyInput("");
       onSaved(updated);
       if (showBanner) {
         setStatusMsg({ ok: true, text: s.savedNoTest });
@@ -359,93 +488,231 @@ export default function SettingsTab({
         })}
       </div>
 
-      {/* SECTION 1: MODEL & PRESETS */}
+      {/* SECTION 1: MULTI-MODEL LIBRARY & ROLE SELECTORS */}
       {section === "model" && (
-        <div className="flex-1 flex flex-col justify-between min-h-0">
-          <div className="space-y-2">
-            <div className="grid grid-cols-2 gap-2">
+        <div className="flex-1 flex flex-col justify-between min-h-0 gap-1.5">
+          <div className="flex-1 overflow-y-auto pr-0.5 space-y-2 min-h-0">
+            {/* Chat / Watch Role Selectors */}
+            <div className="rounded-xl bg-white/[0.04] border border-white/10 p-2 grid grid-cols-2 gap-2">
               <div className="space-y-1">
-                <label className="text-[10.5px] text-white/50">{s.preset}</label>
+                <label className="text-[10px] text-white/55 flex items-center gap-1">
+                  <MessageSquare className="w-2.5 h-2.5 text-sky-300" />
+                  <span className="truncate">{s.roleChatModel}</span>
+                </label>
                 <DarkSelect
-                  value={presetId}
-                  options={MODEL_PRESETS.map((p) => ({ id: p.id, label: p.label }))}
-                  onChange={handlePresetChange}
+                  compact
+                  value={activeChatId}
+                  options={profiles.map((p) => ({
+                    id: p.id,
+                    label: `${p.name || p.model_id}`,
+                  }))}
+                  onChange={(id) => void handleRoleChange(id, null)}
                 />
               </div>
+
               <div className="space-y-1">
-                <label className="text-[10.5px] text-white/50">{s.protocol}</label>
+                <label className="text-[10px] text-white/55 flex items-center gap-1">
+                  <Eye className="w-2.5 h-2.5 text-rose-300" />
+                  <span className="truncate">{s.roleWatchModel}</span>
+                </label>
                 <DarkSelect
-                  value={draft.api_provider}
-                  options={PROTOCOL_OPTIONS}
-                  onChange={(prov) => {
-                    setPresetId("custom");
-                    setDraft({ ...draft, api_provider: prov });
-                  }}
+                  compact
+                  value={activeWatchId || "follow_chat"}
+                  options={[
+                    { id: "follow_chat", label: s.followChat },
+                    ...profiles.map((p) => ({
+                      id: p.id,
+                      label: `${p.name || p.model_id}${p.supports_vision ? "" : " (Text)"}`,
+                    })),
+                  ]}
+                  onChange={(id) => void handleRoleChange(null, id)}
                 />
               </div>
             </div>
 
+            {/* Saved Profiles Chips */}
             <div className="space-y-1">
-              <label className="text-[10.5px] text-white/50">{s.baseUrl}</label>
-              <input
-                type="text"
-                value={draft.base_url}
-                onChange={(e) => {
-                  setPresetId("custom");
-                  setDraft({ ...draft, base_url: e.target.value });
-                }}
-                placeholder="https://..."
-                className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2.5 py-1 text-white font-mono text-[11px]"
-              />
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-white/50">{s.modelLibrary}</span>
+                <button
+                  type="button"
+                  onClick={handleStartNewProfile}
+                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-white/[0.15] border border-white/10 text-[10px] text-white/85 transition"
+                >
+                  <Plus className="w-2.5 h-2.5" />
+                  <span>{s.newProfile}</span>
+                </button>
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {profiles.map((prof) => {
+                  const selected = !isNewProfile && editingProfile.id === prof.id;
+                  const isChat = prof.id === activeChatId;
+                  const isWatch = prof.id === activeWatchId;
+                  return (
+                    <button
+                      key={prof.id}
+                      type="button"
+                      onClick={() => selectProfileToEdit(prof)}
+                      className={`px-2 py-0.5 rounded-full text-[10px] border flex items-center gap-1 transition max-w-[170px] ${
+                        selected
+                          ? "bg-white/15 border-white/35 text-white font-medium"
+                          : "bg-white/[0.04] border-white/10 text-white/65 hover:text-white/90"
+                      }`}
+                    >
+                      <span className="truncate">{prof.name || prof.model_id}</span>
+                      {isChat && (
+                        <span className="text-[8.5px] px-1 rounded bg-sky-500/25 text-sky-200 shrink-0">
+                          Chat
+                        </span>
+                      )}
+                      {isWatch && (
+                        <span className="text-[8.5px] px-1 rounded bg-rose-500/25 text-rose-200 shrink-0">
+                          Watch
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-2">
-              <div className="space-y-1">
-                <label className="text-[10.5px] text-white/50">{s.modelId}</label>
+            {/* Profile Editor */}
+            <div className="rounded-xl bg-white/[0.03] border border-white/[0.08] p-2 space-y-1.5">
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-0.5">
+                  <label className="text-[10px] text-white/50">{s.profileName}</label>
+                  <input
+                    type="text"
+                    value={editingProfile.name}
+                    onChange={(e) =>
+                      setEditingProfile({ ...editingProfile, name: e.target.value })
+                    }
+                    placeholder="My Gemini Flash"
+                    className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2 py-1 text-white text-[11px]"
+                  />
+                </div>
+                <div className="space-y-0.5">
+                  <label className="text-[10px] text-white/50">{s.preset}</label>
+                  <DarkSelect
+                    compact
+                    value={presetId}
+                    options={MODEL_PRESETS.map((p) => ({ id: p.id, label: p.label }))}
+                    onChange={handlePresetChange}
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div className="space-y-0.5">
+                  <label className="text-[10px] text-white/50">{s.protocol}</label>
+                  <DarkSelect
+                    compact
+                    value={editingProfile.api_provider}
+                    options={PROTOCOL_OPTIONS}
+                    onChange={(prov) => {
+                      setPresetId("custom");
+                      setEditingProfile({ ...editingProfile, api_provider: prov });
+                    }}
+                  />
+                </div>
+                <div className="space-y-0.5">
+                  <label className="text-[10px] text-white/50">{s.modelId}</label>
+                  <input
+                    type="text"
+                    value={editingProfile.model_id}
+                    onChange={(e) => {
+                      setPresetId("custom");
+                      setEditingProfile({ ...editingProfile, model_id: e.target.value });
+                    }}
+                    className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2 py-1 text-white font-mono text-[11px]"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-0.5">
+                <label className="text-[10px] text-white/50">{s.baseUrl}</label>
                 <input
                   type="text"
-                  value={draft.model_id}
+                  value={editingProfile.base_url}
                   onChange={(e) => {
                     setPresetId("custom");
-                    setDraft({ ...draft, model_id: e.target.value });
+                    setEditingProfile({ ...editingProfile, base_url: e.target.value });
                   }}
-                  className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2.5 py-1 text-white font-mono text-[11px]"
+                  placeholder="https://..."
+                  className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2 py-1 text-white font-mono text-[11px]"
                 />
               </div>
-              <div className="space-y-1">
-                <div className="flex items-center justify-between">
-                  <label className="text-[10.5px] text-white/50">{s.apiKey}</label>
-                  {draft.has_api_key && (
-                    <span className="flex items-center gap-0.5 text-[10px] text-emerald-400">
-                      <ShieldCheck className="w-2.5 h-2.5" />
-                      DPAPI
-                    </span>
-                  )}
+
+              <div className="grid grid-cols-1 gap-1.5">
+                <div className="space-y-0.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[10px] text-white/50">{s.apiKey}</label>
+                    <div className="flex items-center gap-2">
+                      {editingProfile.has_api_key && (
+                        <span className="flex items-center gap-0.5 text-[9.5px] text-emerald-400">
+                          <ShieldCheck className="w-2.5 h-2.5" />
+                          DPAPI
+                        </span>
+                      )}
+                      {!isNewProfile && profiles.length > 1 && (
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteProfile(editingProfile.id)}
+                          className="text-[9.5px] text-rose-300/75 hover:text-rose-300 inline-flex items-center gap-0.5"
+                        >
+                          <Trash2 className="w-2.5 h-2.5" />
+                          <span>{s.deleteProfile}</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <input
+                    type="password"
+                    value={apiKeyInput}
+                    onChange={(e) => {
+                      setApiKeyInput(e.target.value);
+                      setKeyDirty(true);
+                    }}
+                    placeholder={
+                      editingProfile.has_api_key
+                        ? "••••••••••••"
+                        : editingProfile.api_provider === "anthropic"
+                        ? "sk-ant-..."
+                        : editingProfile.api_provider === "gemini"
+                        ? "AIza..."
+                        : "sk-..."
+                    }
+                    className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2 py-1 text-white font-mono text-[11px] placeholder:text-white/30"
+                  />
                 </div>
-                <input
-                  type="password"
-                  value={apiKeyInput}
-                  onChange={(e) => {
-                    setApiKeyInput(e.target.value);
-                    setKeyDirty(true);
-                  }}
-                  placeholder={
-                    draft.has_api_key
-                      ? "••••••••••••"
-                      : draft.api_provider === "anthropic"
-                      ? "sk-ant-..."
-                      : draft.api_provider === "gemini"
-                      ? "AIza..."
-                      : "sk-..."
-                  }
-                  className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2.5 py-1 text-white font-mono text-[11px] placeholder:text-white/30"
-                />
+
+                <label className="flex items-center justify-between gap-2 pt-0.5 cursor-pointer select-none">
+                  <span className="text-[10.5px] text-white/70 flex items-center gap-1.5">
+                    {editingProfile.supports_vision ? (
+                      <Eye className="w-3 h-3 text-sky-300" />
+                    ) : (
+                      <EyeOff className="w-3 h-3 text-white/35" />
+                    )}
+                    <span>{s.supportsVision}</span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={editingProfile.supports_vision}
+                    onChange={(e) =>
+                      setEditingProfile({
+                        ...editingProfile,
+                        supports_vision: e.target.checked,
+                      })
+                    }
+                    className="accent-sky-400 w-3.5 h-3.5 rounded"
+                  />
+                </label>
               </div>
             </div>
           </div>
 
           {/* Connection Probe Footer */}
-          <div className="pt-2 border-t border-white/[0.08] flex items-center justify-between gap-2 shrink-0">
+          <div className="pt-1.5 border-t border-white/[0.08] flex items-center justify-between gap-2 shrink-0">
             <div className="min-w-0 flex-1">
               {statusMsg ? (
                 <div className="flex items-center gap-1.5">
@@ -460,7 +727,7 @@ export default function SettingsTab({
                   {!statusMsg.ok && (
                     <button
                       type="button"
-                      onClick={() => void handleSaveDirect(draft)}
+                      onClick={() => void handleSaveProfileDirect()}
                       className="text-[10px] underline text-white/60 hover:text-white shrink-0"
                     >
                       {s.saveAnyway}
@@ -468,15 +735,15 @@ export default function SettingsTab({
                   )}
                 </div>
               ) : (
-                <span className="text-[10.5px] text-white/40">{s.verifyHint}</span>
+                <span className="text-[10px] text-white/40">{s.verifyHint}</span>
               )}
             </div>
 
             <button
               type="button"
               disabled={isTesting}
-              onClick={() => void handleVerifyAndSave()}
-              className="px-3 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-60 text-slate-950 font-semibold text-[11px] flex items-center gap-1.5 shrink-0 transition"
+              onClick={() => void handleVerifyAndSaveProfile()}
+              className="px-3 py-1 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-60 text-slate-950 font-semibold text-[11px] flex items-center gap-1.5 shrink-0 transition"
             >
               {isTesting ? (
                 <>
@@ -569,19 +836,41 @@ export default function SettingsTab({
                 />
               </div>
               {draft.agent_mode && (
-                <input
-                  type="text"
-                  value={draft.agent_workspace}
-                  onChange={(e) => setDraft({ ...draft, agent_workspace: e.target.value })}
-                  onBlur={() => void handleSaveDirect(draft, false)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.currentTarget.blur();
-                    }
-                  }}
-                  placeholder={s.workspacePlaceholder}
-                  className="w-full rounded-lg bg-black/30 border border-white/10 focus:border-sky-400/50 outline-none px-2 py-1 text-[10.5px] font-mono text-white/85 placeholder:text-white/30"
-                />
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={draft.agent_workspace}
+                    onChange={(e) => setDraft({ ...draft, agent_workspace: e.target.value })}
+                    onBlur={() => void handleSaveDirect(draft, false)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.currentTarget.blur();
+                      }
+                    }}
+                    placeholder={s.workspacePlaceholder}
+                    className="flex-1 min-w-0 rounded-lg bg-black/30 border border-white/10 focus:border-sky-400/50 outline-none px-2 py-1 text-[10.5px] font-mono text-white/85 placeholder:text-white/30"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void invoke<string | null>("pick_folder", {
+                        title: s.workspace,
+                        initialDir: draft.agent_workspace.trim() || null,
+                      }).then((dir) => {
+                        if (dir) {
+                          const next = { ...draft, agent_workspace: dir };
+                          setDraft(next);
+                          void handleSaveDirect(next, false);
+                        }
+                      });
+                    }}
+                    title={s.browseBtn}
+                    className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white/[0.08] hover:bg-white/[0.15] border border-white/10 text-[10.5px] text-white/85 transition"
+                  >
+                    <FolderOpen className="w-3 h-3 text-sky-300" />
+                    <span>{s.browseBtn}</span>
+                  </button>
+                </div>
               )}
             </div>
 
@@ -642,6 +931,21 @@ export default function SettingsTab({
               >
                 <RotateCcw className="w-3 h-3" />
                 <span>{s.resetBtn}</span>
+              </button>
+            </div>
+
+            <div className="pt-1.5 border-t border-white/[0.06] flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[11.5px] font-medium text-white">{s.openLogs}</div>
+                <div className="text-[10px] text-white/45 truncate">{s.openLogsDesc}</div>
+              </div>
+              <button
+                type="button"
+                onClick={() => void invoke("open_logs_folder")}
+                className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/[0.07] hover:bg-white/[0.14] border border-white/10 text-[10.5px] text-white/85 transition"
+              >
+                <FolderOpen className="w-3 h-3 text-sky-300" />
+                <span>{s.openLogsBtn}</span>
               </button>
             </div>
           </div>
@@ -745,6 +1049,16 @@ export default function SettingsTab({
               <div className="text-[12px] font-medium text-white">{s.testInhale}</div>
               <div className="text-[10.5px] text-white/45">{s.testInhaleDesc}</div>
             </button>
+
+            <div className="col-span-2 rounded-xl bg-white/[0.04] border border-white/10 px-3 py-2 flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <div className="text-[11.5px] font-medium text-white">{s.toggleHotkey}</div>
+                <div className="text-[10px] text-white/45">{s.toggleHotkeyDesc}</div>
+              </div>
+              <kbd className="px-2 py-0.5 rounded-md bg-white/[0.08] border border-white/15 font-mono text-[10.5px] text-sky-300">
+                Ctrl + Alt + B
+              </kbd>
+            </div>
           </div>
 
           <div className="text-[10.5px] text-white/40 text-center pb-0.5">{s.footerNote}</div>
