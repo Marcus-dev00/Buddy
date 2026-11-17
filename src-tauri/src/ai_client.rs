@@ -2342,6 +2342,98 @@ pub async fn run_oneshot_vision(
     }
 }
 
+fn build_screen_watch_prompts(
+    target_label: &str,
+    goal: &str,
+    cadence: &str,
+    ui_language: &str,
+    recent_whispers: &[String],
+    has_prev_frame: bool,
+) -> (String, String) {
+    let goal_trimmed = goal.trim();
+    let has_goal = !goal_trimmed.is_empty();
+    let lang_rule = if has_goal {
+        let hint = detect_thinking_language_hint(goal_trimmed, ui_language);
+        format!("Reply naturally in {hint}.")
+    } else if ui_language == "zh" {
+        "Reply in concise natural Simplified Chinese.".to_string()
+    } else {
+        "Reply in concise natural English.".to_string()
+    };
+
+    let mut anti_repeat = String::new();
+    if !recent_whispers.is_empty() {
+        anti_repeat.push_str("\nAlready mentioned recently (DO NOT repeat these):\n");
+        for w in recent_whispers {
+            anti_repeat.push_str(&format!("- {w}\n"));
+        }
+    }
+
+    let mission_block = if has_goal {
+        format!(
+            "PRIMARY MISSION (STRICT): Everything you say must directly advance the user's active goal: \"{goal_trimmed}\".\n\
+             - Treat this goal as your filter for what matters on screen.\n\
+             - NEVER passively describe, narrate, or summarize what app, page, or UI elements you see.\n\
+             - NEVER offer unrelated design/layout/color tips unless the user's goal itself asks for design/UI feedback.\n\
+             - If nothing visible right now needs action, insight, or follow-up for \"{goal_trimmed}\", output ONLY `[SILENT]`."
+        )
+    } else {
+        "PRIMARY MISSION: Act as a quiet, practical co-worker.\n\
+         - NEVER merely describe or narrate what app or content is on screen.\n\
+         - Output `[SILENT]` unless you spot an actual error, blocker, or high-value actionable tip."
+            .to_string()
+    };
+
+    let posture_rule = match (cadence, has_goal) {
+        ("active", true) => format!(
+            "The user chose ACTIVE mode for their goal \"{goal_trimmed}\". Whenever current or changed screen content gives you something concrete to help with THAT goal (answer, bug/error clue, next step, translation, or 1 sharp clarifying question about the goal), share 1-2 crisp sentences. Output `[SILENT]` if the screen has nothing new relevant to the goal."
+        ),
+        (_, true) => format!(
+            "Output ONLY `[SILENT]` unless something on screen directly impacts \"{goal_trimmed}\" with an actionable diagnosis, blocker, answer, or key question."
+        ),
+        ("active", false) => {
+            "The user chose ACTIVE co-work mode. Share 1 crisp specific suggestion, issue spotted, or helpful next step if something genuinely useful stands out; otherwise output `[SILENT]`.".to_string()
+        }
+        (_, false) => {
+            "Output ONLY `[SILENT]` unless you spot a clear error, blocker, or genuinely high-value suggestion.".to_string()
+        }
+    };
+
+    let sys_prompt = format!(
+        "You are Buddy co-working alongside the user while watching their shared screen ({target_label}).\n\
+         {mission_block}\n\
+         Rules:\n\
+         1. Compare the current screen against the previous snapshot (if provided) to see what the user is actively doing now.\n\
+         2. {posture_rule}\n\
+         3. Ground every remark in exact text, code, errors, or UI states visible on screen — never guess unreadable tiny text, never give generic praise ('looks good'), and never repeat recent remarks.\n\
+         4. Keep replies to 1-2 natural, everyday plain-text sentences (max ~90 Chinese chars or ~30 English words). No markdown headers or bullet lists.\n\
+         5. {lang_rule}{anti_repeat}"
+    );
+
+    let frame_note = if has_prev_frame {
+        "Image 1 is the earlier frame; Image 2 is the settled current frame."
+    } else {
+        "Attached is the current screen snapshot."
+    };
+
+    let user_desc = if has_goal {
+        format!(
+            "Shared target: {target_label}.\n\
+             USER'S ACTIVE GOAL: \"{goal_trimmed}\"\n\
+             {frame_note}\n\
+             Do NOT describe the screen. Respond strictly toward the Active Goal with [SILENT] or 1-2 short actionable sentences."
+        )
+    } else {
+        format!(
+            "Shared target: {target_label}.\n\
+             {frame_note}\n\
+             Do NOT merely narrate what is on screen. Respond with [SILENT] or 1-2 concise actionable sentences."
+        )
+    };
+
+    (sys_prompt, user_desc)
+}
+
 /// Proactive low-noise screen watch check. Returns `Ok(None)` when `[SILENT]`.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_screen_watch_check(
@@ -2356,53 +2448,20 @@ pub async fn run_screen_watch_check(
     prev_frame: Option<&InlineImageFrame>,
     curr_frame: &InlineImageFrame,
 ) -> Result<Option<String>, String> {
-    let lang_rule = if ui_language == "zh" {
-        "Reply in concise natural Simplified Chinese."
-    } else {
-        "Reply in concise natural English (unless the user's goal text is in another language, then match it)."
-    };
-
-    let goal_line = if goal.trim().is_empty() {
-        "General co-working observation (UI, layout, errors, or helpful clarification)."
-    } else {
-        goal.trim()
-    };
-
-    let mut anti_repeat = String::new();
-    if !recent_whispers.is_empty() {
-        anti_repeat.push_str("\nAlready mentioned recently (DO NOT repeat these):\n");
-        for w in recent_whispers {
-            anti_repeat.push_str(&format!("- {w}\n"));
-        }
-    }
-
-    let posture_rule = if cadence == "active" {
-        "The user chose ACTIVE co-work mode and specifically wants you to speak up like a sharp design/coding partner. Whenever you see concrete visual content, layout/typography/color/hierarchy details to improve, an error/ambiguity, or a natural clarifying question about their goal, share 1 crisp specific suggestion or question! Only reply `[SILENT]` if the screen shows nothing meaningful or nothing new since your already-mentioned remarks."
-    } else {
-        "Output ONLY `[SILENT]` unless you spot a clear, actionable design/layout/contrast/alignment/typography flaw, a visible error/blocker, OR you have one genuinely useful clarifying question or suggestion that helps the user's work right now."
-    };
-
-    let sys_prompt = format!(
-        "You are Buddy quietly co-working alongside the user while watching their shared screen ({target_label}).\n\
-        Collaboration focus: {goal_line}\n\
-        Rules:\n\
-        1. Compare the current screen against the previous snapshot (if any).\n\
-        2. {posture_rule}\n\
-        3. Reference concrete visible UI elements, labels, code/error text, or layout areas you actually read on screen. Never give empty generic praise ('looks good') or guess unreadable tiny text, and never repeat recent remarks.\n\
-        4. When speaking, write ONLY 1-2 short, direct plain-text sentences (max ~90 Chinese chars or ~30 English words). No markdown headers or bullet lists.\n\
-        5. {lang_rule}{anti_repeat}"
+    let (sys_prompt, user_desc) = build_screen_watch_prompts(
+        target_label,
+        goal,
+        cadence,
+        ui_language,
+        recent_whispers,
+        prev_frame.is_some(),
     );
 
     let mut frames = Vec::new();
-    let mut user_desc = format!("Shared target: {target_label}.");
     if let Some(pf) = prev_frame {
         frames.push(pf.clone());
-        user_desc.push_str(" Image 1 is the earlier frame; Image 2 is the settled current frame.");
-    } else {
-        user_desc.push_str(" Attached is the initial screen snapshot.");
     }
     frames.push(curr_frame.clone());
-    user_desc.push_str(" Respond with [SILENT] or 1-2 concise sentences.");
 
     let reply = run_oneshot_vision(client, model, api_key, &sys_prompt, &user_desc, &frames, 1024).await?;
     let trimmed = reply.trim();
@@ -2504,7 +2563,11 @@ pub fn spawn_chat_stream(
                 .as_deref()
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
-                .map(|g| format!(" Co-working goal: {g}."))
+                .map(|g| {
+                    format!(
+                        " The user's active screen-sharing goal is: \"{g}\". Prioritize helping fulfill this goal directly from the attached live frame(s) rather than passively describing the screen."
+                    )
+                })
                 .unwrap_or_default();
             sys_prompt.push_str(&format!(
                 "\n\n[LIVE SCREEN SHARE ACTIVE]\nThe user is actively sharing their screen with you right now. Use the attached live frame(s) to answer their question directly with specific visual feedback.{goal_note}"
@@ -3307,5 +3370,22 @@ mod tests {
         let app_zh = build_thinking_appendix("high", "帮我排查一下", "zh");
         assert!(app_zh.contains("Simplified Chinese"));
         assert!(app_zh.contains("native thinking/reasoning blocks"));
+    }
+
+    #[test]
+    fn screen_watch_prompt_anchors_user_goal_and_forbids_narration() {
+        let (sys_prompt, user_desc) = build_screen_watch_prompts(
+            "VS Code",
+            "帮我盯着终端报错并给修复命令",
+            "active",
+            "en",
+            &[],
+            true,
+        );
+        assert!(sys_prompt.contains("帮我盯着终端报错并给修复命令"));
+        assert!(sys_prompt.contains("NEVER passively describe"));
+        assert!(sys_prompt.contains("Simplified Chinese"));
+        assert!(user_desc.contains("USER'S ACTIVE GOAL: \"帮我盯着终端报错并给修复命令\""));
+        assert!(user_desc.contains("Do NOT describe the screen"));
     }
 }

@@ -553,7 +553,6 @@ export default function ChatTab({
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [slashSelIdx, setSlashSelIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement | null>(null);
-  const chatBottomRef = useRef<HTMLDivElement | null>(null);
   const scrollBoxRef = useRef<HTMLDivElement | null>(null);
   const msgRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const s = getStrings(lang).chat;
@@ -635,6 +634,15 @@ export default function ChatTab({
     void invoke("update_screen_share_options", patch).catch(() => {});
   };
 
+  useEffect(() => {
+    if (!shareState?.active) return;
+    if (shareGoal === (shareState.goal || "")) return;
+    const t = window.setTimeout(() => {
+      void invoke("update_screen_share_options", { goal: shareGoal }).catch(() => {});
+    }, 350);
+    return () => window.clearTimeout(t);
+  }, [shareGoal, shareState?.active, shareState?.goal]);
+
   const enabledSkills = skills.filter((sk) => sk.enabled);
   const slashMatch = !slashDismissed ? chatInput.match(/^\/([^\s]*)$/) : null;
   const slashQuery = slashMatch ? slashMatch[1].toLowerCase() : "";
@@ -672,7 +680,11 @@ export default function ChatTab({
 
   useEffect(() => {
     if (!showHistory) {
-      chatBottomRef.current?.scrollIntoView({ behavior: "smooth" });
+      // Scroll ONLY the inner chat message container so ancestor collapsed clip/root never scrolls Buddy off-screen.
+      const box = scrollBoxRef.current;
+      if (box) {
+        box.scrollTo({ top: box.scrollHeight, behavior: "smooth" });
+      }
       if (userMessages.length > 0) {
         setActiveUserIdx(userMessages.length - 1);
       }
@@ -700,8 +712,9 @@ export default function ChatTab({
   const jumpToUserMsg = (msgId: number, userIdx: number) => {
     setActiveUserIdx(userIdx);
     const el = msgRefs.current[msgId];
-    if (el) {
-      el.scrollIntoView({ behavior: "smooth", block: "start" });
+    const box = scrollBoxRef.current;
+    if (el && box) {
+      box.scrollTo({ top: Math.max(0, el.offsetTop - 8), behavior: "smooth" });
     }
   };
 
@@ -975,6 +988,12 @@ export default function ChatTab({
                   value={shareGoal}
                   onChange={(e) => {
                     setShareGoal(e.target.value);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      syncLiveShareOpt({ goal: shareGoal });
+                      (e.currentTarget as HTMLInputElement).blur();
+                    }
                   }}
                   onBlur={() => syncLiveShareOpt({ goal: shareGoal })}
                   placeholder={s.shareGoalPlaceholder}
@@ -1396,7 +1415,6 @@ export default function ChatTab({
                 </div>
               </div>
             ))}
-              <div ref={chatBottomRef} />
             </div>
 
             {userMessages.length >= 2 && (

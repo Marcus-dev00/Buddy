@@ -2,6 +2,16 @@
 
 All notable changes to **Buddy** are documented in this file.
 
+## [0.2.2] - 2026-11-18
+
+### Added
+- **5-Second Collapsed Reply Bubble Notifications**: When you send a message and collapse Buddy back to your desktop, a compact translucent floating bubble now notifies you for 5 seconds when Buddy finishes replying, hits an error, or waits for Agent tool approval—click **View** (or the bubble) to jump right back into the chat.
+- **Thinking Process Language Mirroring & Natural Companion Tone**: Updated `rules.md`, `personality.md`, and thinking prompts so Buddy thinks (`<buddy_thought>` and native reasoning blocks) in your own language with grounded, natural everyday phrasing and apt idioms while preserving unmodified vs. user-edited `.md` prompts cleanly.
+
+### Fixed
+- **Goal-Anchored Screen Share Co-Working**: Fixed Screen Watch ignoring the user's active goal and merely describing what is on screen—now binds `USER'S ACTIVE GOAL` directly into both system and user vision prompts, forbids passive screen narration, replies in the goal's language, and syncs live goal edits immediately on `Enter` or debounce.
+- **Floating Bubble Polish & Off-Screen Scroll Fix**: Removed status dots, added directional fade/slide enter-exit transitions (`200ms`) and semi-transparent frosted dark glass (`backdrop-blur-md`) for both reply bubbles and screen-share whispers, and replaced `scrollIntoView()` in Chat with container-scoped `scrollTo()` + `overflow-hidden` so background replies never push Buddy's collapsed capsule off-screen.
+
 ## [0.2.1] - 2026-11-18
 
 ### Added

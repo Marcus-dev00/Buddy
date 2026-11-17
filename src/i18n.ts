@@ -160,6 +160,10 @@ export const UI_STRINGS = {
       shareSnapTopRight: "Top Right",
       whisperReply: "Reply",
       whisperDismiss: "Dismiss",
+      replyView: "View",
+      replyDoneFallback: "Replied — click to view",
+      replyErrorPrefix: "Reply failed: ",
+      approvalWaitingPrefix: "Needs approval: ",
     },
     memory: {
       searchPlaceholder: "Search 7-Day Memory (FTS5)...",
@@ -412,6 +416,10 @@ export const UI_STRINGS = {
       shareSnapTopRight: "窗口右上",
       whisperReply: "回复",
       whisperDismiss: "忽略",
+      replyView: "查看",
+      replyDoneFallback: "Buddy 已回复，点击查看",
+      replyErrorPrefix: "回复出错：",
+      approvalWaitingPrefix: "等待确认：",
     },
     memory: {
       searchPlaceholder: "搜索 7 天记忆 (FTS5)...",

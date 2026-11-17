@@ -42,6 +42,31 @@ import type {
   UpdateInfo,
 } from "./types";
 
+type FloatingBubble =
+  | { kind: "share_whisper"; whisper: ShareWhisperPayload; durationMs: number }
+  | {
+      kind: "reply_notice";
+      text: string;
+      tone: "reply" | "error" | "approval";
+      durationMs: number;
+    };
+
+function formatBubblePreview(raw: string, fallback: string, maxChars = 88): string {
+  const cleaned = raw
+    .replace(/```[a-zA-Z0-9_-]*\s*/g, "")
+    .replace(/```/g, "")
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/[*_`~]+/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return fallback;
+  const chars = Array.from(cleaned);
+  if (chars.length <= maxChars) return cleaned;
+  return `${chars.slice(0, maxChars).join("")}…`;
+}
+
 type IdleBehavior =
   | "long_doze"
   | "settle_drowsy"
@@ -187,7 +212,8 @@ export default function App() {
   const [lastPickedColor, setLastPickedColor] = useState<ColorPickedPayload | null>(null);
   const [timerState, setTimerState] = useState<TimerTickPayload | null>(null);
   const [shareState, setShareState] = useState<ShareStatePayload | null>(null);
-  const [activeWhisper, setActiveWhisper] = useState<ShareWhisperPayload | null>(null);
+  const [floatingBubble, setFloatingBubble] = useState<FloatingBubble | null>(null);
+  const [bubbleVisible, setBubbleVisible] = useState(false);
   const [whisperHovered, setWhisperHovered] = useState(false);
   const [droppedPathsHint, setDroppedPathsHint] = useState<string[]>([]);
   const [focusedPluginId, setFocusedPluginId] = useState<string | null>(null);
@@ -208,10 +234,13 @@ export default function App() {
   const shareStateRef = useRef<ShareStatePayload | null>(null);
   const whisperRef = useRef<HTMLDivElement | null>(null);
   const whisperTimerRef = useRef<number | null>(null);
+  const bubbleExitTimerRef = useRef<number | null>(null);
+  const floatingBubbleRef = useRef<FloatingBubble | null>(null);
   const activeConversationIdRef = useRef<number | null>(null);
   const focusedRef = useRef(false);
   const thinkingRef = useRef(false);
   const thinkingLevelRef = useRef<ThinkingLevel>("medium");
+  const langRef = useRef<UiLang>("en");
   const activeStreamIdRef = useRef<string | null>(null);
   const typewriterRef = useRef<{
     streamId: string | null;
@@ -549,6 +578,38 @@ export default function App() {
         s.vCapScale = 1.4;
       }
     }
+  };
+
+  const presentBubble = (next: FloatingBubble) => {
+    if (bubbleExitTimerRef.current) {
+      window.clearTimeout(bubbleExitTimerRef.current);
+      bubbleExitTimerRef.current = null;
+    }
+    floatingBubbleRef.current = next;
+    setBubbleVisible(false);
+    setFloatingBubble(next);
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        setBubbleVisible(true);
+      });
+    });
+  };
+
+  const dismissBubbleAnimated = () => {
+    if (whisperTimerRef.current) {
+      window.clearTimeout(whisperTimerRef.current);
+      whisperTimerRef.current = null;
+    }
+    setBubbleVisible(false);
+    setWhisperHovered(false);
+    if (bubbleExitTimerRef.current) {
+      window.clearTimeout(bubbleExitTimerRef.current);
+    }
+    bubbleExitTimerRef.current = window.setTimeout(() => {
+      bubbleExitTimerRef.current = null;
+      floatingBubbleRef.current = null;
+      setFloatingBubble(null);
+    }, 220);
   };
 
   const applyVisualTargets = (next: BuddyState, thinkingOverride?: boolean) => {
@@ -956,6 +1017,21 @@ export default function App() {
             return { ...m, steps: nextSteps };
           })
         );
+        if (
+          step.status === "waiting_approval" &&
+          stateRef.current !== "expanded" &&
+          stateRef.current !== "stealth"
+        ) {
+          const chatStr = getStrings(langRef.current).chat;
+          presentBubble({
+            kind: "reply_notice",
+            tone: "approval",
+            durationMs: 5_000,
+            text:
+              chatStr.approvalWaitingPrefix +
+              formatBubblePreview(step.summary || step.tool_name, step.tool_name, 74),
+          });
+        }
       })
     );
 
@@ -989,6 +1065,15 @@ export default function App() {
         if (activeStreamIdRef.current !== event.payload.stream_id) return;
         typewriterRef.current.streamDone = true;
         void refreshConversations();
+        if (stateRef.current !== "expanded" && stateRef.current !== "stealth") {
+          const chatStr = getStrings(langRef.current).chat;
+          presentBubble({
+            kind: "reply_notice",
+            tone: "reply",
+            durationMs: 5_000,
+            text: formatBubblePreview(event.payload.full_text, chatStr.replyDoneFallback),
+          });
+        }
       })
     );
 
@@ -1003,6 +1088,16 @@ export default function App() {
         setActiveStreamId(null);
         if (stateRef.current === "expanded") {
           applyVisualTargets("expanded", false);
+        } else if (stateRef.current !== "stealth") {
+          const chatStr = getStrings(langRef.current).chat;
+          presentBubble({
+            kind: "reply_notice",
+            tone: "error",
+            durationMs: 5_000,
+            text:
+              chatStr.replyErrorPrefix +
+              formatBubblePreview(error, chatStr.replyDoneFallback, 74),
+          });
         }
         setMessages((prev) =>
           prev.map((m) =>
@@ -1091,7 +1186,9 @@ export default function App() {
         shareStateRef.current = nextShare;
         setShareState(nextShare);
         if (!nextShare.active) {
-          setActiveWhisper(null);
+          if (floatingBubbleRef.current?.kind === "share_whisper") {
+            dismissBubbleAnimated();
+          }
         } else if (stateRef.current === "sleep") {
           transitionTo("idle");
         }
@@ -1113,7 +1210,11 @@ export default function App() {
             { id: Date.now(), role: "assistant", text: w.text },
           ]);
         } else {
-          setActiveWhisper(w);
+          presentBubble({
+            kind: "share_whisper",
+            whisper: w,
+            durationMs: 14_000,
+          });
         }
       })
     );
@@ -2002,11 +2103,32 @@ export default function App() {
       window.clearTimeout(whisperTimerRef.current);
       whisperTimerRef.current = null;
     }
+
+    if (buddyState === "expanded" && floatingBubble) {
+      if (bubbleExitTimerRef.current) {
+        window.clearTimeout(bubbleExitTimerRef.current);
+        bubbleExitTimerRef.current = null;
+      }
+      setBubbleVisible(false);
+      floatingBubbleRef.current = null;
+      setFloatingBubble(null);
+      setWhisperHovered(false);
+      void invoke("set_whisper_bounds", { bounds: null }).catch(() => {});
+      return;
+    }
+
+    if (!floatingBubble) {
+      floatingBubbleRef.current = null;
+      setBubbleVisible(false);
+      setWhisperHovered(false);
+      void invoke("set_whisper_bounds", { bounds: null }).catch(() => {});
+      return;
+    }
+
     const visible =
-      Boolean(activeWhisper) &&
-      Boolean(shareState?.active) &&
       buddyState !== "expanded" &&
-      buddyState !== "stealth";
+      buddyState !== "stealth" &&
+      (floatingBubble.kind !== "share_whisper" || Boolean(shareState?.active));
 
     if (visible && whisperRef.current) {
       const el = whisperRef.current;
@@ -2019,8 +2141,8 @@ export default function App() {
       void invoke("set_whisper_bounds", { bounds }).catch(() => {});
       if (!whisperHovered) {
         whisperTimerRef.current = window.setTimeout(() => {
-          setActiveWhisper(null);
-        }, 14_000);
+          dismissBubbleAnimated();
+        }, floatingBubble.durationMs);
       }
     } else {
       void invoke("set_whisper_bounds", { bounds: null }).catch(() => {});
@@ -2031,12 +2153,25 @@ export default function App() {
         window.clearTimeout(whisperTimerRef.current);
       }
     };
-  }, [activeWhisper, shareState?.active, buddyState, dockEdge, layoutDims, whisperHovered]);
+  }, [floatingBubble, shareState?.active, buddyState, dockEdge, layoutDims, whisperHovered]);
 
-  const handleAcceptWhisper = async () => {
-    if (!activeWhisper) return;
-    const w = activeWhisper;
-    setActiveWhisper(null);
+  const handleOpenBubble = async () => {
+    if (!floatingBubble) return;
+    const bubble = floatingBubble;
+    if (bubbleExitTimerRef.current) {
+      window.clearTimeout(bubbleExitTimerRef.current);
+      bubbleExitTimerRef.current = null;
+    }
+    setBubbleVisible(false);
+    floatingBubbleRef.current = null;
+    setFloatingBubble(null);
+    setWhisperHovered(false);
+    if (bubble.kind === "reply_notice") {
+      switchTab("chat");
+      transitionTo("expanded");
+      return;
+    }
+    const w = bubble.whisper;
     let convId = activeConversationIdRef.current;
     if (convId === null) {
       try {
@@ -2297,6 +2432,7 @@ export default function App() {
         };
 
   const lang: UiLang = settings.ui_language === "zh" ? "zh" : "en";
+  langRef.current = lang;
   const activeChatModel = resolveActiveChatModel(settings);
   const thinkingCapability = getModelThinkingCapability(activeChatModel);
   const thinkingLevel: ThinkingLevel = clampThinkingLevel(
@@ -2307,7 +2443,7 @@ export default function App() {
   const ui = getStrings(lang);
 
   return (
-    <div className="w-full h-full bg-transparent relative pointer-events-none">
+    <div className="w-full h-full bg-transparent relative overflow-hidden pointer-events-none">
       <div
         ref={morphLayerRef}
         className="relative pointer-events-none"
@@ -2779,13 +2915,21 @@ export default function App() {
         </div>
       </div>
 
-      {/* Floating Whisper Mini Bubble (kept outside morphLayerRef so text renders crisp at integer pixels) */}
-      {activeWhisper && shareState?.active && !isExpanded && buddyState !== "stealth" && (
+      {/* Floating Whisper / Reply Mini Bubble (kept outside morphLayerRef so text renders crisp at integer pixels) */}
+      {floatingBubble &&
+        (floatingBubble.kind !== "share_whisper" || shareState?.active) &&
+        !isExpanded &&
+        buddyState !== "stealth" && (
         <div
           ref={whisperRef}
           onPointerDown={(e) => e.stopPropagation()}
           onMouseEnter={() => setWhisperHovered(true)}
           onMouseLeave={() => setWhisperHovered(false)}
+          onClick={() => {
+            if (floatingBubble.kind === "reply_notice") {
+              void handleOpenBubble();
+            }
+          }}
           style={
             dockEdge === "bottom"
               ? {
@@ -2811,28 +2955,53 @@ export default function App() {
                   width: 296,
                 }
           }
-          className="pointer-events-auto absolute z-40 rounded-2xl bg-[#0b0d14] border border-white/20 shadow-[0_12px_30px_rgba(0,0,0,0.72)] px-3 py-2 text-[12px] text-[#f8fafc]"
+          className={`pointer-events-auto absolute z-40 rounded-2xl bg-[#0b0d14]/78 backdrop-blur-md shadow-[0_10px_28px_rgba(0,0,0,0.45)] px-3 py-2 text-[12px] text-[#f8fafc] border transition-all duration-200 ease-out origin-center ${
+            floatingBubble.kind === "reply_notice" && floatingBubble.tone === "error"
+              ? "border-rose-400/35"
+              : floatingBubble.kind === "reply_notice" && floatingBubble.tone === "approval"
+              ? "border-amber-400/35"
+              : "border-white/[0.18]"
+          } ${
+            bubbleVisible
+              ? "opacity-100 translate-x-0 translate-y-0 scale-100"
+              : dockEdge === "bottom"
+              ? "opacity-0 translate-y-2 scale-95"
+              : dockEdge === "left"
+              ? "opacity-0 -translate-x-2 scale-95"
+              : dockEdge === "right"
+              ? "opacity-0 translate-x-2 scale-95"
+              : "opacity-0 -translate-y-2 scale-95"
+          } ${
+            floatingBubble.kind === "reply_notice" ? "cursor-pointer hover:border-white/30" : ""
+          }`}
         >
-          <div className="flex items-start gap-2">
-            <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-red-500 shrink-0" />
-            <div className="flex-1 min-w-0">
-              <p className="leading-snug text-[#f8fafc] break-words">{activeWhisper.text}</p>
-              <div className="mt-1.5 flex items-center justify-end gap-1.5">
-                <button
-                  type="button"
-                  onClick={() => setActiveWhisper(null)}
-                  className="px-2 py-0.5 rounded-full text-[10.5px] text-white/60 hover:text-white hover:bg-white/[0.08] transition"
-                >
-                  {ui.chat.whisperDismiss}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleAcceptWhisper()}
-                  className="px-2.5 py-0.5 rounded-full bg-white text-black font-medium text-[10.5px] hover:bg-white/90 transition"
-                >
-                  {ui.chat.whisperReply}
-                </button>
-              </div>
+          <div className="min-w-0">
+            <p className="leading-snug text-[#f8fafc] break-words">
+              {floatingBubble.kind === "share_whisper"
+                ? floatingBubble.whisper.text
+                : floatingBubble.text}
+            </p>
+            <div className="mt-1.5 flex items-center justify-end gap-1.5">
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  dismissBubbleAnimated();
+                }}
+                className="px-2 py-0.5 rounded-full text-[10.5px] text-white/65 hover:text-white hover:bg-white/[0.08] transition"
+              >
+                {ui.chat.whisperDismiss}
+              </button>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  void handleOpenBubble();
+                }}
+                className="px-2.5 py-0.5 rounded-full bg-white text-black font-medium text-[10.5px] hover:bg-white/90 transition"
+              >
+                {floatingBubble.kind === "share_whisper" ? ui.chat.whisperReply : ui.chat.replyView}
+              </button>
             </div>
           </div>
         </div>
