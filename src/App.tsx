@@ -1,7 +1,7 @@
 import { lazy, Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Clock, Download, Loader2, MessageSquare, Pause, Play, Puzzle, Settings, Square, X } from "lucide-react";
+import { Clock, Download, Loader2, MessageSquare, Pause, Pin, PinOff, Play, Puzzle, Settings, Square, X } from "lucide-react";
 import ChatTab, { memoryToAttachment } from "./components/ChatTab";
 const MemoryTab = lazy(() => import("./components/MemoryTab"));
 const PluginsTab = lazy(() => import("./components/PluginsTab"));
@@ -188,6 +188,7 @@ export default function App() {
     thinking_level: "medium",
     agent_workspace: "",
     ui_language: "en",
+    auto_collapse_on_blur: false,
   });
   const [layoutDims, setLayoutDims] = useState<LayoutDims>({
     v_w: 420,
@@ -2707,6 +2708,48 @@ export default function App() {
               </div>
 
               <button
+                type="button"
+                onPointerDown={(e) => e.stopPropagation()}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  const nextAutoCollapse = !settings.auto_collapse_on_blur;
+                  setSettings((prev) => ({
+                    ...prev,
+                    auto_collapse_on_blur: nextAutoCollapse,
+                  }));
+                  void invoke("set_auto_collapse_on_blur", {
+                    enabled: nextAutoCollapse,
+                  }).catch(() => {});
+                }}
+                aria-pressed={!settings.auto_collapse_on_blur}
+                title={
+                  settings.auto_collapse_on_blur
+                    ? ui.pinAutoCollapseTitle
+                    : ui.pinKeepOpenTitle
+                }
+                className={`absolute z-20 w-6 h-6 rounded-full border flex items-center justify-center transition-all duration-150 ${
+                  sideDocked
+                    ? "top-10 left-1/2 -translate-x-1/2"
+                    : dockEdge === "bottom"
+                    ? "right-11 bottom-3"
+                    : "right-11 top-3.5"
+                } ${
+                  !settings.auto_collapse_on_blur
+                    ? "bg-sky-500/20 border-sky-400/35 text-sky-200 hover:bg-sky-500/30"
+                    : "bg-white/[0.06] border-transparent text-white/45 hover:text-white/85 hover:bg-white/15"
+                } ${
+                  isExpanded ? "opacity-100 pointer-events-auto" : "opacity-0 pointer-events-none"
+                }`}
+              >
+                {!settings.auto_collapse_on_blur ? (
+                  <Pin className="w-3 h-3" />
+                ) : (
+                  <PinOff className="w-3 h-3" />
+                )}
+              </button>
+
+              <button
+                type="button"
                 onPointerDown={(e) => e.stopPropagation()}
                 onClick={(e) => {
                   e.stopPropagation();

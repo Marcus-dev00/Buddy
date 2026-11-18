@@ -218,6 +218,7 @@ export interface AppSettings {
   model_profiles?: ModelProfile[];
   chat_profile_id?: string;
   watch_profile_id?: string;
+  auto_collapse_on_blur?: boolean;
 }
 
 export interface ShareTargetInfo {

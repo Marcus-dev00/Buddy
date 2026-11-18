@@ -3,6 +3,8 @@ import type { UiLang } from "./types";
 export const UI_STRINGS = {
   en: {
     collapseTitle: "Collapse (Esc)",
+    pinKeepOpenTitle: "Pinned (click X / Esc to close; click to auto-collapse on blur)",
+    pinAutoCollapseTitle: "Auto-collapse on blur (click to pin open)",
     captureToast: "Saved to 7-Day Memory",
     updateBanner: "Update available",
     updateNow: "Update & Restart",
@@ -259,6 +261,8 @@ export const UI_STRINGS = {
   },
   zh: {
     collapseTitle: "收起 (Esc)",
+    pinKeepOpenTitle: "已固定（仅点击 X / Esc 关闭；点击可切换为失焦自动收起）",
+    pinAutoCollapseTitle: "失焦自动收起（点击固定面板不误关）",
     captureToast: "已存入 7 天记忆",
     updateBanner: "发现新版本",
     updateNow: "立即更新并重启",

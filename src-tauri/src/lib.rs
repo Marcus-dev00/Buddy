@@ -251,6 +251,18 @@ fn set_auto_hide_stealth(state: tauri::State<'_, Arc<AppSensorState>>, enabled: 
 }
 
 #[tauri::command]
+fn set_auto_collapse_on_blur(
+    settings_mgr: tauri::State<'_, Arc<SettingsManager>>,
+    sensor_state: tauri::State<'_, Arc<AppSensorState>>,
+    enabled: bool,
+) -> Result<(), String> {
+    sensor_state
+        .auto_collapse_on_blur
+        .store(enabled, Ordering::Relaxed);
+    settings_mgr.set_auto_collapse_on_blur(enabled)
+}
+
+#[tauri::command]
 fn set_music_reactive(state: tauri::State<'_, Arc<AppSensorState>>, enabled: bool) {
     state.music_reactive_enabled.store(enabled, Ordering::Relaxed);
     if !enabled {
@@ -391,6 +403,9 @@ async fn verify_and_save_model_config(
         .auto_hide_enabled
         .store(saved.auto_hide_stealth, Ordering::Relaxed);
     sensor_state
+        .auto_collapse_on_blur
+        .store(saved.auto_collapse_on_blur, Ordering::Relaxed);
+    sensor_state
         .music_reactive_enabled
         .store(saved.music_reactive, Ordering::Relaxed);
     if !saved.music_reactive {
@@ -473,6 +488,9 @@ fn save_settings(
     sensor_state
         .auto_hide_enabled
         .store(saved.auto_hide_stealth, Ordering::Relaxed);
+    sensor_state
+        .auto_collapse_on_blur
+        .store(saved.auto_collapse_on_blur, Ordering::Relaxed);
     sensor_state
         .music_reactive_enabled
         .store(saved.music_reactive, Ordering::Relaxed);
@@ -1106,6 +1124,9 @@ pub fn run() {
         .auto_hide_enabled
         .store(initial_cfg.auto_hide_stealth, Ordering::Relaxed);
     sensor_state
+        .auto_collapse_on_blur
+        .store(initial_cfg.auto_collapse_on_blur, Ordering::Relaxed);
+    sensor_state
         .music_reactive_enabled
         .store(initial_cfg.music_reactive, Ordering::Relaxed);
     if matches!(
@@ -1164,6 +1185,7 @@ pub fn run() {
             check_app_update,
             install_app_update,
             set_auto_hide_stealth,
+            set_auto_collapse_on_blur,
             set_music_reactive,
             set_music_playing_flag,
             get_expanded_bounds,
@@ -1406,7 +1428,8 @@ pub fn run() {
             let focus_state = sensor_state.clone();
             main_win.on_window_event(move |event| match event {
                 WindowEvent::Focused(false) => {
-                    if focus_state.is_expanded.load(Ordering::Relaxed)
+                    if focus_state.auto_collapse_on_blur.load(Ordering::Relaxed)
+                        && focus_state.is_expanded.load(Ordering::Relaxed)
                         && !focus_state.is_dragging.load(Ordering::Relaxed)
                         && !focus_state.suspend_auto_collapse.load(Ordering::Acquire)
                     {

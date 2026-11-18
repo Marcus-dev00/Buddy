@@ -125,6 +125,8 @@ pub struct AppSettings {
     pub chat_profile_id: String,
     #[serde(default)]
     pub watch_profile_id: String, // "" => follow chat_profile_id
+    #[serde(default)]
+    pub auto_collapse_on_blur: bool,
 }
 
 impl Default for AppSettings {
@@ -159,6 +161,7 @@ impl Default for AppSettings {
             model_profiles: vec![def_profile],
             chat_profile_id: default_chat_profile_id(),
             watch_profile_id: String::new(),
+            auto_collapse_on_blur: false,
         }
     }
 }
@@ -324,6 +327,12 @@ impl SettingsManager {
 
     pub fn get(&self) -> AppSettings {
         self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    pub fn set_auto_collapse_on_blur(&self, enabled: bool) -> Result<(), String> {
+        let mut guard = self.inner.lock().map_err(|_| "settings lock poisoned".to_string())?;
+        guard.auto_collapse_on_blur = enabled;
+        self.persist_unlocked(&guard)
     }
 
     /// Re-verifies / repairs Windows fast logon autostart silently on app launch.
@@ -903,9 +912,13 @@ mod tests {
 
         let mgr = SettingsManager::load(&dir);
         let cfg = mgr.get();
+        assert!(!cfg.auto_collapse_on_blur);
         assert_eq!(cfg.model_profiles.len(), 1);
         assert_eq!(cfg.chat_profile_id, "prof_default");
         assert_eq!(cfg.model_profiles[0].model_id, "gemini-2.5-pro");
+
+        mgr.set_auto_collapse_on_blur(true).unwrap();
+        assert!(SettingsManager::load(&dir).get().auto_collapse_on_blur);
 
         let (watch_follow, _) = mgr.resolve_watch_target(None);
         assert_eq!(watch_follow.model_id, "gemini-2.5-pro");

@@ -114,6 +114,8 @@ pub struct AppSensorState {
     pub is_dragging: AtomicBool,
     /// Prevents auto-collapse when opening native modal dialogs (e.g. file/folder pickers).
     pub suspend_auto_collapse: AtomicBool,
+    /// Only collapse on window blur when the user explicitly toggles Pin off (default: false = stay open until X/Esc/Ctrl+Alt+B).
+    pub auto_collapse_on_blur: AtomicBool,
     pub last_expand_ms: std::sync::atomic::AtomicU64,
     /// Active visual pill dimensions inside the fixed transparent canvas (logical px)
     pub pill_w: std::sync::atomic::AtomicU32,
@@ -141,6 +143,7 @@ impl Default for AppSensorState {
             manual_sleep: AtomicBool::new(false),
             is_dragging: AtomicBool::new(false),
             suspend_auto_collapse: AtomicBool::new(false),
+            auto_collapse_on_blur: AtomicBool::new(false),
             last_expand_ms: std::sync::atomic::AtomicU64::new(0),
             pill_w: std::sync::atomic::AtomicU32::new(152),
             pill_h: std::sync::atomic::AtomicU32::new(42),
@@ -1279,18 +1282,71 @@ fn is_shell_or_desktop_class(cls: &str) -> bool {
     )
 }
 
+fn is_non_game_window_class(win_class: &str) -> bool {
+    matches!(
+        win_class,
+        "Chrome_WidgetWin_0"
+            | "Chrome_WidgetWin_1"
+            | "Chrome_RenderWidgetHostHWND"
+            | "MozillaWindowClass"
+            | "MozillaDialogClass"
+            | "ApplicationFrameWindow"
+            | "CASCADIA_HOSTING_WINDOW_CLASS"
+            | "ConsoleWindowClass"
+            | "VirtualConsoleClass"
+            | "CabinetWClass"
+            | "ExploreWClass"
+            | "Electron"
+    ) || (win_class.starts_with("Qt") && win_class.ends_with("QWindowIcon"))
+        || win_class.starts_with("HwndWrapper[")
+}
+
+fn is_known_game_class(cls: &str) -> bool {
+    matches!(
+        cls,
+        "UnityWndClass"
+            | "UnrealWindow"
+            | "RiotWindowClass"
+            | "Valve001"
+            | "TslGame"
+            | "Respawn001"
+            | "CryENGINE"
+            | "Frostbite"
+            | "LaunchUnrealUWindowsClient"
+            | "grcWindow"
+            | "sgaWinClass"
+            | "LWJGL"
+    )
+}
+
 fn is_non_game_exe(exe_name: &str) -> bool {
     const NON_GAME_EXES: &[&str] = &[
         "chrome.exe",
+        "chrome_proxy.exe",
         "msedge.exe",
+        "msedge_proxy.exe",
+        "msedgewebview2.exe",
         "firefox.exe",
+        "zen.exe",
+        "floorp.exe",
+        "librewolf.exe",
+        "waterfox.exe",
+        "thorium.exe",
         "brave.exe",
         "opera.exe",
+        "opera_gx.exe",
         "vivaldi.exe",
         "arc.exe",
+        "comet.exe",
+        "yandex.exe",
+        "quark.exe",
         "360se.exe",
         "360chrome.exe",
         "qqbrowser.exe",
+        "sogouexplorer.exe",
+        "2345explorer.exe",
+        "liebao.exe",
+        "centbrowser.exe",
         "code.exe",
         "devenv.exe",
         "idea64.exe",
@@ -1302,11 +1358,20 @@ fn is_non_game_exe(exe_name: &str) -> bool {
         "cursor.exe",
         "windsurf.exe",
         "antigravity.exe",
+        "trae.exe",
+        "kiro.exe",
+        "zed.exe",
+        "sublime_text.exe",
+        "subl.exe",
         "explorer.exe",
+        "applicationframehost.exe",
         "notepad.exe",
         "notepad++.exe",
         "obsidian.exe",
         "notion.exe",
+        "typora.exe",
+        "logseq.exe",
+        "siyuan.exe",
         "wps.exe",
         "et.exe",
         "wpp.exe",
@@ -1315,13 +1380,29 @@ fn is_non_game_exe(exe_name: &str) -> bool {
         "powerpnt.exe",
         "acrord32.exe",
         "acrobat.exe",
+        "sumatrapdf.exe",
+        "foxitpdfreader.exe",
+        "foxitreader.exe",
         "vlc.exe",
+        "potplayer.exe",
         "potplayermini64.exe",
         "potplayermini.exe",
         "mpv.exe",
+        "mpv.net.exe",
+        "iina.exe",
         "mpc-hc64.exe",
         "mpc-be64.exe",
+        "kodi.exe",
+        "plex.exe",
+        "plexhtpc.exe",
+        "jellyfinmediaplayer.exe",
         "bilibili.exe",
+        "douyin.exe",
+        "qqlive.exe",
+        "tencentvideo.exe",
+        "iqiyi.exe",
+        "qiyi.exe",
+        "youku.exe",
         "qq.exe",
         "wechat.exe",
         "weixin.exe",
@@ -1337,6 +1418,8 @@ fn is_non_game_exe(exe_name: &str) -> bool {
         "spotify.exe",
         "cloudmusic.exe",
         "qqmusic.exe",
+        "kugou.exe",
+        "kwmusic.exe",
         "windowsterminal.exe",
         "powershell.exe",
         "pwsh.exe",
@@ -1344,6 +1427,18 @@ fn is_non_game_exe(exe_name: &str) -> bool {
         "conhost.exe",
         "taskmgr.exe",
         "buddy.exe",
+        "mstsc.exe",
+        "parsec.exe",
+        "moonlight.exe",
+        "sunshine.exe",
+        "todesk.exe",
+        "sunloginclient.exe",
+        "anydesk.exe",
+        "teamviewer.exe",
+        "rustdesk.exe",
+        "snipaste.exe",
+        "pixpin.exe",
+        "sharex.exe",
         // Launchers, live wallpapers, overlays, and streaming tools (not games themselves)
         "steam.exe",
         "steamwebhelper.exe",
@@ -1352,34 +1447,41 @@ fn is_non_game_exe(exe_name: &str) -> bool {
         "riotclientservices.exe",
         "riotclientux.exe",
         "wegame.exe",
+        "hoyoplay.exe",
+        "launcher.exe",
         "battlenet.exe",
+        "uu.exe",
+        "leigod.exe",
         "wallpaper32.exe",
         "wallpaper64.exe",
         "losslessscaling.exe",
         "obs64.exe",
         "obs32.exe",
         "ciscocollabhost.exe",
+        "gamebar.exe",
+        "nvidia overlay.exe",
+        "nvidiashare.exe",
     ];
     NON_GAME_EXES.contains(&exe_name)
 }
 
 fn is_known_game_signature(exe_path_lower: &str, exe_name: &str, cls: &str, title_lower: &str) -> bool {
-    const GAME_CLASSES: &[&str] = &[
-        "UnityWndClass",
-        "UnrealWindow",
-        "RiotWindowClass",
-        "Valve001",
-        "TslGame",
-        "Respawn001",
-        "CryENGINE",
-        "Frostbite",
-    ];
-    if GAME_CLASSES.contains(&cls) {
+    if is_known_game_class(cls) {
         return true;
+    }
+
+    // Ignore updaters/uninstallers/crash reporters sitting inside game folders.
+    if exe_name.starts_with("unins")
+        || exe_name.contains("crashhandler")
+        || exe_name.contains("crashpad")
+        || exe_name.contains("crashreport")
+    {
+        return false;
     }
 
     const PATH_FRAGMENTS: &[&str] = &[
         "\\steamapps\\common\\",
+        "\\steamlibrary\\",
         "\\epic games\\",
         "\\riot games\\",
         "\\wegameapps\\",
@@ -1389,6 +1491,7 @@ fn is_known_game_signature(exe_path_lower: &str, exe_name: &str, cls: &str, titl
         "\\origin games\\",
         "\\battle.net\\",
         "\\hoyoverse\\",
+        "\\hoyoplay\\games\\",
         "\\mihoyo\\",
         "\\genshin impact\\",
         "\\kuro games\\",
@@ -1432,12 +1535,35 @@ fn is_known_game_signature(exe_path_lower: &str, exe_name: &str, cls: &str, titl
         "minecraft.windows.exe",
         "robloxplayerbeta.exe",
         "deltaforceclient-win64-shipping.exe",
+        "narakabladepoint.exe",
+        "naraka.exe",
+        "b1-win64-shipping.exe",
+        "client-win64-shipping.exe",
+        "palworld-win64-shipping.exe",
+        "marvel-win64-shipping.exe",
+        "wow.exe",
+        "wowclassic.exe",
+        "ffxiv_dx11.exe",
+        "diablo iv.exe",
+        "hearthstone.exe",
+        "starcraft2.exe",
+        "starcraft2_x64.exe",
+        "crossfire.exe",
+        "dnf.exe",
+        "pathofexile.exe",
+        "pathofexile_x64.exe",
+        "pathofexile2.exe",
+        "bg3.exe",
+        "bg3_dx11.exe",
+        "witcher3.exe",
+        "mhworld.exe",
+        "monsterhunterwilds.exe",
     ];
     GAME_EXES.contains(&exe_name)
 }
 
-/// Distinguishes real games (exclusive D3D, borderless/fullscreen non-app windows, known engines/paths,
-/// or anti-cheat protected processes) from normal fullscreen browsers, editors, or players.
+/// Distinguishes real games (known engines/paths/exes, anti-cheat protected game classes, or
+/// genuine D3D exclusive fullscreen non-app windows) from normal fullscreen browsers, editors, or players.
 fn classify_foreground_game(
     exe_path_opt: Option<&str>,
     win_class: &str,
@@ -1447,13 +1573,17 @@ fn classify_foreground_game(
     has_caption: bool,
     large_window: bool,
 ) -> bool {
-    if is_shell_or_desktop_class(win_class) {
+    if is_shell_or_desktop_class(win_class) || is_non_game_window_class(win_class) {
         return false;
     }
 
     let Some(raw_path) = exe_path_opt else {
-        // Protected kernel anti-cheat games (ACE/Vanguard/EAC) can deny OpenProcess; only match fullscreen/borderless
-        return is_d3d_exclusive || (covers_screen && !has_caption);
+        // Protected kernel anti-cheat games (ACE/Vanguard/EAC) can deny OpenProcess:
+        // match known game classes or true D3D exclusive fullscreen (never plain borderless desktop apps).
+        if is_known_game_class(win_class) {
+            return large_window || covers_screen || is_d3d_exclusive;
+        }
+        return is_d3d_exclusive && covers_screen && !has_caption;
     };
 
     let path_lower = raw_path.to_ascii_lowercase();
@@ -1470,13 +1600,13 @@ fn classify_foreground_game(
         return large_window || covers_screen || is_d3d_exclusive;
     }
 
-    // Unknown app: hide only for genuine Direct3D exclusive fullscreen or captionless fullscreen games,
-    // NEVER for ordinary F11 desktop apps/viewers with normal windows or listed apps.
-    is_d3d_exclusive || (covers_screen && !has_caption)
+    // Unknown app: hide ONLY for genuine Direct3D exclusive fullscreen + captionless monitor coverage,
+    // NEVER for ordinary F11/borderless desktop apps, video players, browsers, or UWP apps.
+    is_d3d_exclusive && covers_screen && !has_caption
 }
 
 #[cfg(windows)]
-fn is_game_active(own_pid: u32) -> bool {
+fn detect_active_game(own_pid: u32) -> Option<String> {
     unsafe {
         let d3d_exclusive = SHQueryUserNotificationState()
             .map(|s| s == QUNS_RUNNING_D3D_FULL_SCREEN)
@@ -1484,22 +1614,22 @@ fn is_game_active(own_pid: u32) -> bool {
 
         let fg = GetForegroundWindow();
         if fg.0.is_null() {
-            return false;
+            return None;
         }
         let mut fg_pid: u32 = 0;
         GetWindowThreadProcessId(fg, Some(&mut fg_pid));
         if fg_pid == own_pid || fg_pid == 0 {
-            return false;
+            return None;
         }
 
         let cls = get_window_class(fg);
-        if is_shell_or_desktop_class(&cls) {
-            return false;
+        if is_shell_or_desktop_class(&cls) || is_non_game_window_class(&cls) {
+            return None;
         }
 
         let mut fg_rect = RECT::default();
         if GetWindowRect(fg, &mut fg_rect).is_err() {
-            return false;
+            return None;
         }
         let w = fg_rect.right - fg_rect.left;
         let h = fg_rect.bottom - fg_rect.top;
@@ -1524,7 +1654,7 @@ fn is_game_active(own_pid: u32) -> bool {
         let exe_path = query_process_image_path_lower(fg_pid);
         let title_lower = get_window_title_lower(fg);
 
-        classify_foreground_game(
+        if classify_foreground_game(
             exe_path.as_deref(),
             &cls,
             &title_lower,
@@ -1532,7 +1662,17 @@ fn is_game_active(own_pid: u32) -> bool {
             d3d_exclusive,
             has_caption,
             large_window,
-        )
+        ) {
+            let exe_label = exe_path
+                .as_deref()
+                .and_then(|p| Path::new(p).file_name().and_then(|n| n.to_str()))
+                .unwrap_or("<denied>");
+            return Some(format!(
+                "exe={}, class={}, covers={}, d3d={}, caption={}",
+                exe_label, cls, covers_screen, d3d_exclusive, has_caption
+            ));
+        }
+        None
     }
 }
 
@@ -1814,28 +1954,34 @@ pub fn start_sensor_loops(app: AppHandle, state: Arc<AppSensorState>) {
                 // Stealth check: drop to bottom & hide ONLY for active games (never meetings, launchers, browsers, etc.)
                 let auto_hide = state.auto_hide_enabled.load(Ordering::Relaxed);
                 let mut is_expanded = state.is_expanded.load(Ordering::Relaxed);
-                let (detected, reason) = if auto_hide && !state.is_dragging.load(Ordering::Relaxed) {
-                    if is_game_active(own_pid) {
+                let (detected_detail, reason) = if auto_hide && !state.is_dragging.load(Ordering::Relaxed) {
+                    if let Some(detail) = detect_active_game(own_pid) {
                         if is_expanded {
                             state.is_expanded.store(false, Ordering::Relaxed);
                             is_expanded = false;
                             let _ = app.emit("buddy://collapse", ());
                         }
-                        (true, "Game Active".to_string())
+                        (Some(detail), "Game Active".to_string())
                     } else {
-                        (false, String::new())
+                        (None, String::new())
                     }
                 } else {
-                    (false, String::new())
+                    (None, String::new())
                 };
 
-                if detected {
+                if let Some(detail) = detected_detail {
                     if let Ok(_vis_guard) = state.visibility_lock.lock() {
                         let currently_stealth = state.is_stealth.load(Ordering::Acquire);
                         clear_since = None;
                         if !currently_stealth {
                             state.is_stealth.store(true, Ordering::Release);
-                            crate::logger::log_info("stealth", "game detected -> dropping Buddy to bottom and hiding");
+                            crate::logger::log_info(
+                                "stealth",
+                                &format!(
+                                    "game detected ({}) -> dropping Buddy to bottom and hiding",
+                                    detail
+                                ),
+                            );
                             if let Some(win) = app.get_webview_window("main") {
                                 demote_and_hide_window(&win);
                             }
@@ -2018,6 +2164,53 @@ mod tests {
             true
         ));
 
+        // Unlisted fullscreen desktop apps, UWP apps, elevated apps, and non-fullscreen D3D false positives MUST NOT hide Buddy
+        assert!(!classify_foreground_game(
+            Some(r"C:\Program Files\SomeUnlistedApp\SomeViewer.exe"),
+            "SomeViewerWindowClass",
+            "full screen presentation",
+            true,
+            false,
+            false,
+            true
+        ));
+        assert!(!classify_foreground_game(
+            Some(r"C:\Program Files\SomeUnlistedApp\SomeViewer.exe"),
+            "SomeViewerWindowClass",
+            "small window with lingering d3d state",
+            false,
+            true,
+            true,
+            true
+        ));
+        assert!(!classify_foreground_game(
+            None,
+            "CASCADIA_HOSTING_WINDOW_CLASS",
+            "administrator: powershell",
+            true,
+            false,
+            false,
+            true
+        ));
+        assert!(!classify_foreground_game(
+            None,
+            "CustomElevatedApp",
+            "fullscreen admin app",
+            true,
+            false,
+            false,
+            true
+        ));
+        assert!(!classify_foreground_game(
+            Some(r"D:\Games\Genshin Impact\launcher.exe"),
+            "Qt5152QWindowIcon",
+            "genshin launcher",
+            false,
+            false,
+            false,
+            true
+        ));
+
         // Actual games MUST trigger stealth hide (both fullscreen and windowed/borderless)
         assert!(classify_foreground_game(
             Some(r"D:\SteamLibrary\steamapps\common\EldenRing\Game\eldenring.exe"),
@@ -2037,13 +2230,22 @@ mod tests {
             false,
             true
         ));
-        // Kernel anti-cheat protected game blocking OpenProcess in fullscreen borderless
+        // Kernel anti-cheat protected game blocking OpenProcess in fullscreen borderless or exclusive D3D
         assert!(classify_foreground_game(
             None,
             "RiotWindowClass",
             "valorant",
             true,
             false,
+            false,
+            true
+        ));
+        assert!(classify_foreground_game(
+            None,
+            "CustomProtectedGameWnd",
+            "protected d3d game",
+            true,
+            true,
             false,
             true
         ));

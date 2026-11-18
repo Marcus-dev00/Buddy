@@ -2,6 +2,14 @@
 
 All notable changes to **Buddy** are documented in this file.
 
+## [0.2.3] - 2026-11-18
+
+### Added
+- **Pinned Expanded Panel by Default (`Pin` / `PinOff` Toggle)**: Expanded Buddy now stays open across focus switches until explicitly closed via the `X` button, `Esc`, or `Ctrl + Alt + B`—making it effortless to copy API keys, base URLs, and text from other windows without losing your place. Click the new Pin toggle next to `X` anytime to switch back to auto-collapse on blur (preserving unsaved Settings drafts).
+
+### Fixed
+- **Prevented False Auto-Hide on Non-Game Fullscreen Apps**: Removed the overly broad `covers_screen && !has_caption` catch-all in game detection, added window-class guards (`is_non_game_window_class` for Chromium/Electron/Mozilla/UWP/Terminal/Explorer/Qt/WPF) and expanded non-game app & game-launcher exclusions so F11/fullscreen browsers, video players, UWP apps, and elevated tools no longer trigger stealth hide even when Auto-Hide During Games is enabled; added exact detection metadata to `buddy.log`.
+
 ## [0.2.2] - 2026-11-18
 
 ### Added

@@ -323,9 +323,29 @@ export default function SettingsTab({
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [updateMsg, setUpdateMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const prevProfilesSyncRef = useRef(
+    JSON.stringify({
+      profiles: settings.model_profiles ?? [],
+      chat: settings.chat_profile_id ?? "",
+      api_provider: settings.api_provider,
+      base_url: settings.base_url,
+      model_id: settings.model_id,
+      has_api_key: settings.has_api_key,
+    })
+  );
 
   useEffect(() => {
     setDraft(settings);
+    const nextSig = JSON.stringify({
+      profiles: settings.model_profiles ?? [],
+      chat: settings.chat_profile_id ?? "",
+      api_provider: settings.api_provider,
+      base_url: settings.base_url,
+      model_id: settings.model_id,
+      has_api_key: settings.has_api_key,
+    });
+    if (nextSig === prevProfilesSyncRef.current) return;
+    prevProfilesSyncRef.current = nextSig;
     const profs = makeFallbackProfiles(settings);
     setEditingProfile((cur) => {
       if (isNewProfile) return cur;
