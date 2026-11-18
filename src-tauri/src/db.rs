@@ -493,6 +493,34 @@ impl MemoryDb {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Starts a fresh conversation on app boot unless the latest conversation already has 0 messages.
+    pub fn ensure_fresh_startup_conversation(&self) -> Result<i64, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let ts = now_ms();
+        if let Ok((id, count)) = conn.query_row(
+            "SELECT c.id, (SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id = c.id) AS cnt
+             FROM conversations c
+             ORDER BY c.updated_at DESC, c.id DESC
+             LIMIT 1",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+        ) {
+            if count == 0 {
+                let _ = conn.execute(
+                    "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+                    params![ts, id],
+                );
+                return Ok(id);
+            }
+        }
+        conn.execute(
+            "INSERT INTO conversations (title, created_at, updated_at) VALUES ('New Chat', ?1, ?1)",
+            params![ts],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(conn.last_insert_rowid())
+    }
+
     pub fn list_conversations(&self, limit: usize) -> Result<Vec<ConversationSummary>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let mut stmt = conn
@@ -916,6 +944,31 @@ mod tests {
 
         // Second check with 12 uncompacted messages should not re-trigger
         assert!(db.list_messages_to_compact(conv.id, 22, 12).unwrap().is_none());
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_startup_conversation_starts_new_only_when_prior_has_messages() {
+        let dir = temp_db_dir("startup_fresh");
+        let db = MemoryDb::open_at(dir.clone()).unwrap();
+
+        let id1 = db.ensure_fresh_startup_conversation().unwrap();
+        // Calling startup again while id1 is still empty reuses id1 instead of creating blank rows
+        let id1_reused = db.ensure_fresh_startup_conversation().unwrap();
+        assert_eq!(id1, id1_reused);
+
+        db.append_chat_message(id1, "user", "hi buddy", None, None, None)
+            .unwrap();
+
+        // Once id1 has messages, next startup opens a brand-new conversation while id1 stays saved
+        let id2 = db.ensure_fresh_startup_conversation().unwrap();
+        assert_ne!(id1, id2);
+        let all = db.list_conversations(10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|c| c.id == id1 && c.message_count == 1));
+        assert!(all.iter().any(|c| c.id == id2 && c.message_count == 0));
 
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);

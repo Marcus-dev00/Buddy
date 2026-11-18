@@ -55,6 +55,18 @@ fn default_thinking_mode() -> String {
     "auto".to_string()
 }
 
+fn default_permission_mode() -> String {
+    "default".to_string()
+}
+
+pub fn normalize_permission_mode(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ask" => "ask".to_string(),
+        "auto" => "auto".to_string(),
+        _ => "default".to_string(),
+    }
+}
+
 fn normalize_thinking_mode(raw: &str) -> String {
     match raw.trim().to_ascii_lowercase().as_str() {
         "native" => "native".to_string(),
@@ -127,6 +139,8 @@ pub struct AppSettings {
     pub watch_profile_id: String, // "" => follow chat_profile_id
     #[serde(default)]
     pub auto_collapse_on_blur: bool,
+    #[serde(default = "default_permission_mode")]
+    pub agent_permission_mode: String, // "ask" | "default" | "auto"
 }
 
 impl Default for AppSettings {
@@ -162,6 +176,7 @@ impl Default for AppSettings {
             chat_profile_id: default_chat_profile_id(),
             watch_profile_id: String::new(),
             auto_collapse_on_blur: false,
+            agent_permission_mode: default_permission_mode(),
         }
     }
 }
@@ -318,6 +333,7 @@ impl SettingsManager {
             settings.model_id = active.model_id;
             settings.has_api_key = active.has_api_key;
         }
+        settings.agent_permission_mode = normalize_permission_mode(&settings.agent_permission_mode);
     }
 
     fn persist_unlocked(&self, settings: &AppSettings) -> Result<(), String> {
@@ -333,6 +349,14 @@ impl SettingsManager {
         let mut guard = self.inner.lock().map_err(|_| "settings lock poisoned".to_string())?;
         guard.auto_collapse_on_blur = enabled;
         self.persist_unlocked(&guard)
+    }
+
+    pub fn set_agent_permission_mode(&self, mode: &str) -> Result<String, String> {
+        let normalized = normalize_permission_mode(mode);
+        let mut guard = self.inner.lock().map_err(|_| "settings lock poisoned".to_string())?;
+        guard.agent_permission_mode = normalized.clone();
+        self.persist_unlocked(&guard)?;
+        Ok(normalized)
     }
 
     /// Re-verifies / repairs Windows fast logon autostart silently on app launch.
@@ -913,12 +937,16 @@ mod tests {
         let mgr = SettingsManager::load(&dir);
         let cfg = mgr.get();
         assert!(!cfg.auto_collapse_on_blur);
+        assert_eq!(cfg.agent_permission_mode, "default");
         assert_eq!(cfg.model_profiles.len(), 1);
         assert_eq!(cfg.chat_profile_id, "prof_default");
         assert_eq!(cfg.model_profiles[0].model_id, "gemini-2.5-pro");
 
         mgr.set_auto_collapse_on_blur(true).unwrap();
         assert!(SettingsManager::load(&dir).get().auto_collapse_on_blur);
+        assert_eq!(mgr.set_agent_permission_mode("auto").unwrap(), "auto");
+        assert_eq!(SettingsManager::load(&dir).get().agent_permission_mode, "auto");
+        assert_eq!(mgr.set_agent_permission_mode("turbo").unwrap(), "default");
 
         let (watch_follow, _) = mgr.resolve_watch_target(None);
         assert_eq!(watch_follow.model_id, "gemini-2.5-pro");

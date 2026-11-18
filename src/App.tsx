@@ -14,6 +14,7 @@ import {
   resolveActiveChatModel,
 } from "./thinking";
 import type {
+  AgentPermissionMode,
   AgentStep,
   AppSettings,
   ApprovalDecision,
@@ -189,6 +190,7 @@ export default function App() {
     agent_workspace: "",
     ui_language: "en",
     auto_collapse_on_blur: false,
+    agent_permission_mode: "default",
   });
   const [layoutDims, setLayoutDims] = useState<LayoutDims>({
     v_w: 420,
@@ -892,7 +894,7 @@ export default function App() {
         // ignore
       }
       try {
-        const convId = await invoke<number>("ensure_active_conversation");
+        const convId = await invoke<number>("ensure_fresh_startup_conversation");
         await loadConversationMessages(convId, loadedLang);
         await refreshConversations();
       } catch {
@@ -2075,6 +2077,15 @@ export default function App() {
       .catch(() => {});
   };
 
+  const handleChangePermissionMode = (mode: AgentPermissionMode) => {
+    setSettings((prev) => ({ ...prev, agent_permission_mode: mode }));
+    void invoke<string>("set_agent_permission_mode", { mode })
+      .then((normalized) => {
+        setSettings((prev) => ({ ...prev, agent_permission_mode: normalized }));
+      })
+      .catch(() => {});
+  };
+
   const handleChangeThinkingLevel = (level: ThinkingLevel) => {
     if (isThinking) return;
     const next = { ...settings, thinking_level: level };
@@ -2810,6 +2821,12 @@ export default function App() {
                 <ChatTab
                   lang={lang}
                   agentMode={settings.agent_mode}
+                  permissionMode={
+                    settings.agent_permission_mode === "ask" ||
+                    settings.agent_permission_mode === "auto"
+                      ? settings.agent_permission_mode
+                      : "default"
+                  }
                   thinkingLevel={thinkingLevel}
                   thinkingCapability={thinkingCapability}
                   activeStreamId={activeStreamId}
@@ -2831,6 +2848,7 @@ export default function App() {
                   onSend={(p, a) => void handleSendChat(p, a)}
                   onStopStream={handleStopStream}
                   onToggleAgentMode={handleToggleAgentMode}
+                  onChangePermissionMode={handleChangePermissionMode}
                   onChangeThinkingLevel={handleChangeThinkingLevel}
                   onResolveApproval={handleResolveApproval}
                   onNewChat={() => void handleNewChat()}

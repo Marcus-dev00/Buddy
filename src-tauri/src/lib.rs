@@ -263,6 +263,14 @@ fn set_auto_collapse_on_blur(
 }
 
 #[tauri::command]
+fn set_agent_permission_mode(
+    settings_mgr: tauri::State<'_, Arc<SettingsManager>>,
+    mode: String,
+) -> Result<String, String> {
+    settings_mgr.set_agent_permission_mode(&mode)
+}
+
+#[tauri::command]
 fn set_music_reactive(state: tauri::State<'_, Arc<AppSensorState>>, enabled: bool) {
     state.music_reactive_enabled.store(enabled, Ordering::Relaxed);
     if !enabled {
@@ -503,6 +511,11 @@ fn save_settings(
 #[tauri::command]
 fn ensure_active_conversation(db: tauri::State<'_, Arc<MemoryDb>>) -> Result<i64, String> {
     db.ensure_active_conversation()
+}
+
+#[tauri::command]
+fn ensure_fresh_startup_conversation(db: tauri::State<'_, Arc<MemoryDb>>) -> Result<i64, String> {
+    db.ensure_fresh_startup_conversation()
 }
 
 #[tauri::command]
@@ -1186,6 +1199,7 @@ pub fn run() {
             install_app_update,
             set_auto_hide_stealth,
             set_auto_collapse_on_blur,
+            set_agent_permission_mode,
             set_music_reactive,
             set_music_playing_flag,
             get_expanded_bounds,
@@ -1204,6 +1218,7 @@ pub fn run() {
             list_personalities,
             open_prompts_folder,
             ensure_active_conversation,
+            ensure_fresh_startup_conversation,
             list_conversations,
             create_conversation,
             delete_conversation,

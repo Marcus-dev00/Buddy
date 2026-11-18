@@ -11,6 +11,7 @@ export type TabId = "chat" | "memory" | "plugins" | "settings";
 export type MusicStyle = "lofi" | "pop" | "edm" | "vocal";
 export type UiLang = "en" | "zh";
 export type ThinkingLevel = "off" | "low" | "medium" | "high" | "max";
+export type AgentPermissionMode = "ask" | "default" | "auto";
 export type DockEdge = "top" | "bottom" | "left" | "right" | "free";
 
 export interface LayoutDims {
@@ -219,6 +220,7 @@ export interface AppSettings {
   chat_profile_id?: string;
   watch_profile_id?: string;
   auto_collapse_on_blur?: boolean;
+  agent_permission_mode?: AgentPermissionMode | string;
 }
 
 export interface ShareTargetInfo {

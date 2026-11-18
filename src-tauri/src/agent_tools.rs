@@ -592,11 +592,208 @@ fn short_path_label(path: &Path) -> String {
     format!("...{tail}")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentPermissionMode {
+    Ask,
+    Default,
+    Auto,
+}
+
+impl AgentPermissionMode {
+    pub fn from_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "ask" => Self::Ask,
+            "auto" => Self::Auto,
+            _ => Self::Default,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolRiskKind {
+    ReadOnly,
+    ReversibleWrite,
+    ExternalSideEffect,
+    DangerousOrDelete,
+}
+
+fn approval_flags_for(mode: AgentPermissionMode, risk: ToolRiskKind) -> (bool, bool, bool) {
+    let is_destructive = risk == ToolRiskKind::DangerousOrDelete;
+    match (mode, risk) {
+        (_, ToolRiskKind::ReadOnly) => (false, false, false),
+        (
+            AgentPermissionMode::Ask,
+            ToolRiskKind::ReversibleWrite
+            | ToolRiskKind::ExternalSideEffect
+            | ToolRiskKind::DangerousOrDelete,
+        ) => (true, false, is_destructive),
+        (AgentPermissionMode::Default, ToolRiskKind::ReversibleWrite) => (true, true, false),
+        (
+            AgentPermissionMode::Default,
+            ToolRiskKind::ExternalSideEffect | ToolRiskKind::DangerousOrDelete,
+        ) => (true, false, is_destructive),
+        (
+            AgentPermissionMode::Auto,
+            ToolRiskKind::ReversibleWrite | ToolRiskKind::ExternalSideEffect,
+        ) => (false, false, false),
+        (AgentPermissionMode::Auto, ToolRiskKind::DangerousOrDelete) => (true, false, true),
+    }
+}
+
+fn is_dangerous_shell_command(cmd: &str) -> bool {
+    let normalized: String = cmd
+        .to_ascii_lowercase()
+        .replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return true;
+    }
+
+    const SUBSTR_PATTERNS: &[&str] = &[
+        "remove-item",
+        "clear-content",
+        "clear-item",
+        "remove-itemproperty",
+        "set-itemproperty",
+        "new-itemproperty",
+        "stop-process",
+        "stop-service",
+        "set-service",
+        "remove-service",
+        "restart-computer",
+        "stop-computer",
+        "format-volume",
+        "format-disk",
+        "clear-disk",
+        "remove-partition",
+        "invoke-expression",
+        "-encodedcommand",
+        "frombase64string",
+        "start-bitstransfer",
+        "file]::delete",
+        "directory]::delete",
+        ".delete(",
+        "os.remove",
+        "os.unlink",
+        "shutil.rmtree",
+        "fs.unlink",
+        "fs.rm",
+        "rmsync",
+        "rmdirsync",
+        "unlinksync",
+        "uninstall-package",
+        "uninstall-module",
+        "winget uninstall",
+        "npm uninstall",
+        "pip uninstall",
+        "cargo clean",
+        "git clean",
+        "git reset --hard",
+        "git push",
+        "git branch -d",
+        "git checkout --",
+        "git restore",
+        "git rebase",
+        "reg delete",
+        "reg add",
+        "reg import",
+        "reg restore",
+        "-verb runas",
+        "-verb 'runas'",
+        "-verb \"runas\"",
+        " -force",
+        " --force",
+    ];
+    if SUBSTR_PATTERNS.iter().any(|p| normalized.contains(p)) {
+        return true;
+    }
+    if normalized.contains("cipher") && normalized.contains("/w") {
+        return true;
+    }
+    if normalized.contains(" -enc ") || normalized.ends_with(" -enc") {
+        return true;
+    }
+
+    const DANGEROUS_CMDS: &[&str] = &[
+        "rm",
+        "del",
+        "erase",
+        "rd",
+        "rmdir",
+        "ri",
+        "clc",
+        "kill",
+        "taskkill",
+        "shutdown",
+        "logoff",
+        "diskpart",
+        "bcdedit",
+        "vssadmin",
+        "wbadmin",
+        "reg",
+        "regedit",
+        "schtasks",
+        "netsh",
+        "net",
+        "icacls",
+        "takeown",
+        "iex",
+        "runas",
+        "format",
+        "sfc",
+        "dism",
+        "sc",
+    ];
+
+    for segment in normalized.split(|c| matches!(c, ';' | '|' | '&' | '\n' | '\r' | '(' | '{')) {
+        let mut iter = segment.split_whitespace().peekable();
+        // Skip shell wrappers / invocation prefixes to inspect the actual verb
+        while let Some(raw_tok) = iter.peek().copied() {
+            let tok = raw_tok
+                .trim_matches(|c| matches!(c, '\'' | '"' | '.'))
+                .trim_end_matches(".exe");
+            if matches!(
+                tok,
+                "" | "cmd" | "powershell" | "pwsh" | "/c" | "/k" | "-c" | "-command" | "-noprofile"
+                    | "-nologo" | "-noninteractive" | "sudo"
+            ) {
+                iter.next();
+                continue;
+            }
+            if DANGEROUS_CMDS.contains(&tok) {
+                return true;
+            }
+            break;
+        }
+    }
+
+    false
+}
+
+fn make_plan(
+    summary: String,
+    preview: Option<String>,
+    mode: AgentPermissionMode,
+    risk: ToolRiskKind,
+) -> ToolExecutionPlan {
+    let (requires_approval, allow_approve_all, is_destructive) = approval_flags_for(mode, risk);
+    ToolExecutionPlan {
+        summary,
+        preview,
+        requires_approval,
+        allow_approve_all,
+        is_destructive,
+    }
+}
+
 /// Builds a user-readable plan and safety classification before executing a tool.
 pub fn plan_tool_execution(
     name: &str,
     args: &Value,
     workspace_hint: Option<&Path>,
+    permission_mode: AgentPermissionMode,
 ) -> ToolExecutionPlan {
     match name {
         "list_dir" => {
@@ -604,13 +801,12 @@ pub fn plan_tool_execution(
             let label = resolve_user_path(raw, workspace_hint)
                 .map(|p| short_path_label(&p))
                 .unwrap_or_else(|_| raw.to_string());
-            ToolExecutionPlan {
-                summary: format!("List folder `{label}`"),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("List folder `{label}`"),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "find_files" => {
             let q = args["query"].as_str().unwrap_or("");
@@ -618,13 +814,12 @@ pub fn plan_tool_execution(
             let label = resolve_user_path(r, workspace_hint)
                 .map(|p| short_path_label(&p))
                 .unwrap_or_else(|_| r.to_string());
-            ToolExecutionPlan {
-                summary: format!("Find `{q}` in `{label}`"),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Find `{q}` in `{label}`"),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "search_text" => {
             let q = args["query"].as_str().unwrap_or("");
@@ -632,39 +827,41 @@ pub fn plan_tool_execution(
             let label = resolve_user_path(r, workspace_hint)
                 .map(|p| short_path_label(&p))
                 .unwrap_or_else(|_| r.to_string());
-            ToolExecutionPlan {
-                summary: format!("Search \"{q}\" in `{label}`"),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Search \"{q}\" in `{label}`"),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "read_file" => {
             let raw = args["path"].as_str().unwrap_or("");
             let label = resolve_user_path(raw, workspace_hint)
                 .map(|p| short_path_label(&p))
                 .unwrap_or_else(|_| raw.to_string());
-            ToolExecutionPlan {
-                summary: format!("Read `{label}`"),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Read `{label}`"),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "create_dir" => {
             let raw = args["path"].as_str().unwrap_or("");
             let resolved = resolve_user_path(raw, workspace_hint)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| raw.to_string());
-            ToolExecutionPlan {
-                summary: format!("Create folder `{}`", Path::new(&resolved).file_name().and_then(|s| s.to_str()).unwrap_or(&resolved)),
-                preview: Some(resolved),
-                requires_approval: true,
-                allow_approve_all: true,
-                is_destructive: false,
-            }
+            let dir_name = Path::new(&resolved)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&resolved)
+                .to_string();
+            make_plan(
+                format!("Create folder `{dir_name}`"),
+                Some(resolved),
+                permission_mode,
+                ToolRiskKind::ReversibleWrite,
+            )
         }
         "write_file" => {
             let raw = args["path"].as_str().unwrap_or("");
@@ -674,21 +871,26 @@ pub fn plan_tool_execution(
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| raw.to_string());
             let snippet = truncate_chars(content, 360);
-            ToolExecutionPlan {
-                summary: format!(
+            let file_label = Path::new(&resolved)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&resolved)
+                .to_string();
+            make_plan(
+                format!(
                     "{} `{}` ({} bytes)",
                     if overwrite { "Overwrite" } else { "Write" },
-                    Path::new(&resolved)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&resolved),
+                    file_label,
                     content.len()
                 ),
-                preview: Some(format!("Path: {resolved}\n---\n{snippet}")),
-                requires_approval: true,
-                allow_approve_all: true,
-                is_destructive: overwrite,
-            }
+                Some(format!("Path: {resolved}\n---\n{snippet}")),
+                permission_mode,
+                if overwrite {
+                    ToolRiskKind::DangerousOrDelete
+                } else {
+                    ToolRiskKind::ReversibleWrite
+                },
+            )
         }
         "edit_file" => {
             let raw = args["path"].as_str().unwrap_or("");
@@ -702,19 +904,17 @@ pub fn plan_tool_execution(
                 truncate_chars(target, 160),
                 truncate_chars(replacement, 160)
             );
-            ToolExecutionPlan {
-                summary: format!(
-                    "Edit `{}`",
-                    Path::new(&resolved)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&resolved)
-                ),
-                preview: Some(preview),
-                requires_approval: true,
-                allow_approve_all: true,
-                is_destructive: false,
-            }
+            let file_label = Path::new(&resolved)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&resolved)
+                .to_string();
+            make_plan(
+                format!("Edit `{file_label}`"),
+                Some(preview),
+                permission_mode,
+                ToolRiskKind::ReversibleWrite,
+            )
         }
         "move_or_rename" => {
             let src = args["source"].as_str().unwrap_or("");
@@ -728,18 +928,19 @@ pub fn plan_tool_execution(
             let s_name = Path::new(&src_res)
                 .file_name()
                 .and_then(|s| s.to_str())
-                .unwrap_or(&src_res);
+                .unwrap_or(&src_res)
+                .to_string();
             let d_name = Path::new(&dst_res)
                 .file_name()
                 .and_then(|s| s.to_str())
-                .unwrap_or(&dst_res);
-            ToolExecutionPlan {
-                summary: format!("Move `{s_name}` → `{d_name}`"),
-                preview: Some(format!("From: {src_res}\nTo:   {dst_res}")),
-                requires_approval: true,
-                allow_approve_all: true,
-                is_destructive: false,
-            }
+                .unwrap_or(&dst_res)
+                .to_string();
+            make_plan(
+                format!("Move `{s_name}` → `{d_name}`"),
+                Some(format!("From: {src_res}\nTo:   {dst_res}")),
+                permission_mode,
+                ToolRiskKind::ReversibleWrite,
+            )
         }
         "copy_file" => {
             let src = args["source"].as_str().unwrap_or("");
@@ -750,36 +951,43 @@ pub fn plan_tool_execution(
             let dst_res = resolve_user_path(dst, workspace_hint)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| dst.to_string());
+            let dst_exists = Path::new(&dst_res).exists();
             let s_name = Path::new(&src_res)
                 .file_name()
                 .and_then(|s| s.to_str())
-                .unwrap_or(&src_res);
-            ToolExecutionPlan {
-                summary: format!("Copy `{s_name}`"),
-                preview: Some(format!("From: {src_res}\nTo:   {dst_res}")),
-                requires_approval: true,
-                allow_approve_all: true,
-                is_destructive: false,
-            }
+                .unwrap_or(&src_res)
+                .to_string();
+            make_plan(
+                if dst_exists {
+                    format!("Overwrite `{s_name}` (copy)")
+                } else {
+                    format!("Copy `{s_name}`")
+                },
+                Some(format!("From: {src_res}\nTo:   {dst_res}")),
+                permission_mode,
+                if dst_exists {
+                    ToolRiskKind::DangerousOrDelete
+                } else {
+                    ToolRiskKind::ReversibleWrite
+                },
+            )
         }
         "delete_path" => {
             let raw = args["path"].as_str().unwrap_or("");
             let resolved = resolve_user_path(raw, workspace_hint)
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| raw.to_string());
-            ToolExecutionPlan {
-                summary: format!(
-                    "Recycle `{}`",
-                    Path::new(&resolved)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(&resolved)
-                ),
-                preview: Some(format!("Send to Recycle Bin:\n{resolved}")),
-                requires_approval: true,
-                allow_approve_all: false,
-                is_destructive: true,
-            }
+            let file_label = Path::new(&resolved)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(&resolved)
+                .to_string();
+            make_plan(
+                format!("Recycle `{file_label}`"),
+                Some(format!("Send to Recycle Bin:\n{resolved}")),
+                permission_mode,
+                ToolRiskKind::DangerousOrDelete,
+            )
         }
         "run_shell" => {
             let cmd = args["command"].as_str().unwrap_or("");
@@ -793,50 +1001,50 @@ pub fn plan_tool_execution(
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| wd.to_string())
             };
-            ToolExecutionPlan {
-                summary: "Run PowerShell command".to_string(),
-                preview: Some(format!("CWD: {wd_label}\n$ {}", truncate_chars(cmd, 420))),
-                requires_approval: true,
-                allow_approve_all: false,
-                is_destructive: true,
-            }
+            let shell_risk = if is_dangerous_shell_command(cmd) {
+                ToolRiskKind::DangerousOrDelete
+            } else {
+                ToolRiskKind::ReversibleWrite
+            };
+            make_plan(
+                "Run PowerShell command".to_string(),
+                Some(format!("CWD: {wd_label}\n$ {}", truncate_chars(cmd, 420))),
+                permission_mode,
+                shell_risk,
+            )
         }
-        "list_installed_skills" => ToolExecutionPlan {
-            summary: "List installed Skills".to_string(),
-            preview: None,
-            requires_approval: false,
-            allow_approve_all: false,
-            is_destructive: false,
-        },
+        "list_installed_skills" => make_plan(
+            "List installed Skills".to_string(),
+            None,
+            permission_mode,
+            ToolRiskKind::ReadOnly,
+        ),
         "read_skill" => {
             let id = args["skill_id"].as_str().unwrap_or("");
-            ToolExecutionPlan {
-                summary: format!("Load Skill `{id}`"),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Load Skill `{id}`"),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "search_github_skills" => {
             let q = args["query"].as_str().unwrap_or("");
-            ToolExecutionPlan {
-                summary: format!("Search GitHub Skills `{q}`"),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Search GitHub Skills `{q}`"),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "install_github_skill" => {
             let src = args["source"].as_str().unwrap_or("");
-            ToolExecutionPlan {
-                summary: format!("Install GitHub Skill `{}`", truncate_chars(src, 42)),
-                preview: Some(format!("Source: {src}\nInstall into %LOCALAPPDATA%/Buddy/skills/")),
-                requires_approval: true,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Install GitHub Skill `{}`", truncate_chars(src, 42)),
+                Some(format!("Source: {src}\nInstall into %LOCALAPPDATA%/Buddy/skills/")),
+                permission_mode,
+                ToolRiskKind::ExternalSideEffect,
+            )
         }
         "offline_ocr" => {
             let src = args["source"].as_str().unwrap_or("");
@@ -844,53 +1052,48 @@ pub fn plan_tool_execution(
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or(src);
-            ToolExecutionPlan {
-                summary: format!("Offline OCR `{}`", truncate_chars(name, 36)),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Offline OCR `{}`", truncate_chars(name, 36)),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "search_memories" => {
             let q = args["query"].as_str().unwrap_or("");
-            ToolExecutionPlan {
-                summary: format!("Search memories `{}`", truncate_chars(q, 32)),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Search memories `{}`", truncate_chars(q, 32)),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "save_memory_fact" => {
             let fact = args["content"].as_str().unwrap_or("");
-            ToolExecutionPlan {
-                summary: format!("Save fact: `{}`", truncate_chars(fact, 36)),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Save fact: `{}`", truncate_chars(fact, 36)),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "web_search" => {
             let q = args["query"].as_str().unwrap_or("");
-            ToolExecutionPlan {
-                summary: format!("Web search `{}`", truncate_chars(q, 34)),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Web search `{}`", truncate_chars(q, 34)),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "fetch_web_page" => {
             let url = args["url"].as_str().unwrap_or("");
-            ToolExecutionPlan {
-                summary: format!("Fetch `{}`", truncate_chars(url, 38)),
-                preview: None,
-                requires_approval: false,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Fetch `{}`", truncate_chars(url, 38)),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
         }
         "download_media" => {
             let url = args["url"].as_str().unwrap_or("");
@@ -903,21 +1106,19 @@ pub fn plan_tool_execution(
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| out_dir.to_string())
             };
-            ToolExecutionPlan {
-                summary: format!("Download `{fmt}` via yt-dlp + FFmpeg"),
-                preview: Some(format!("URL: {}\nFormat: {fmt}\nSave to: {dir_note}", truncate_chars(url, 180))),
-                requires_approval: true,
-                allow_approve_all: false,
-                is_destructive: false,
-            }
+            make_plan(
+                format!("Download `{fmt}` via yt-dlp + FFmpeg"),
+                Some(format!("URL: {}\nFormat: {fmt}\nSave to: {dir_note}", truncate_chars(url, 180))),
+                permission_mode,
+                ToolRiskKind::ExternalSideEffect,
+            )
         }
-        other => ToolExecutionPlan {
-            summary: format!("Call `{other}`"),
-            preview: None,
-            requires_approval: true,
-            allow_approve_all: false,
-            is_destructive: false,
-        },
+        other => make_plan(
+            format!("Call `{other}`"),
+            None,
+            permission_mode,
+            ToolRiskKind::DangerousOrDelete,
+        ),
     }
 }
 
@@ -2079,5 +2280,64 @@ mod tests {
         assert_eq!(hits[0].0, "Rust Language");
         assert_eq!(hits[0].1, "https://rust-lang.org/");
         assert!(hits[0].2.contains("Systems programming"));
+    }
+
+    #[test]
+    fn permission_modes_enforce_ask_default_and_auto_safely() {
+        let base = std::env::temp_dir().join("buddy_perm_test");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let existing = base.join("existing.txt");
+        fs::write(&existing, "hello").unwrap();
+
+        // Read-only is auto across all three modes
+        for mode in [AgentPermissionMode::Ask, AgentPermissionMode::Default, AgentPermissionMode::Auto] {
+            assert!(!plan_tool_execution("read_file", &json!({"path": "existing.txt"}), Some(&base), mode).requires_approval);
+            assert!(!plan_tool_execution("web_search", &json!({"query": "rust"}), Some(&base), mode).requires_approval);
+        }
+
+        // Reversible write: Ask requires step-by-step (no approve_all), Default allows approve_all, Auto skips prompt
+        let ask_write = plan_tool_execution("write_file", &json!({"path": "new.txt", "content": "hi"}), Some(&base), AgentPermissionMode::Ask);
+        assert!(ask_write.requires_approval && !ask_write.allow_approve_all && !ask_write.is_destructive);
+
+        let def_write = plan_tool_execution("write_file", &json!({"path": "new.txt", "content": "hi"}), Some(&base), AgentPermissionMode::Default);
+        assert!(def_write.requires_approval && def_write.allow_approve_all && !def_write.is_destructive);
+
+        let auto_write = plan_tool_execution("write_file", &json!({"path": "new.txt", "content": "hi"}), Some(&base), AgentPermissionMode::Auto);
+        assert!(!auto_write.requires_approval && !auto_write.is_destructive);
+
+        // External side-effect (download_media / install_github_skill): Ask & Default ask, Auto executes cleanly
+        let def_dl = plan_tool_execution("download_media", &json!({"url": "https://example.com/a"}), Some(&base), AgentPermissionMode::Default);
+        assert!(def_dl.requires_approval && !def_dl.allow_approve_all);
+        let auto_dl = plan_tool_execution("download_media", &json!({"url": "https://example.com/a"}), Some(&base), AgentPermissionMode::Auto);
+        assert!(!auto_dl.requires_approval);
+
+        // Deletion, overwrite, existing-target copy overwrite, and DANGEROUS run_shell ALWAYS ask even in Auto;
+        // safe/non-destructive run_shell commands run automatically in Auto while still asking in Ask & Default.
+        let safe_shell_ask = plan_tool_execution("run_shell", &json!({"command": "git status"}), Some(&base), AgentPermissionMode::Ask);
+        assert!(safe_shell_ask.requires_approval && !safe_shell_ask.allow_approve_all);
+        let safe_shell_def = plan_tool_execution("run_shell", &json!({"command": "python script.py --format json"}), Some(&base), AgentPermissionMode::Default);
+        assert!(safe_shell_def.requires_approval && safe_shell_def.allow_approve_all && !safe_shell_def.is_destructive);
+        let safe_shell_auto = plan_tool_execution("run_shell", &json!({"command": "Get-ChildItem | Select-Object Name"}), Some(&base), AgentPermissionMode::Auto);
+        assert!(!safe_shell_auto.requires_approval && !safe_shell_auto.is_destructive);
+
+        for (tool, args) in [
+            ("delete_path", json!({"path": "existing.txt"})),
+            ("run_shell", json!({"command": "Remove-Item existing.txt"})),
+            ("run_shell", json!({"command": "Get-Date; rm existing.txt"})),
+            ("run_shell", json!({"command": "cmd /c del existing.txt"})),
+            ("run_shell", json!({"command": "Stop-Process -Name notepad"})),
+            ("run_shell", json!({"command": "python -c \"import os; os.remove('a.txt')\""})),
+            ("run_shell", json!({"command": "git reset --hard HEAD"})),
+            ("write_file", json!({"path": "existing.txt", "content": "x", "overwrite": true})),
+            ("copy_file", json!({"source": "existing.txt", "destination": "existing.txt"})),
+        ] {
+            let plan = plan_tool_execution(tool, &args, Some(&base), AgentPermissionMode::Auto);
+            assert!(plan.requires_approval, "{tool} ({args}) must ask even in Auto");
+            assert!(!plan.allow_approve_all, "{tool} ({args}) must not allow approve-all");
+            assert!(plan.is_destructive, "{tool} ({args}) must be marked destructive");
+        }
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

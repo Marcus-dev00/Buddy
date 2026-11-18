@@ -129,6 +129,11 @@ export const UI_STRINGS = {
       approvalRequired: "Approval required",
       destructiveWarning: "Destructive / Shell action",
       rejectedLabel: "Rejected",
+      permModes: {
+        ask: { label: "Ask", desc: "Ask every write, download, delete & shell step" },
+        default: { label: "Default", desc: "Approve writes/commands once/turn; delete/danger ask" },
+        auto: { label: "Auto", desc: "Auto writes, downloads & safe commands; delete/danger ask" },
+      },
       shareBtn: "Share",
       shareTitle: "Live Screen Share",
       shareTarget: "What to share",
@@ -387,6 +392,11 @@ export const UI_STRINGS = {
       approvalRequired: "需要你确认执行",
       destructiveWarning: "删除/命令操作需单独确认",
       rejectedLabel: "已拒绝",
+      permModes: {
+        ask: { label: "Ask", desc: "写改、下载、删改与命令逐条确认" },
+        default: { label: "Default", desc: "写改/常规命令可本轮放行；删改与高危必问" },
+        auto: { label: "Auto", desc: "读写、下载与安全命令自动执行；删除/高危仍必问" },
+      },
       shareBtn: "共享",
       shareTitle: "实时屏幕共享与共创",
       shareTarget: "共享范围",

@@ -29,12 +29,15 @@ import {
   RefreshCw,
   ScanText,
   Search,
+  Shield,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Square,
   Trash2,
   X,
   XCircle,
+  Zap,
 } from "lucide-react";
 import { formatRelativeTime, getStrings } from "../i18n";
 import {
@@ -43,6 +46,7 @@ import {
   type ModelThinkingCapability,
 } from "../thinking";
 import type {
+  AgentPermissionMode,
   AgentStep,
   ApprovalDecision,
   AttachmentPayload,
@@ -114,6 +118,7 @@ function MarkdownCodePre({
 interface ChatTabProps {
   lang: UiLang;
   agentMode: boolean;
+  permissionMode: AgentPermissionMode;
   thinkingLevel: ThinkingLevel;
   thinkingCapability?: ModelThinkingCapability;
   activeStreamId: string | null;
@@ -131,6 +136,7 @@ interface ChatTabProps {
   onSend: (promptOverride?: string, attOverride?: AttachmentPayload[]) => void;
   onStopStream: () => void;
   onToggleAgentMode: () => void;
+  onChangePermissionMode: (mode: AgentPermissionMode) => void;
   onChangeThinkingLevel: (level: ThinkingLevel) => void;
   onResolveApproval: (stepId: string, decision: ApprovalDecision) => void;
   onNewChat: () => void;
@@ -501,9 +507,116 @@ export function ThinkingSlider({
   );
 }
 
+const PERMISSION_STEPS: AgentPermissionMode[] = ["ask", "default", "auto"];
+
+function PermissionSlider({
+  value,
+  lang,
+  onChange,
+}: {
+  value: AgentPermissionMode;
+  lang: UiLang;
+  onChange: (next: AgentPermissionMode) => void;
+}) {
+  const s = getStrings(lang).chat;
+  const rawIdx = PERMISSION_STEPS.indexOf(value);
+  const idx = rawIdx >= 0 ? rawIdx : 1;
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const draggingRef = useRef(false);
+
+  const pickByClientX = (clientX: number) => {
+    const el = trackRef.current;
+    if (!el) return;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0) return;
+    const ratio = Math.max(0, Math.min(0.999, (clientX - rect.left) / rect.width));
+    const nextIdx = Math.floor(ratio * PERMISSION_STEPS.length);
+    const next = PERMISSION_STEPS[nextIdx];
+    if (next && next !== value) {
+      onChange(next);
+    }
+  };
+
+  const accentBar =
+    value === "ask"
+      ? "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.65)]"
+      : value === "auto"
+      ? "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.75)]"
+      : "bg-blue-400 shadow-[0_0_8px_rgba(96,165,250,0.65)]";
+
+  return (
+    <div
+      ref={trackRef}
+      role="radiogroup"
+      aria-label="Agent permission mode"
+      onPointerDown={(e) => {
+        draggingRef.current = true;
+        e.currentTarget.setPointerCapture(e.pointerId);
+        pickByClientX(e.clientX);
+      }}
+      onPointerMove={(e) => {
+        if (!draggingRef.current) return;
+        pickByClientX(e.clientX);
+      }}
+      onPointerUp={(e) => {
+        if (!draggingRef.current) return;
+        draggingRef.current = false;
+        try {
+          e.currentTarget.releasePointerCapture(e.pointerId);
+        } catch {
+          // ignore
+        }
+      }}
+      onPointerCancel={() => {
+        draggingRef.current = false;
+      }}
+      style={{ gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}
+      className="relative grid items-center rounded-lg bg-[#08090d] border border-white/[0.09] p-[2px] select-none touch-none w-[168px] h-[24px] cursor-pointer shrink-0"
+    >
+      {/* Smooth Gliding Elevated Thumb matching ThinkingSlider */}
+      <div
+        className="pointer-events-none absolute top-[2px] bottom-[2px] left-[2px] rounded-[6px] bg-white/[0.11] border border-white/[0.15] shadow-[0_1px_4px_rgba(0,0,0,0.65)] flex flex-col justify-end items-center pb-[1.5px] transition-transform duration-200 ease-out"
+        style={{
+          width: "calc((100% - 4px) / 3)",
+          transform: `translateX(${idx * 100}%)`,
+        }}
+      >
+        <span className={`w-4 h-[1.5px] rounded-full transition-colors duration-200 ${accentBar}`} />
+      </div>
+
+      {(
+        [
+          { id: "ask", icon: ShieldAlert, activeText: "text-cyan-200 font-medium" },
+          { id: "default", icon: ShieldCheck, activeText: "text-blue-200 font-medium" },
+          { id: "auto", icon: Zap, activeText: "text-rose-200 font-semibold" },
+        ] as const
+      ).map((item) => {
+        const active = value === item.id;
+        const Icon = item.icon;
+        const info = s.permModes[item.id];
+        return (
+          <div
+            key={item.id}
+            role="radio"
+            aria-checked={active}
+            title={info.desc}
+            className={`relative z-10 flex items-center justify-center gap-0.5 text-[9.5px] tracking-tight transition-colors duration-200 ${
+              active ? item.activeText : "text-white/40 hover:text-white/75"
+            }`}
+          >
+            <Icon className="w-2.5 h-2.5 shrink-0" />
+            <span>{info.label}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function ChatTab({
   lang,
   agentMode,
+  permissionMode,
   thinkingLevel,
   thinkingCapability,
   activeStreamId,
@@ -521,6 +634,7 @@ export default function ChatTab({
   onSend,
   onStopStream,
   onToggleAgentMode,
+  onChangePermissionMode,
   onChangeThinkingLevel,
   onResolveApproval,
   onNewChat,
@@ -1145,10 +1259,11 @@ export default function ChatTab({
           <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
             {(() => {
               const q = historySearch.trim().toLowerCase();
-              const filtered = conversations.filter((c) =>
+              const nonEmpty = conversations.filter((c) => c.message_count > 0);
+              const filtered = nonEmpty.filter((c) =>
                 !q ? true : c.title.toLowerCase().includes(q)
               );
-              if (conversations.length === 0) {
+              if (nonEmpty.length === 0) {
                 return (
                   <div className="h-full flex items-center justify-center text-[11.5px] text-white/40">
                     {s.noConversations}
@@ -1780,6 +1895,28 @@ export default function ChatTab({
                   </div>
                 );
               })()}
+
+            {agentMode && (
+              <div className="mb-1.5 flex items-center justify-between gap-2 px-0.5">
+                <PermissionSlider
+                  value={permissionMode}
+                  lang={lang}
+                  onChange={onChangePermissionMode}
+                />
+                <span className="text-[10px] text-white/40 truncate text-right flex items-center gap-1 min-w-0">
+                  <Shield
+                    className={`w-2.5 h-2.5 shrink-0 transition-colors duration-200 ${
+                      permissionMode === "ask"
+                        ? "text-cyan-300/75"
+                        : permissionMode === "auto"
+                        ? "text-rose-300/80"
+                        : "text-blue-300/75"
+                    }`}
+                  />
+                  <span className="truncate">{s.permModes[permissionMode].desc}</span>
+                </span>
+              </div>
+            )}
 
             <form onSubmit={handleSubmit} className="flex items-center gap-2">
               <input

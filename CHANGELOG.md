@@ -2,6 +2,19 @@
 
 All notable changes to **Buddy** are documented in this file.
 
+## [0.2.4] - 2026-11-19
+
+### Added
+- **Three-Tier Agent Permission Slider (`Ask | Default | Auto`)**: Added a gliding matte-glass `PermissionSlider` above the chat input bar (Cyan for `Ask`, Blue for `Default`, Red for `Auto`, matching `ThinkingSlider`'s `200ms` transition) backed by persistent `agent_permission_mode` in `config.json`.
+  - **Ask**: Confirms every mutating write, download, Skill install, deletion, and shell command individually (disables per-turn approve-all).
+  - **Default**: Confirms reversible edits and safe shell commands once per turn with `Approve All`, while downloads, Skill installs, overwrites, deletions, and risky shell commands still ask individually.
+  - **Auto**: Runs non-destructive writes, downloads, Skill installs, and safe inspection/build shell commands automatically, while `delete_path`, `write_file(overwrite=true)`, overwriting `copy_file`, and destructive/dangerous `run_shell` commands (`rm`/`del`/`Remove-Item`, `Stop-Process`/`taskkill`, `reg`, `git reset --hard`/`git push`/`git clean`, `-Force`, etc.) still require explicit approval.
+- **Fresh Conversation on App Launch**: Added `ensure_fresh_startup_conversation` so rebooting or restarting Buddy opens a clean new conversation while keeping all prior non-empty conversations accessible in the top-left History drawer (reusing unused 0-message drafts and hiding empty drafts from History).
+
+### Improved & Fixed
+- **Stronger Native Thinking Language Localization**: Localized `build_thinking_appendix_for_lang` into natural Simplified Chinese (`LOW` / `MEDIUM` / `HIGH` / `MAX`), sandwiched English system instructions with a top-of-prompt and per-turn Chinese reasoning anchor (without polluting saved chat history), and fixed `"Analyze attached item"` / bare-URL / bare-path fallbacks so native reasoning models (`mimo-v2.6-flash`, DeepSeek, Gemini, Claude) reliably think in the user's language.
+- **Wallpaper Engine UI Exclusion**: Excluded `wallpaperui.exe`, `ui32.exe`, and `webwallpaper32.exe` in `is_non_game_exe` so Wallpaper Engine windows do not trigger stealth auto-hide.
+
 ## [0.2.3] - 2026-11-18
 
 ### Added

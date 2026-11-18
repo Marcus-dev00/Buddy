@@ -7,7 +7,7 @@
 use crate::agent_tools::{
     anthropic_tools_json, build_agent_system_appendix, execute_fetch_web_page, execute_tool,
     execute_web_search, gemini_tools_json, openai_tools_json, plan_tool_execution,
-    resolve_user_path, AgentApprovalManager, AgentStepEvent, ApprovalDecision,
+    resolve_user_path, AgentApprovalManager, AgentPermissionMode, AgentStepEvent, ApprovalDecision,
 };
 use crate::db::MemoryDb;
 use crate::plugins::{run_media_download, run_offline_ocr, PluginManager};
@@ -830,42 +830,138 @@ fn normalize_thinking_level(raw: &str) -> &'static str {
     }
 }
 
-fn detect_thinking_language_hint(prompt: &str, ui_language: &str) -> &'static str {
-    let trimmed = prompt.trim();
-    let has_cjk = trimmed
-        .chars()
-        .any(|c| matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF));
-    if has_cjk {
-        return "Simplified Chinese (简体中文)";
-    }
-    let has_kana = trimmed
-        .chars()
-        .any(|c| matches!(c as u32, 0x3040..=0x30FF));
-    if has_kana {
-        return "Japanese (日本語)";
-    }
-    let has_hangul = trimmed
-        .chars()
-        .any(|c| matches!(c as u32, 0xAC00..=0xD7AF));
-    if has_hangul {
-        return "Korean (한국어)";
-    }
-    let has_latin = trimmed.chars().any(|c| c.is_ascii_alphabetic());
-    if trimmed.is_empty() || !has_latin {
-        if ui_language.eq_ignore_ascii_case("zh") {
-            return "Simplified Chinese (简体中文)";
-        }
-        return "English";
-    }
-    "the exact same language as the user's latest message"
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThinkingLang {
+    Zh,
+    Ja,
+    Ko,
+    En,
+    MatchUser,
 }
 
-fn build_thinking_appendix(level: &str, prompt: &str, ui_language: &str) -> String {
-    let lang_hint = detect_thinking_language_hint(prompt, ui_language);
+fn is_non_prose_prompt(trimmed: &str) -> bool {
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "analyze attached item" || lower == "analyze attached items" {
+        return true;
+    }
+    let has_latin = trimmed.chars().any(|c| c.is_ascii_alphabetic());
+    if !has_latin {
+        return true;
+    }
+    // Pure single URL or Windows path without prose words
+    !trimmed.contains(' ')
+        && (lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || trimmed.contains(":\\")
+            || trimmed.starts_with('/'))
+}
+
+fn detect_text_script_lang(text: &str) -> Option<ThinkingLang> {
+    if text
+        .chars()
+        .any(|c| matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF))
+    {
+        return Some(ThinkingLang::Zh);
+    }
+    if text
+        .chars()
+        .any(|c| matches!(c as u32, 0x3040..=0x30FF))
+    {
+        return Some(ThinkingLang::Ja);
+    }
+    if text
+        .chars()
+        .any(|c| matches!(c as u32, 0xAC00..=0xD7AF))
+    {
+        return Some(ThinkingLang::Ko);
+    }
+    None
+}
+
+fn detect_thinking_lang(
+    prompt: &str,
+    history: &[(String, String)],
+    ui_language: &str,
+) -> ThinkingLang {
+    let trimmed = prompt.trim();
+    if let Some(script) = detect_text_script_lang(trimmed) {
+        return script;
+    }
+    if is_non_prose_prompt(trimmed) {
+        for (role, content) in history.iter().rev() {
+            if role == "user" {
+                if let Some(script) = detect_text_script_lang(content) {
+                    return script;
+                }
+            }
+        }
+        return if ui_language.eq_ignore_ascii_case("zh") {
+            ThinkingLang::Zh
+        } else {
+            ThinkingLang::En
+        };
+    }
+    ThinkingLang::MatchUser
+}
+
+fn detect_thinking_language_hint(prompt: &str, ui_language: &str) -> &'static str {
+    match detect_thinking_lang(prompt, &[], ui_language) {
+        ThinkingLang::Zh => "Simplified Chinese (简体中文)",
+        ThinkingLang::Ja => "Japanese (日本語)",
+        ThinkingLang::Ko => "Korean (한국어)",
+        ThinkingLang::En => "English",
+        ThinkingLang::MatchUser => "the exact same language as the user's latest message",
+    }
+}
+
+fn build_thinking_appendix_for_lang(level: &str, lang: ThinkingLang) -> String {
+    let norm = normalize_thinking_level(level);
+    if lang == ThinkingLang::Zh {
+        return match norm {
+            "off" => "\n\n---\n\n# 思考模式：关闭（OFF）\n\
+                      - 直接、自然地回复用户，不做多余停顿。\n\
+                      - 不要输出 `<buddy_thought>` 标签，全程使用简体中文回答。"
+                .to_string(),
+            "low" => "\n\n---\n\n# 思考深度：轻量（LOW · 简体中文）\n\
+                      - **强制语言规则**：无论原生思考块（`reasoning_content` / `thinking`）还是 `<buddy_thought>...</buddy_thought>`，**从第一句起必须全程使用地道、接地气的简体中文思考**（比如日常口语化的内心独白：“先确认下他核心想要啥”、“这个点得核实一下”），严禁使用英文推演或英文模板句（文件名/代码标识符除外）。\n\
+                      - 快速核对核心事实和意图即可，不要过度发散；若用 `<buddy_thought>`，正式回复写在 `</buddy_thought>` 之后。"
+                .to_string(),
+            "high" => "\n\n---\n\n# 思考深度：深入（HIGH · 简体中文）\n\
+                      - **强制语言规则**：无论原生思考块（`reasoning_content` / `thinking`）还是 `<buddy_thought>...</buddy_thought>`，**从第一个字到最后一个字都必须全程使用自然、口语化、像真人搭档一样的简体中文推演**，绝对不要用英文思考或套英文思维模板（代码标识符、命令、路径名除外）。\n\
+                      - 动手回答前按以下步骤仔细过一遍：\n\
+                        1）先搞清楚用户真正要什么（若有歧义或涉及高风险改动，先简短追问确认）。\n\
+                        2）核对事实准确性、技术可行性与边界情况——如果用户前提有误或不现实，准备温和但坦诚的纠偏。\n\
+                        3）梳理清楚最有条理、有依据且带点日常人情味的表达结构后再作答（若使用 `<buddy_thought>`，把最终回答放在 `</buddy_thought>` 之后）。"
+                .to_string(),
+            "max" => "\n\n---\n\n# 思考深度：极致核验（MAX · 简体中文）\n\
+                      - **强制语言规则**：无论原生思考块（`reasoning_content` / `thinking`）还是 `<buddy_thought>...</buddy_thought>`，**从第一句开始必须全程使用自然、接地气、像真人朋友般的简体中文思考**，严禁切换成英文自言自语（代码标识符、命令、路径名除外）。\n\
+                      - 回答前进行穷举式推演：\n\
+                        1）列出所有可能的理解方向与边界条件。\n\
+                        2）预演每种方案的结果，排查报错、矛盾或不可行之处。\n\
+                        3）逐一复核事实、路径、命令与前提假设；若需要澄清或坦诚指出不妥之处，明确标注。\n\
+                        4）确认结论完全站得住脚后，再在外部给出清晰自然的正式答复。"
+                .to_string(),
+            _ => "\n\n---\n\n# 思考深度：均衡（MEDIUM · 简体中文）\n\
+                  - **强制语言规则**：无论原生思考块（`reasoning_content` / `thinking`）还是 `<buddy_thought>...</buddy_thought>`，**从第一句起必须全程使用自然、有日常人情味的简体中文思考**，严禁使用英文推演（代码标识符、命令、路径名除外）。\n\
+                  - 回答前梳理好意图、判断是否需要先行确认或坦诚纠偏，核对关键步骤与事实；若使用 `<buddy_thought>`，正式回复写在 `</buddy_thought>` 之后。"
+                .to_string(),
+        };
+    }
+
+    let lang_hint = match lang {
+        ThinkingLang::Zh => "Simplified Chinese (简体中文)",
+        ThinkingLang::Ja => "Japanese (日本語)",
+        ThinkingLang::Ko => "Korean (한국어)",
+        ThinkingLang::En => "English",
+        ThinkingLang::MatchUser => "the exact same language as the user's latest message",
+    };
     let lang_rule = format!(
         "- Write ALL internal reasoning (both native thinking/reasoning blocks and `<buddy_thought>...</buddy_thought>`) in {lang_hint}, in a natural, conversational, down-to-earth inner voice (no stiff English-only template thoughts unless the user wrote in English)."
     );
-    match normalize_thinking_level(level) {
+    match norm {
         "off" => "\n\n---\n\n# Thinking Level: OFF\n\
                   - Respond immediately and directly with zero deliberation.\n\
                   - Do NOT output `<buddy_thought>` tags."
@@ -902,6 +998,12 @@ fn build_thinking_appendix(level: &str, prompt: &str, ui_language: &str) -> Stri
              - Put ONLY the final user-facing reply after `</buddy_thought>`."
         ),
     }
+}
+
+#[cfg(test)]
+fn build_thinking_appendix(level: &str, prompt: &str, ui_language: &str) -> String {
+    let lang = detect_thinking_lang(prompt, &[], ui_language);
+    build_thinking_appendix_for_lang(level, lang)
 }
 
 /// Resizes `DynamicImage` longest edge to `<= max_dim` and encodes JPEG returning raw base64.
@@ -1858,10 +1960,11 @@ async fn run_tool_with_approval(
     call_idx: usize,
     call: &ParsedToolCall,
     workspace_hint: Option<&Path>,
+    permission_mode: AgentPermissionMode,
     approve_all_turn: &mut bool,
     cancel_flag: &AtomicBool,
 ) -> (String, AgentStepEvent) {
-    let plan = plan_tool_execution(&call.name, &call.args, workspace_hint);
+    let plan = plan_tool_execution(&call.name, &call.args, workspace_hint, permission_mode);
     let step_id = format!("{stream_id}_{turn_idx}_{call_idx}");
 
     let needs_prompt = plan.requires_approval && !(plan.allow_approve_all && *approve_all_turn);
@@ -2524,7 +2627,15 @@ pub fn spawn_chat_stream(
         let thinking_backend = thinking_cap.backend;
         let mirror_prefix = plugin_mgr.list().mirror_prefix;
         let media_dl_ready = plugin_mgr.is_engine_ready("media_downloader");
-        let mut sys_prompt = prompts_mgr.build_system_prompt(&cfg.persona_id);
+        let thinking_lang = detect_thinking_lang(&prompt, &history, &cfg.ui_language);
+        let mut sys_prompt = if thinking_lang == ThinkingLang::Zh {
+            format!(
+                "【全局最高优先级语言规则】用户当前使用简体中文交流。你在原生思考区（`reasoning_content` / `thinking`）以及 `<buddy_thought>` 中的每一句内部推理，都必须从第一句话开始全程使用自然、口语化、接地气的简体中文，严禁使用英文自言自语或英文思维模板（仅路径、命令与代码标识保留原样）。\n\n{}",
+                prompts_mgr.build_system_prompt(&cfg.persona_id)
+            )
+        } else {
+            prompts_mgr.build_system_prompt(&cfg.persona_id)
+        };
         if let Ok(facts) = db.list_active_facts(8) {
             if !facts.is_empty() {
                 let fact_lines = facts
@@ -2573,11 +2684,7 @@ pub fn spawn_chat_stream(
                 "\n\n[LIVE SCREEN SHARE ACTIVE]\nThe user is actively sharing their screen with you right now. Use the attached live frame(s) to answer their question directly with specific visual feedback.{goal_note}"
             ));
         }
-        sys_prompt.push_str(&build_thinking_appendix(
-            thinking_level,
-            &prompt,
-            &cfg.ui_language,
-        ));
+        sys_prompt.push_str(&build_thinking_appendix_for_lang(thinking_level, thinking_lang));
 
         let client = match reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(150))
@@ -2599,6 +2706,11 @@ pub fn spawn_chat_stream(
 
         // Fallback for text-only Chat models while Screen Share is active: ask Watch Vision model to transcribe live screen
         let mut effective_prompt = prompt.clone();
+        if thinking_lang == ThinkingLang::Zh && thinking_level != "off" {
+            effective_prompt.push_str(
+                "\n\n[内部思考语言提示：请从第一句思考起全程使用自然、接地气的简体中文推演，禁止英文内部思考。]",
+            );
+        }
         let effective_live_frames = if !live_frames.is_empty() && !chat_model.supports_vision {
             let (watch_model, watch_key) =
                 settings_mgr.resolve_watch_target(watch_profile_override.as_deref());
@@ -2840,6 +2952,9 @@ pub fn spawn_chat_stream(
                         if cancel_flag.load(Ordering::Relaxed) {
                             break;
                         }
+                        let permission_mode = AgentPermissionMode::from_str(
+                            &settings_mgr.get().agent_permission_mode,
+                        );
                         let (result_text, step_rec) = run_tool_with_approval(
                             &app,
                             &approval_mgr,
@@ -2852,6 +2967,7 @@ pub fn spawn_chat_stream(
                             call_idx,
                             call,
                             workspace_hint.as_deref(),
+                            permission_mode,
                             &mut approve_all_turn,
                             &cancel_flag,
                         )
@@ -3364,12 +3480,20 @@ mod tests {
             "Simplified Chinese (简体中文)"
         );
         assert_eq!(
+            detect_thinking_language_hint("Analyze attached item", "zh"),
+            "Simplified Chinese (简体中文)"
+        );
+        assert_eq!(
+            detect_thinking_language_hint("https://example.com", "zh"),
+            "Simplified Chinese (简体中文)"
+        );
+        assert_eq!(
             detect_thinking_language_hint("Explain this Rust error", "zh"),
             "the exact same language as the user's latest message"
         );
         let app_zh = build_thinking_appendix("high", "帮我排查一下", "zh");
-        assert!(app_zh.contains("Simplified Chinese"));
-        assert!(app_zh.contains("native thinking/reasoning blocks"));
+        assert!(app_zh.contains("简体中文"));
+        assert!(app_zh.contains("reasoning_content"));
     }
 
     #[test]
