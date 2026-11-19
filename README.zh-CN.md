@@ -12,11 +12,13 @@
 
 ## 下载
 
-前往 **[Releases 页面](https://github.com/Marcus-dev00/Buddy/releases/latest)** 下载最新 Windows 安装包即可使用，支持应用内自动检测与一键更新。
+前往 **[Releases 页面](https://github.com/Marcus-dev00/Buddy/releases/latest)** 下载最新 Windows 安装包（支持应用内自动检测与一键更新），或访问 **[Buddy 下载页](https://buddy-companion.marcus-dev00.workers.dev/)** 获取 **BuddyMobile 安卓 APK** 与在线手机端。
 
 ## Buddy 能做什么
 
-- **四边磁吸 & 随处悬浮** — 无论是胶囊还是展开面板，都可以随意拖到多屏幕任意位置或磁吸贴合屏幕/窗口四边，头部朝向和展开方向自动适配；支持 `Ctrl + Alt + B` 全局快捷呼出与收起。
+- **灵动岛小窗 + 大窗 / 全屏模式** — 平时四边磁吸随处悬浮（`Ctrl + Alt + B` 全局呼出），一键平滑切换为居中大窗或全屏模式（左侧常驻历史边栏、支持任务栏与 Alt+Tab 自由切换）。
+- **BuddyMobile 手机伴侣（局域网 / Tailscale / 免费 Cloudflare 隧道）** — 出门在外随时远程指挥电脑 Buddy 干活、审批 Agent 操作、抓拍查看电脑桌面、跨端查看 7 天截图/一键复制电脑剪贴板文字并同步定时提醒。
+- **MCP 协议与 Skills 生态** — 在「设置 → MCP」中直接接入 `stdio` 或 `HTTP` MCP 服务，并在对话中通过 `/skill` 调用扩展技能。
 - **实时屏幕共享协作 (`Alt + Shift + P`)** — 选定屏幕或指定窗口后展示柔和发光边框，由独立的 Watch 视觉模型按静默/均衡/积极频率轻量伴看提示，并在聊天时自动附带实时画面上下文。
 - **自然神态 & 音乐律动** — 悬停时眼神跟随光标，空闲自动打盹；仅全屏游戏时沉底避让、其余场景全程置顶；播放系统音乐时随 WASAPI 节拍律动且保持对话框稳定。
 - **多模型角色 & 动态思考适配** — 支持 OpenAI 兼容、Anthropic、Gemini 与本地 Ollama，支持 Chat / Watch 独立模型配对，根据所用 LLM 动态适配原生思考参数（Gemini 2.5 `thinkingBudget`、Gemini 3/3.5 `thinkingLevel`、Claude Adaptive/Extended、OpenAI `reasoning_effort`、DeepSeek/MiMo 开关或手动覆盖 `自动 / 原生 / 仅 Prompt`），并自带 `503/429` 退避重试与 `400` 降级兜底。

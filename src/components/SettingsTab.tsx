@@ -1,22 +1,16 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Camera,
-  Check,
-  ChevronDown,
   Cpu,
   Download,
-  Eye,
-  EyeOff,
   FolderOpen,
   Loader2,
-  MessageSquare,
-  Plus,
+  Plug,
   RotateCcw,
-  ShieldCheck,
   Sliders,
+  Smartphone,
   Sparkles,
-  Trash2,
   Zap,
 } from "lucide-react";
 import { getStrings } from "../i18n";
@@ -25,18 +19,17 @@ import {
   formatThinkingBadge,
   getModelThinkingCapability,
   normalizeThinkingLevel,
-  normalizeThinkingMode,
   resolveActiveChatModel,
 } from "../thinking";
 import { getStepDisplay, ThinkingSlider } from "./ChatTab";
-import type {
-  AppSettings,
-  ModelProfile,
-  UiLang,
-  UpdateInfo,
-} from "../types";
+import { McpSection } from "./McpSection";
+import { MobileLinkCard } from "./MobileLinkCard";
+import { ModelProfilesSection } from "./ModelProfilesSection";
+import { DarkSelect, LANGUAGE_OPTIONS, ToggleSwitch } from "./SettingsControls";
+import type { AppSettings, McpServerStatus, UiLang, UpdateInfo } from "../types";
 
 interface SettingsTabProps {
+  isWindowMode?: boolean;
   settings: AppSettings;
   refreshHz: number;
   expandedDims: [number, number];
@@ -51,250 +44,10 @@ interface SettingsTabProps {
   onResetDock: () => void;
 }
 
-type SettingsSection = "model" | "general" | "actions";
-
-interface ModelPreset {
-  id: string;
-  label: string;
-  provider: "openai" | "anthropic" | "gemini";
-  baseUrl: string;
-  modelId: string;
-  vision?: boolean;
-}
-
-const MODEL_PRESETS: ModelPreset[] = [
-  {
-    id: "mimo",
-    label: "Xiaomi MiMo 2.6 Flash",
-    provider: "openai",
-    baseUrl: "https://api.xiaomimimo.com/v1",
-    modelId: "mimo-v2-flash",
-  },
-  {
-    id: "gemini_35_flash_lite",
-    label: "Gemini 3.5 Flash Lite",
-    provider: "gemini",
-    baseUrl: "https://generativelanguage.googleapis.com",
-    modelId: "gemini-3.5-flash-lite",
-  },
-  {
-    id: "gemini_35_flash",
-    label: "Gemini 3.5 Flash",
-    provider: "gemini",
-    baseUrl: "https://generativelanguage.googleapis.com",
-    modelId: "gemini-3.5-flash",
-  },
-  {
-    id: "gemini_flash",
-    label: "Gemini 2.5 Flash",
-    provider: "gemini",
-    baseUrl: "https://generativelanguage.googleapis.com",
-    modelId: "gemini-2.5-flash",
-  },
-  {
-    id: "gemini_pro",
-    label: "Gemini 2.5 Pro",
-    provider: "gemini",
-    baseUrl: "https://generativelanguage.googleapis.com",
-    modelId: "gemini-2.5-pro",
-  },
-  {
-    id: "claude_sonnet",
-    label: "Claude Sonnet 4.5",
-    provider: "anthropic",
-    baseUrl: "https://api.anthropic.com",
-    modelId: "claude-sonnet-4-5",
-  },
-  {
-    id: "claude_haiku",
-    label: "Claude Haiku 3.5",
-    provider: "anthropic",
-    baseUrl: "https://api.anthropic.com",
-    modelId: "claude-3-5-haiku-latest",
-  },
-  {
-    id: "openai_4o_mini",
-    label: "OpenAI GPT-4o Mini",
-    provider: "openai",
-    baseUrl: "https://api.openai.com/v1",
-    modelId: "gpt-4o-mini",
-  },
-  {
-    id: "openai_41_mini",
-    label: "OpenAI GPT-4.1 Mini",
-    provider: "openai",
-    baseUrl: "https://api.openai.com/v1",
-    modelId: "gpt-4.1-mini",
-  },
-  {
-    id: "deepseek",
-    label: "DeepSeek Chat (V3)",
-    provider: "openai",
-    baseUrl: "https://api.deepseek.com/v1",
-    modelId: "deepseek-chat",
-  },
-  {
-    id: "openrouter",
-    label: "OpenRouter",
-    provider: "openai",
-    baseUrl: "https://openrouter.ai/api/v1",
-    modelId: "openai/gpt-4o-mini",
-  },
-  {
-    id: "ollama",
-    label: "Ollama (Local)",
-    provider: "openai",
-    baseUrl: "http://localhost:11434/v1",
-    modelId: "llama3.2",
-  },
-  {
-    id: "custom",
-    label: "Custom Endpoint",
-    provider: "openai",
-    baseUrl: "",
-    modelId: "",
-  },
-];
-
-const PROTOCOL_OPTIONS = [
-  { id: "openai", label: "OpenAI Compatible" },
-  { id: "anthropic", label: "Anthropic Claude" },
-  { id: "gemini", label: "Google Gemini" },
-];
-
-const LANGUAGE_OPTIONS = [
-  { id: "en", label: "English" },
-  { id: "zh", label: "简体中文" },
-];
-
-interface DarkSelectProps {
-  value: string;
-  options: { id: string; label: string }[];
-  onChange: (id: string) => void;
-  onOpen?: () => void;
-  compact?: boolean;
-}
-
-function DarkSelect({ value, options, onChange, onOpen, compact }: DarkSelectProps) {
-  const [open, setOpen] = useState(false);
-  const boxRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent) => {
-      if (boxRef.current && !boxRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    window.addEventListener("mousedown", onDown);
-    return () => window.removeEventListener("mousedown", onDown);
-  }, [open]);
-
-  const current = options.find((o) => o.id === value) ?? options[0];
-
-  return (
-    <div ref={boxRef} className="relative">
-      <button
-        type="button"
-        onClick={() => {
-          if (!open && onOpen) onOpen();
-          setOpen((v) => !v);
-        }}
-        className={`w-full rounded-lg bg-white/[0.07] hover:bg-white/[0.11] border border-white/15 text-left text-[11px] text-white flex items-center justify-between gap-1.5 transition ${
-          compact ? "px-2 py-1" : "px-2.5 py-1.5"
-        }`}
-      >
-        <span className="truncate">{current?.label ?? value}</span>
-        <ChevronDown
-          className={`w-3 h-3 text-white/50 shrink-0 transition-transform ${
-            open ? "rotate-180" : ""
-          }`}
-        />
-      </button>
-
-      {open && (
-        <div className="absolute left-0 right-0 mt-1 z-50 max-h-40 overflow-y-auto rounded-xl bg-[#0e0f14] border border-white/15 shadow-2xl p-1">
-          {options.map((opt) => {
-            const active = opt.id === value;
-            return (
-              <button
-                key={opt.id}
-                type="button"
-                onClick={() => {
-                  onChange(opt.id);
-                  setOpen(false);
-                }}
-                className={`w-full text-left px-2 py-1.5 rounded-lg text-[11px] flex items-center justify-between transition ${
-                  active
-                    ? "bg-sky-500/20 text-sky-200 font-medium"
-                    : "text-white/80 hover:bg-white/[0.08]"
-                }`}
-              >
-                <span className="truncate">{opt.label}</span>
-                {active && <Check className="w-3 h-3 text-sky-400 shrink-0" />}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ToggleSwitch({
-  checked,
-  onChange,
-}: {
-  checked: boolean;
-  onChange: (next: boolean) => void;
-}) {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      onClick={() => onChange(!checked)}
-      className={`w-8 h-[18px] rounded-full p-0.5 transition-colors flex items-center shrink-0 ${
-        checked ? "bg-sky-500" : "bg-white/15"
-      }`}
-    >
-      <span
-        className={`w-3.5 h-3.5 rounded-full bg-white shadow transition-transform ${
-          checked ? "translate-x-[14px]" : "translate-x-0"
-        }`}
-      />
-    </button>
-  );
-}
-
-function detectPresetId(cfg: { api_provider: string; base_url: string; model_id: string }): string {
-  const b = cfg.base_url.trim().replace(/\/+$/, "");
-  const m = cfg.model_id.trim();
-  const match = MODEL_PRESETS.find(
-    (p) => p.id !== "custom" && p.provider === cfg.api_provider && p.baseUrl === b && p.modelId === m
-  );
-  return match?.id ?? "custom";
-}
-
-function makeFallbackProfiles(cfg: AppSettings): ModelProfile[] {
-  if (cfg.model_profiles && cfg.model_profiles.length > 0) {
-    return cfg.model_profiles;
-  }
-  return [
-    {
-      id: cfg.chat_profile_id || "prof_default",
-      name: cfg.model_id || "Default Model",
-      api_provider: cfg.api_provider,
-      base_url: cfg.base_url,
-      model_id: cfg.model_id,
-      supports_vision: true,
-      thinking_mode: "auto",
-      has_api_key: cfg.has_api_key,
-    },
-  ];
-}
+type SettingsSection = "model" | "general" | "mcp" | "mobile" | "actions";
 
 export default function SettingsTab({
+  isWindowMode = false,
   settings,
   refreshHz,
   expandedDims,
@@ -310,179 +63,25 @@ export default function SettingsTab({
 }: SettingsTabProps) {
   const [section, setSection] = useState<SettingsSection>("model");
   const [draft, setDraft] = useState<AppSettings>(settings);
-  const initialProfiles = makeFallbackProfiles(settings);
-  const [editingProfile, setEditingProfile] = useState<ModelProfile>(
-    () =>
-      initialProfiles.find((p) => p.id === settings.chat_profile_id) ?? initialProfiles[0]
-  );
-  const [isNewProfile, setIsNewProfile] = useState(false);
-  const [presetId, setPresetId] = useState<string>(() => detectPresetId(editingProfile));
-  const [apiKeyInput, setApiKeyInput] = useState("");
-  const [keyDirty, setKeyDirty] = useState(false);
-  const [isTesting, setIsTesting] = useState(false);
   const [statusMsg, setStatusMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
   const [updateMsg, setUpdateMsg] = useState<{ ok: boolean; text: string } | null>(null);
-  const prevProfilesSyncRef = useRef(
-    JSON.stringify({
-      profiles: settings.model_profiles ?? [],
-      chat: settings.chat_profile_id ?? "",
-      api_provider: settings.api_provider,
-      base_url: settings.base_url,
-      model_id: settings.model_id,
-      has_api_key: settings.has_api_key,
-    })
-  );
+  const [browserCleared, setBrowserCleared] = useState(false);
+  const [mcpServers, setMcpServers] = useState<McpServerStatus[]>([]);
+  const [mcpError, setMcpError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void invoke<McpServerStatus[]>("list_mcp_servers")
+      .then(setMcpServers)
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     setDraft(settings);
-    const nextSig = JSON.stringify({
-      profiles: settings.model_profiles ?? [],
-      chat: settings.chat_profile_id ?? "",
-      api_provider: settings.api_provider,
-      base_url: settings.base_url,
-      model_id: settings.model_id,
-      has_api_key: settings.has_api_key,
-    });
-    if (nextSig === prevProfilesSyncRef.current) return;
-    prevProfilesSyncRef.current = nextSig;
-    const profs = makeFallbackProfiles(settings);
-    setEditingProfile((cur) => {
-      if (isNewProfile) return cur;
-      return profs.find((p) => p.id === cur.id) ?? profs.find((p) => p.id === settings.chat_profile_id) ?? profs[0];
-    });
-  }, [settings, isNewProfile]);
+  }, [settings]);
 
   const lang: UiLang = draft.ui_language === "zh" ? "zh" : "en";
   const s = getStrings(lang).settings;
-  const profiles = makeFallbackProfiles(draft);
-  const activeChatId = draft.chat_profile_id || profiles[0]?.id || "prof_default";
-  const activeWatchId = draft.watch_profile_id || "";
-
-  const selectProfileToEdit = (prof: ModelProfile) => {
-    setIsNewProfile(false);
-    setEditingProfile(prof);
-    setPresetId(detectPresetId(prof));
-    setApiKeyInput("");
-    setKeyDirty(false);
-    setStatusMsg(null);
-  };
-
-  const handleStartNewProfile = () => {
-    const newId = `prof_${Date.now().toString(36)}`;
-    const blank: ModelProfile = {
-      id: newId,
-      name: "Gemini 2.5 Flash",
-      api_provider: "gemini",
-      base_url: "https://generativelanguage.googleapis.com",
-      model_id: "gemini-2.5-flash",
-      supports_vision: true,
-      thinking_mode: "auto",
-      has_api_key: false,
-    };
-    setIsNewProfile(true);
-    setEditingProfile(blank);
-    setPresetId("gemini_flash");
-    setApiKeyInput("");
-    setKeyDirty(false);
-    setStatusMsg(null);
-  };
-
-  const handlePresetChange = (id: string) => {
-    setPresetId(id);
-    setStatusMsg(null);
-    const preset = MODEL_PRESETS.find((p) => p.id === id);
-    if (preset && preset.id !== "custom") {
-      setEditingProfile((p) => ({
-        ...p,
-        name: preset.label,
-        api_provider: preset.provider,
-        base_url: preset.baseUrl,
-        model_id: preset.modelId,
-        supports_vision: preset.id === "deepseek" ? false : true,
-      }));
-    }
-  };
-
-  const handleRoleChange = async (nextChatId: string | null, nextWatchId: string | null) => {
-    setStatusMsg(null);
-    try {
-      const updated = await invoke<AppSettings>("select_role_models", {
-        chatProfileId: nextChatId,
-        watchProfileId: nextWatchId,
-      });
-      setDraft(updated);
-      onSaved(updated);
-    } catch (err) {
-      setStatusMsg({ ok: false, text: String(err) });
-    }
-  };
-
-  const handleVerifyAndSaveProfile = async () => {
-    setIsTesting(true);
-    setStatusMsg(null);
-    try {
-      const res = await invoke<{ settings: AppSettings; latency_ms: number }>(
-        "verify_and_save_model_profile",
-        {
-          profile: editingProfile,
-          newApiKey: keyDirty ? apiKeyInput : null,
-          setAsChat: isNewProfile ? false : editingProfile.id === activeChatId,
-          setAsWatch: false,
-        }
-      );
-      setIsNewProfile(false);
-      setDraft(res.settings);
-      const savedProf =
-        makeFallbackProfiles(res.settings).find((p) => p.id === editingProfile.id) ?? editingProfile;
-      setEditingProfile(savedProf);
-      setKeyDirty(false);
-      setApiKeyInput("");
-      onSaved(res.settings);
-      setStatusMsg({ ok: true, text: `${s.connectedSaved} (${res.latency_ms}ms)` });
-    } catch (err) {
-      setStatusMsg({ ok: false, text: String(err) });
-    } finally {
-      setIsTesting(false);
-    }
-  };
-
-  const handleSaveProfileDirect = async () => {
-    setStatusMsg(null);
-    try {
-      const updated = await invoke<AppSettings>("save_model_profile", {
-        profile: editingProfile,
-        newApiKey: keyDirty ? apiKeyInput : null,
-        setAsChat: isNewProfile ? false : editingProfile.id === activeChatId,
-        setAsWatch: false,
-      });
-      setIsNewProfile(false);
-      setDraft(updated);
-      const savedProf =
-        makeFallbackProfiles(updated).find((p) => p.id === editingProfile.id) ?? editingProfile;
-      setEditingProfile(savedProf);
-      setKeyDirty(false);
-      setApiKeyInput("");
-      onSaved(updated);
-      setStatusMsg({ ok: true, text: s.savedNoTest });
-    } catch (err) {
-      setStatusMsg({ ok: false, text: String(err) });
-    }
-  };
-
-  const handleDeleteProfile = async (profileId: string) => {
-    setStatusMsg(null);
-    try {
-      const updated = await invoke<AppSettings>("delete_model_profile", { profileId });
-      setIsNewProfile(false);
-      setDraft(updated);
-      const profs = makeFallbackProfiles(updated);
-      setEditingProfile(profs.find((p) => p.id === updated.chat_profile_id) ?? profs[0]);
-      onSaved(updated);
-    } catch (err) {
-      setStatusMsg({ ok: false, text: String(err) });
-    }
-  };
 
   const handleSaveDirect = async (nextDraft = draft, showBanner = true) => {
     if (showBanner) setStatusMsg(null);
@@ -501,331 +100,93 @@ export default function SettingsTab({
     }
   };
 
+  const navItems = [
+    { id: "model", label: s.secModel, Icon: Cpu },
+    { id: "general", label: s.secGeneral, Icon: Sliders },
+    { id: "mcp", label: s.secMcp, Icon: Plug },
+    { id: "mobile", label: s.secMobile, Icon: Smartphone },
+    { id: "actions", label: s.secActions, Icon: Zap },
+  ] as const;
+
   return (
-    <div className="flex-1 flex flex-col min-h-0 text-[12px] text-white/85">
-      {/* Sub-navigation Pill Switcher */}
-      <div className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-white/[0.05] border border-white/10 mb-2 shrink-0">
-        {(
-          [
-            { id: "model", label: s.secModel, Icon: Cpu },
-            { id: "general", label: s.secGeneral, Icon: Sliders },
-            { id: "actions", label: s.secActions, Icon: Zap },
-          ] as const
-        ).map(({ id, label, Icon }) => {
-          const active = section === id;
-          return (
-            <button
-              key={id}
-              type="button"
-              onClick={() => setSection(id)}
-              className={`py-1 rounded-lg text-[11px] font-medium flex items-center justify-center gap-1.5 transition ${
-                active
-                  ? "bg-white/15 text-white"
-                  : "text-white/50 hover:text-white/80"
-              }`}
-            >
-              <Icon className="w-3 h-3" />
-              <span>{label}</span>
-            </button>
-          );
-        })}
-      </div>
+    <div
+      className={`flex-1 flex min-h-0 text-white/85 ${
+        isWindowMode
+          ? "flex-row max-w-5xl w-full mx-auto gap-8 pt-1 text-[13px]"
+          : "flex-col text-[12px]"
+      }`}
+    >
+      {/* Navigation: Left vertical rail in Window Mode, top 5-capsule bar in compact Island Mode */}
+      {isWindowMode ? (
+        <aside className="w-48 shrink-0 border-r border-white/[0.08] pr-4 space-y-1">
+          {navItems.map(({ id, label, Icon }) => {
+            const active = section === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setSection(id)}
+                className={`w-full px-3 py-2 rounded-xl border text-[13px] font-medium flex items-center gap-2.5 transition ${
+                  active
+                    ? "bg-white text-black border-white"
+                    : "border-transparent text-white/60 hover:text-white hover:bg-white/[0.06]"
+                }`}
+              >
+                <Icon className="w-4 h-4 shrink-0" />
+                <span className="truncate">{label}</span>
+              </button>
+            );
+          })}
+        </aside>
+      ) : (
+        <div className="grid grid-cols-5 gap-0.5 p-1 rounded-full bg-white/[0.04] border border-white/10 mb-2 shrink-0">
+          {navItems.map(({ id, label }) => {
+            const active = section === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => setSection(id)}
+                className={`py-1 px-1 rounded-full border text-[10px] font-medium flex items-center justify-center transition-all duration-200 ${
+                  active
+                    ? "bg-white/[0.12] border-white/[0.16] text-white"
+                    : "border-transparent text-white/50 hover:text-white/80 hover:bg-white/[0.04]"
+                }`}
+              >
+                <span className="truncate">{label}</span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div className={`flex-1 flex flex-col min-w-0 min-h-0 ${isWindowMode ? "max-w-2xl" : ""}`}>
 
       {/* SECTION 1: MULTI-MODEL LIBRARY & ROLE SELECTORS */}
       {section === "model" && (
-        <div className="flex-1 flex flex-col justify-between min-h-0 gap-1.5">
-          <div className="flex-1 overflow-y-auto pr-0.5 space-y-2 min-h-0">
-            {/* Chat / Watch Role Selectors */}
-            <div className="rounded-xl bg-white/[0.04] border border-white/10 p-2 grid grid-cols-2 gap-2">
-              <div className="space-y-1">
-                <label className="text-[10px] text-white/55 flex items-center gap-1">
-                  <MessageSquare className="w-2.5 h-2.5 text-sky-300" />
-                  <span className="truncate">{s.roleChatModel}</span>
-                </label>
-                <DarkSelect
-                  compact
-                  value={activeChatId}
-                  options={profiles.map((p) => ({
-                    id: p.id,
-                    label: `${p.name || p.model_id}`,
-                  }))}
-                  onChange={(id) => void handleRoleChange(id, null)}
-                />
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-[10px] text-white/55 flex items-center gap-1">
-                  <Eye className="w-2.5 h-2.5 text-rose-300" />
-                  <span className="truncate">{s.roleWatchModel}</span>
-                </label>
-                <DarkSelect
-                  compact
-                  value={activeWatchId || "follow_chat"}
-                  options={[
-                    { id: "follow_chat", label: s.followChat },
-                    ...profiles.map((p) => ({
-                      id: p.id,
-                      label: `${p.name || p.model_id}${p.supports_vision ? "" : " (Text)"}`,
-                    })),
-                  ]}
-                  onChange={(id) => void handleRoleChange(null, id)}
-                />
-              </div>
-            </div>
-
-            {/* Saved Profiles Chips */}
-            <div className="space-y-1">
-              <div className="flex items-center justify-between">
-                <span className="text-[10px] text-white/50">{s.modelLibrary}</span>
-                <button
-                  type="button"
-                  onClick={handleStartNewProfile}
-                  className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-white/[0.08] hover:bg-white/[0.15] border border-white/10 text-[10px] text-white/85 transition"
-                >
-                  <Plus className="w-2.5 h-2.5" />
-                  <span>{s.newProfile}</span>
-                </button>
-              </div>
-              <div className="flex flex-wrap gap-1">
-                {profiles.map((prof) => {
-                  const selected = !isNewProfile && editingProfile.id === prof.id;
-                  const isChat = prof.id === activeChatId;
-                  const isWatch = prof.id === activeWatchId;
-                  return (
-                    <button
-                      key={prof.id}
-                      type="button"
-                      onClick={() => selectProfileToEdit(prof)}
-                      className={`px-2 py-0.5 rounded-full text-[10px] border flex items-center gap-1 transition max-w-[170px] ${
-                        selected
-                          ? "bg-white/15 border-white/35 text-white font-medium"
-                          : "bg-white/[0.04] border-white/10 text-white/65 hover:text-white/90"
-                      }`}
-                    >
-                      <span className="truncate">{prof.name || prof.model_id}</span>
-                      {isChat && (
-                        <span className="text-[8.5px] px-1 rounded bg-sky-500/25 text-sky-200 shrink-0">
-                          Chat
-                        </span>
-                      )}
-                      {isWatch && (
-                        <span className="text-[8.5px] px-1 rounded bg-rose-500/25 text-rose-200 shrink-0">
-                          Watch
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Profile Editor */}
-            <div className="rounded-xl bg-white/[0.03] border border-white/[0.08] p-2 space-y-1.5">
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-0.5">
-                  <label className="text-[10px] text-white/50">{s.profileName}</label>
-                  <input
-                    type="text"
-                    value={editingProfile.name}
-                    onChange={(e) =>
-                      setEditingProfile({ ...editingProfile, name: e.target.value })
-                    }
-                    placeholder="My Gemini Flash"
-                    className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2 py-1 text-white text-[11px]"
-                  />
-                </div>
-                <div className="space-y-0.5">
-                  <label className="text-[10px] text-white/50">{s.preset}</label>
-                  <DarkSelect
-                    compact
-                    value={presetId}
-                    options={MODEL_PRESETS.map((p) => ({ id: p.id, label: p.label }))}
-                    onChange={handlePresetChange}
-                  />
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-2">
-                <div className="space-y-0.5">
-                  <label className="text-[10px] text-white/50">{s.protocol}</label>
-                  <DarkSelect
-                    compact
-                    value={editingProfile.api_provider}
-                    options={PROTOCOL_OPTIONS}
-                    onChange={(prov) => {
-                      setPresetId("custom");
-                      setEditingProfile({ ...editingProfile, api_provider: prov });
-                    }}
-                  />
-                </div>
-                <div className="space-y-0.5">
-                  <label className="text-[10px] text-white/50">{s.modelId}</label>
-                  <input
-                    type="text"
-                    value={editingProfile.model_id}
-                    onChange={(e) => {
-                      setPresetId("custom");
-                      setEditingProfile({ ...editingProfile, model_id: e.target.value });
-                    }}
-                    className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2 py-1 text-white font-mono text-[11px]"
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-0.5">
-                <label className="text-[10px] text-white/50">{s.baseUrl}</label>
-                <input
-                  type="text"
-                  value={editingProfile.base_url}
-                  onChange={(e) => {
-                    setPresetId("custom");
-                    setEditingProfile({ ...editingProfile, base_url: e.target.value });
-                  }}
-                  placeholder="https://..."
-                  className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2 py-1 text-white font-mono text-[11px]"
-                />
-              </div>
-
-              <div className="grid grid-cols-1 gap-1.5">
-                <div className="space-y-0.5">
-                  <div className="flex items-center justify-between">
-                    <label className="text-[10px] text-white/50">{s.apiKey}</label>
-                    <div className="flex items-center gap-2">
-                      {editingProfile.has_api_key && (
-                        <span className="flex items-center gap-0.5 text-[9.5px] text-emerald-400">
-                          <ShieldCheck className="w-2.5 h-2.5" />
-                          DPAPI
-                        </span>
-                      )}
-                      {!isNewProfile && profiles.length > 1 && (
-                        <button
-                          type="button"
-                          onClick={() => void handleDeleteProfile(editingProfile.id)}
-                          className="text-[9.5px] text-rose-300/75 hover:text-rose-300 inline-flex items-center gap-0.5"
-                        >
-                          <Trash2 className="w-2.5 h-2.5" />
-                          <span>{s.deleteProfile}</span>
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                  <input
-                    type="password"
-                    value={apiKeyInput}
-                    onChange={(e) => {
-                      setApiKeyInput(e.target.value);
-                      setKeyDirty(true);
-                    }}
-                    placeholder={
-                      editingProfile.has_api_key
-                        ? "••••••••••••"
-                        : editingProfile.api_provider === "anthropic"
-                        ? "sk-ant-..."
-                        : editingProfile.api_provider === "gemini"
-                        ? "AIza..."
-                        : "sk-..."
-                    }
-                    className="w-full rounded-lg bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-2 py-1 text-white font-mono text-[11px] placeholder:text-white/30"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-2 pt-0.5 items-center">
-                  <label className="flex items-center justify-between gap-2 cursor-pointer select-none">
-                    <span className="text-[10.5px] text-white/70 flex items-center gap-1.5 truncate">
-                      {editingProfile.supports_vision ? (
-                        <Eye className="w-3 h-3 text-sky-300 shrink-0" />
-                      ) : (
-                        <EyeOff className="w-3 h-3 text-white/35 shrink-0" />
-                      )}
-                      <span className="truncate">{s.supportsVision}</span>
-                    </span>
-                    <input
-                      type="checkbox"
-                      checked={editingProfile.supports_vision}
-                      onChange={(e) =>
-                        setEditingProfile({
-                          ...editingProfile,
-                          supports_vision: e.target.checked,
-                        })
-                      }
-                      className="accent-sky-400 w-3.5 h-3.5 rounded shrink-0"
-                    />
-                  </label>
-                  <div className="flex items-center gap-1.5 min-w-0">
-                    <span className="text-[10px] text-white/50 shrink-0">
-                      {s.thinkingModeLabel}
-                    </span>
-                    <div className="flex-1 min-w-0">
-                      <DarkSelect
-                        compact
-                        value={normalizeThinkingMode(editingProfile.thinking_mode)}
-                        options={[
-                          { id: "auto", label: s.thinkingModeAuto },
-                          { id: "native", label: s.thinkingModeNative },
-                          { id: "prompt", label: s.thinkingModePrompt },
-                        ]}
-                        onChange={(mode) =>
-                          setEditingProfile({ ...editingProfile, thinking_mode: mode })
-                        }
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Connection Probe Footer */}
-          <div className="pt-1.5 border-t border-white/[0.08] flex items-center justify-between gap-2 shrink-0">
-            <div className="min-w-0 flex-1">
-              {statusMsg ? (
-                <div className="flex items-center gap-1.5">
-                  <span
-                    className={`text-[10.5px] truncate ${
-                      statusMsg.ok ? "text-emerald-400" : "text-rose-400"
-                    }`}
-                    title={statusMsg.text}
-                  >
-                    {statusMsg.text}
-                  </span>
-                  {!statusMsg.ok && (
-                    <button
-                      type="button"
-                      onClick={() => void handleSaveProfileDirect()}
-                      className="text-[10px] underline text-white/60 hover:text-white shrink-0"
-                    >
-                      {s.saveAnyway}
-                    </button>
-                  )}
-                </div>
-              ) : (
-                <span className="text-[10px] text-white/40">{s.verifyHint}</span>
-              )}
-            </div>
-
-            <button
-              type="button"
-              disabled={isTesting}
-              onClick={() => void handleVerifyAndSaveProfile()}
-              className="px-3 py-1 rounded-lg bg-sky-500 hover:bg-sky-400 disabled:opacity-60 text-slate-950 font-semibold text-[11px] flex items-center gap-1.5 shrink-0 transition"
-            >
-              {isTesting ? (
-                <>
-                  <Loader2 className="w-3 h-3 animate-spin" />
-                  <span>{s.testing}</span>
-                </>
-              ) : (
-                <span>{s.testAndSave}</span>
-              )}
-            </button>
-          </div>
-        </div>
+        <ModelProfilesSection
+          settings={settings}
+          draft={draft}
+          lang={lang}
+          statusMsg={statusMsg}
+          setStatusMsg={setStatusMsg}
+          onUpdateDraft={setDraft}
+          onSaved={onSaved}
+        />
       )}
 
       {/* SECTION 2: GENERAL, LANGUAGE & AGENT */}
       {section === "general" && (
-        <div className="flex-1 flex flex-col justify-between min-h-0 gap-1.5 overflow-y-auto pr-0.5">
-          <div className="rounded-xl bg-white/[0.04] border border-white/10 p-2.5 space-y-1.5">
+        <div
+          className={`flex-1 flex flex-col min-h-0 overflow-y-auto pr-0.5 ${
+            isWindowMode ? "gap-3.5 pb-6" : "gap-2"
+          }`}
+        >
+          <div
+            className={`rounded-2xl bg-white/[0.04] border border-white/10 ${
+              isWindowMode ? "p-4 space-y-3" : "p-2.5 space-y-1.5"
+            }`}
+          >
             {/* System UI Language (English / 中文) */}
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
@@ -1027,10 +388,32 @@ export default function SettingsTab({
                 <span>{s.openLogsBtn}</span>
               </button>
             </div>
+
+            <div className="pt-1.5 border-t border-white/[0.06] flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="text-[11.5px] font-medium text-white">{s.clearBrowser}</div>
+                <div className="text-[10px] text-white/45 truncate">{s.clearBrowserDesc}</div>
+              </div>
+              <button
+                type="button"
+                onClick={() =>
+                  void invoke("clear_browser_data")
+                    .then(() => {
+                      setBrowserCleared(true);
+                      window.setTimeout(() => setBrowserCleared(false), 2000);
+                    })
+                    .catch(() => {})
+                }
+                className="shrink-0 inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-white/[0.07] hover:bg-rose-500/25 border border-white/10 text-[10.5px] text-white/85 transition"
+              >
+                <RotateCcw className="w-3 h-3 text-rose-300" />
+                <span>{browserCleared ? s.browserCleared : s.clearBrowserBtn}</span>
+              </button>
+            </div>
           </div>
 
           {/* Tauri Official Auto-Updater Card */}
-          <div className="rounded-xl bg-white/[0.04] border border-white/10 p-2.5 space-y-1.5">
+          <div className="rounded-2xl bg-white/[0.04] border border-white/10 p-2.5 space-y-1.5">
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="text-[11.5px] font-medium text-white">{s.updatesTitle}</div>
@@ -1096,7 +479,7 @@ export default function SettingsTab({
             )}
           </div>
 
-          <div className="rounded-xl bg-white/[0.04] border border-white/10 px-3 py-1.5 flex items-center justify-between text-[10.5px]">
+          <div className="rounded-2xl bg-white/[0.04] border border-white/10 px-3 py-1.5 flex items-center justify-between text-[10.5px]">
             <span className="text-white/50">{s.displayVsync}</span>
             <span className="font-mono text-emerald-400">
               {refreshHz} Hz · {expandedDims[0]}×{expandedDims[1]}
@@ -1105,44 +488,84 @@ export default function SettingsTab({
         </div>
       )}
 
-      {/* SECTION 3: QUICK ACTIONS */}
+      {/* SECTION 3: MCP SERVERS */}
+      {section === "mcp" && (
+        <div className="flex-1 flex flex-col min-h-0 space-y-2">
+          {mcpError && (
+            <div className="rounded-xl bg-rose-500/15 border border-rose-400/30 px-2.5 py-1.5 text-[10.5px] text-rose-200 flex items-center justify-between gap-2 shrink-0">
+              <span className="truncate">{mcpError}</span>
+              <button
+                type="button"
+                onClick={() => setMcpError(null)}
+                className="text-rose-200/70 hover:text-white shrink-0"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+          <McpSection
+            lang={lang}
+            servers={mcpServers}
+            onRefreshServers={setMcpServers}
+            onError={setMcpError}
+          />
+        </div>
+      )}
+
+      {/* SECTION 4: MOBILE COMPANION */}
+      {section === "mobile" && <MobileLinkCard lang={lang} isWindowMode={isWindowMode} />}
+
+      {/* SECTION 5: QUICK ACTIONS */}
       {section === "actions" && (
-        <div className="flex-1 flex flex-col justify-between min-h-0">
-          <div className="grid grid-cols-2 gap-2">
+        <div
+          className={`flex-1 flex flex-col min-h-0 overflow-y-auto ${
+            isWindowMode ? "gap-4" : "gap-2.5"
+          }`}
+        >
+          <div className={`grid grid-cols-2 ${isWindowMode ? "gap-3" : "gap-2"}`}>
             <button
               type="button"
               onClick={onTriggerSnip}
-              className="rounded-xl bg-white/[0.05] hover:bg-sky-500/20 border border-white/10 p-3 text-left space-y-1 transition"
+              className={`rounded-2xl bg-white/[0.05] hover:bg-white/[0.1] border border-white/10 text-left space-y-1 transition ${
+                isWindowMode ? "p-4" : "p-3"
+              }`}
             >
-              <Camera className="w-4 h-4 text-sky-400" />
-              <div className="text-[12px] font-medium text-white">{s.quickSnip}</div>
-              <div className="text-[10.5px] text-white/45">{s.quickSnipDesc}</div>
+              <Camera className="w-4 h-4 text-white/85" />
+              <div className="text-[12.5px] font-medium text-white">{s.quickSnip}</div>
+              <div className="text-[11px] text-white/45">{s.quickSnipDesc}</div>
             </button>
 
             <button
               type="button"
               onClick={onTestInhale}
-              className="rounded-xl bg-white/[0.05] hover:bg-emerald-500/20 border border-white/10 p-3 text-left space-y-1 transition"
+              className={`rounded-2xl bg-white/[0.05] hover:bg-white/[0.1] border border-white/10 text-left space-y-1 transition ${
+                isWindowMode ? "p-4" : "p-3"
+              }`}
             >
               <Sparkles className="w-4 h-4 text-emerald-400" />
-              <div className="text-[12px] font-medium text-white">{s.testInhale}</div>
-              <div className="text-[10.5px] text-white/45">{s.testInhaleDesc}</div>
+              <div className="text-[12.5px] font-medium text-white">{s.testInhale}</div>
+              <div className="text-[11px] text-white/45">{s.testInhaleDesc}</div>
             </button>
 
-            <div className="col-span-2 rounded-xl bg-white/[0.04] border border-white/10 px-3 py-2 flex items-center justify-between gap-2">
+            <div
+              className={`col-span-2 rounded-2xl bg-white/[0.04] border border-white/10 flex items-center justify-between gap-2 ${
+                isWindowMode ? "px-4 py-3" : "px-3 py-2"
+              }`}
+            >
               <div className="min-w-0">
-                <div className="text-[11.5px] font-medium text-white">{s.toggleHotkey}</div>
-                <div className="text-[10px] text-white/45">{s.toggleHotkeyDesc}</div>
+                <div className="text-[12px] font-medium text-white">{s.toggleHotkey}</div>
+                <div className="text-[10.5px] text-white/45">{s.toggleHotkeyDesc}</div>
               </div>
-              <kbd className="px-2 py-0.5 rounded-md bg-white/[0.08] border border-white/15 font-mono text-[10.5px] text-sky-300">
+              <kbd className="px-2.5 py-0.5 rounded-md bg-white/[0.08] border border-white/15 font-mono text-[11px] text-white">
                 Ctrl + Alt + B
               </kbd>
             </div>
           </div>
 
-          <div className="text-[10.5px] text-white/40 text-center pb-0.5">{s.footerNote}</div>
+          <div className="text-[11px] text-white/40 text-center pt-1">{s.footerNote}</div>
         </div>
       )}
+      </div>
     </div>
   );
 }

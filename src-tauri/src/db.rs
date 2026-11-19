@@ -13,6 +13,7 @@ pub struct ConversationSummary {
     pub id: i64,
     pub title: String,
     pub message_count: i64,
+    pub source: String, // "desktop" | "mobile"
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -32,7 +33,7 @@ pub struct StoredChatMessage {
 #[derive(Clone, Debug, Serialize)]
 pub struct MemoryItem {
     pub id: i64,
-    pub kind: String, // "screenshot" | "clipboard_text" | "clipboard_image"
+    pub kind: String, // "screenshot" | "clipboard_text" | "clipboard_image" | "fact"
     pub content_text: Option<String>,
     pub file_path: Option<String>,
     pub thumb_path: Option<String>,
@@ -41,6 +42,25 @@ pub struct MemoryItem {
     pub is_starred: bool,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct BrowserBookmark {
+    pub id: i64,
+    pub title: String,
+    pub url: String,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReminderItem {
+    pub id: i64,
+    pub title: String,
+    pub fire_at_ms: i64,
+    pub repeat_rule: Option<String>, // None | "daily" | "weekdays" | "weekly"
+    pub enabled: bool,
+    pub fired_count: i64,
+    pub created_at: i64,
 }
 
 pub struct MemoryDb {
@@ -167,6 +187,33 @@ impl MemoryDb {
                 thought_text TEXT,
                 created_at INTEGER NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_chat_messages_conv_id
+                ON chat_messages(conversation_id, id);
+            CREATE INDEX IF NOT EXISTS idx_conversations_updated
+                ON conversations(updated_at DESC, id DESC);
+            CREATE INDEX IF NOT EXISTS idx_memories_cleanup
+                ON memories(kind, is_starred, updated_at);
+
+            CREATE TABLE IF NOT EXISTS browser_bookmarks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL UNIQUE,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                fire_at_ms INTEGER NOT NULL,
+                repeat_rule TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                fired_count INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_reminders_due
+                ON reminders(enabled, fire_at_ms ASC);
             ",
         )
         .map_err(|e| format!("init schema failed: {e}"))?;
@@ -200,6 +247,12 @@ impl MemoryDb {
             "conversations",
             "summarized_up_to_id",
             "ALTER TABLE conversations ADD COLUMN summarized_up_to_id INTEGER NOT NULL DEFAULT 0",
+        )?;
+        Self::ensure_column(
+            &conn,
+            "conversations",
+            "source",
+            "ALTER TABLE conversations ADD COLUMN source TEXT NOT NULL DEFAULT 'desktop'",
         )?;
 
         // Ensure orphaned legacy messages belong to an existing conversation row
@@ -317,6 +370,11 @@ impl MemoryDb {
         .map_err(|e| e.to_string())
     }
 
+    pub fn get_memory_by_id(&self, id: i64) -> Result<MemoryItem, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        Self::get_by_id_locked(&conn, id)
+    }
+
     pub fn list_memories(&self, query: Option<&str>, limit: usize) -> Result<Vec<MemoryItem>, String> {
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let trimmed = query.unwrap_or("").trim();
@@ -408,31 +466,66 @@ impl MemoryDb {
         Ok(())
     }
 
-    /// Removes physical image files first, then removes expired DB rows (> 7 days & unstarred).
+    /// Removes physical image files first, then removes expired DB rows (> 7 days & unstarred),
+    /// and prunes temporary pasted chat images older than 7 days.
     pub fn cleanup_expired(&self) -> usize {
-        let Ok(conn) = self.conn.lock() else {
+        let mut count = 0usize;
+        if let Ok(conn) = self.conn.lock() {
+            let cutoff = now_ms() - (7 * 24 * 60 * 60 * 1000);
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT id, file_path, thumb_path FROM memories WHERE is_starred = 0 AND kind != 'fact' AND updated_at < ?1",
+            ) {
+                let expired: Vec<(i64, Option<String>, Option<String>)> = stmt
+                    .query_map(params![cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+                    .ok()
+                    .map(|iter| iter.filter_map(Result::ok).collect())
+                    .unwrap_or_default();
+
+                count += expired.len();
+                for (id, fp, tp) in expired {
+                    Self::remove_files_if_present(fp.as_deref(), tp.as_deref());
+                    let _ = conn.execute("DELETE FROM memories WHERE id = ?1", params![id]);
+                }
+            }
+        }
+        count += Self::prune_expired_pasted_files(&self.data_dir.join("pasted"), 7 * 24 * 60 * 60);
+        count
+    }
+
+    pub(crate) fn prune_expired_pasted_files(pasted_dir: &Path, max_age_secs: u64) -> usize {
+        let Ok(entries) = std::fs::read_dir(pasted_dir) else {
             return 0;
         };
-        let cutoff = now_ms() - (7 * 24 * 60 * 60 * 1000);
-        let mut stmt = match conn.prepare(
-            "SELECT id, file_path, thumb_path FROM memories WHERE is_starred = 0 AND kind != 'fact' AND updated_at < ?1",
-        ) {
-            Ok(s) => s,
-            Err(_) => return 0,
-        };
-
-        let expired: Vec<(i64, Option<String>, Option<String>)> = stmt
-            .query_map(params![cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .ok()
-            .map(|iter| iter.filter_map(Result::ok).collect())
-            .unwrap_or_default();
-
-        let count = expired.len();
-        for (id, fp, tp) in expired {
-            Self::remove_files_if_present(fp.as_deref(), tp.as_deref());
-            let _ = conn.execute("DELETE FROM memories WHERE id = ?1", params![id]);
+        let now = SystemTime::now();
+        let mut removed = 0usize;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            if let Ok(age) = now.duration_since(modified) {
+                if age.as_secs() >= max_age_secs && std::fs::remove_file(&path).is_ok() {
+                    removed += 1;
+                }
+            }
         }
-        count
+        removed
+    }
+
+    pub fn get_conversation_title(&self, conversation_id: i64) -> Result<String, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.query_row(
+            "SELECT title FROM conversations WHERE id = ?1",
+            params![conversation_id],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(|e| e.to_string())
     }
 
     fn remove_files_if_present(file_path: Option<&str>, thumb_path: Option<&str>) {
@@ -457,12 +550,55 @@ impl MemoryDb {
     }
 
     pub fn create_conversation(&self, title: Option<&str>) -> Result<ConversationSummary, String> {
+        self.create_conversation_with_source(title, "desktop")
+    }
+
+    pub fn create_conversation_with_source(
+        &self,
+        title: Option<&str>,
+        source: &str,
+    ) -> Result<ConversationSummary, String> {
+        let clean_source = if source == "mobile" { "mobile" } else { "desktop" };
         let conn = self.conn.lock().map_err(|e| e.to_string())?;
         let ts = now_ms();
+        if title.is_none() {
+            if let Ok((id, existing_title, created_at, existing_source, count)) = conn.query_row(
+                "SELECT c.id, c.title, c.created_at, COALESCE(c.source, 'desktop'),
+                        (SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id = c.id) AS cnt
+                 FROM conversations c
+                 ORDER BY c.updated_at DESC, c.id DESC
+                 LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                    ))
+                },
+            ) {
+                if count == 0 && existing_source == clean_source {
+                    let _ = conn.execute(
+                        "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+                        params![ts, id],
+                    );
+                    return Ok(ConversationSummary {
+                        id,
+                        title: existing_title,
+                        message_count: 0,
+                        source: existing_source,
+                        created_at,
+                        updated_at: ts,
+                    });
+                }
+            }
+        }
         let t = title.unwrap_or("New Chat");
         conn.execute(
-            "INSERT INTO conversations (title, created_at, updated_at) VALUES (?1, ?2, ?2)",
-            params![t, ts],
+            "INSERT INTO conversations (title, source, created_at, updated_at) VALUES (?1, ?2, ?3, ?3)",
+            params![t, clean_source, ts],
         )
         .map_err(|e| e.to_string())?;
         let id = conn.last_insert_rowid();
@@ -470,6 +606,7 @@ impl MemoryDb {
             id,
             title: t.to_string(),
             message_count: 0,
+            source: clean_source.to_string(),
             created_at: ts,
             updated_at: ts,
         })
@@ -527,6 +664,7 @@ impl MemoryDb {
             .prepare(
                 "SELECT c.id, c.title,
                         (SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id = c.id) AS cnt,
+                        COALESCE(c.source, 'desktop'),
                         c.created_at, c.updated_at
                  FROM conversations c
                  ORDER BY c.updated_at DESC, c.id DESC
@@ -539,8 +677,9 @@ impl MemoryDb {
                     id: r.get(0)?,
                     title: r.get(1)?,
                     message_count: r.get(2)?,
-                    created_at: r.get(3)?,
-                    updated_at: r.get(4)?,
+                    source: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
                 })
             })
             .map_err(|e| e.to_string())?;
@@ -560,6 +699,353 @@ impl MemoryDb {
         )
         .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    pub fn rename_conversation(
+        &self,
+        conversation_id: i64,
+        new_title: &str,
+    ) -> Result<String, String> {
+        let clean: String = new_title.trim().chars().take(64).collect();
+        if clean.is_empty() {
+            return Err("Title cannot be empty".to_string());
+        }
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE conversations SET title = ?1 WHERE id = ?2",
+            params![clean, conversation_id],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(clean)
+    }
+
+    pub fn search_conversations(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ConversationSummary>, String> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return self.list_conversations(limit);
+        }
+        let escaped = trimmed
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.id, c.title,
+                        (SELECT COUNT(*) FROM chat_messages m WHERE m.conversation_id = c.id) AS cnt,
+                        COALESCE(c.source, 'desktop'),
+                        c.created_at, c.updated_at
+                 FROM conversations c
+                 WHERE c.title LIKE ?1 ESCAPE '\\'
+                    OR EXISTS (
+                        SELECT 1 FROM chat_messages cm
+                        WHERE cm.conversation_id = c.id
+                          AND cm.content LIKE ?1 ESCAPE '\\'
+                    )
+                 ORDER BY c.updated_at DESC, c.id DESC
+                 LIMIT ?2",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![pattern, limit as i64], |r| {
+                Ok(ConversationSummary {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    message_count: r.get(2)?,
+                    source: r.get(3)?,
+                    created_at: r.get(4)?,
+                    updated_at: r.get(5)?,
+                })
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn delete_last_assistant_message(&self, conversation_id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let last: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, role FROM chat_messages WHERE conversation_id = ?1 ORDER BY id DESC LIMIT 1",
+                params![conversation_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+        if let Some((msg_id, role)) = last {
+            if role == "assistant" {
+                conn.execute("DELETE FROM chat_messages WHERE id = ?1", params![msg_id])
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Truncate a conversation starting at the `user_turn_index`-th (0-based) user message,
+    /// removing that user turn and every subsequent message so the turn can be cleanly edited & resent.
+    pub fn truncate_conversation_by_user_index(
+        &self,
+        conversation_id: i64,
+        user_turn_index: usize,
+    ) -> Result<usize, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let cutoff_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM chat_messages
+                 WHERE conversation_id = ?1 AND role = 'user'
+                 ORDER BY id ASC
+                 LIMIT 1 OFFSET ?2",
+                params![conversation_id, user_turn_index as i64],
+                |r| r.get(0),
+            )
+            .ok();
+        let Some(cid) = cutoff_id else {
+            return Ok(0);
+        };
+        let deleted = conn
+            .execute(
+                "DELETE FROM chat_messages WHERE conversation_id = ?1 AND id >= ?2",
+                params![conversation_id, cid],
+            )
+            .map_err(|e| e.to_string())?;
+
+        // Reset rolling summary if it covered any truncated message
+        let up_to: i64 = conn
+            .query_row(
+                "SELECT summarized_up_to_id FROM conversations WHERE id = ?1",
+                params![conversation_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        let ts = now_ms();
+        if up_to >= cid {
+            let _ = conn.execute(
+                "UPDATE conversations SET summary_text = NULL, summarized_up_to_id = 0, updated_at = ?1 WHERE id = ?2",
+                params![ts, conversation_id],
+            );
+        } else {
+            let _ = conn.execute(
+                "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
+                params![ts, conversation_id],
+            );
+        }
+        Ok(deleted)
+    }
+
+    // ------------------------------------------------------------------------
+    // Browser Bookmarks
+    // ------------------------------------------------------------------------
+
+    pub fn list_bookmarks(&self) -> Result<Vec<BrowserBookmark>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, url, created_at FROM browser_bookmarks ORDER BY created_at DESC LIMIT 60",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(BrowserBookmark {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    url: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn add_bookmark(&self, title: &str, url: &str) -> Result<BrowserBookmark, String> {
+        let clean_url = url.trim();
+        if clean_url.is_empty() {
+            return Err("Bookmark URL cannot be empty".to_string());
+        }
+        let clean_title: String = {
+            let t = title.trim();
+            if t.is_empty() {
+                clean_url.chars().take(48).collect()
+            } else {
+                t.chars().take(80).collect()
+            }
+        };
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let ts = now_ms();
+        conn.execute(
+            "INSERT INTO browser_bookmarks (title, url, created_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(url) DO UPDATE SET title = excluded.title, created_at = excluded.created_at",
+            params![clean_title, clean_url, ts],
+        )
+        .map_err(|e| e.to_string())?;
+
+        conn.query_row(
+            "SELECT id, title, url, created_at FROM browser_bookmarks WHERE url = ?1",
+            params![clean_url],
+            |r| {
+                Ok(BrowserBookmark {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    url: r.get(2)?,
+                    created_at: r.get(3)?,
+                })
+            },
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    pub fn delete_bookmark(&self, id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM browser_bookmarks WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------------
+    // Persistent Scheduled Reminders
+    // ------------------------------------------------------------------------
+
+    pub fn create_reminder(
+        &self,
+        title: &str,
+        fire_at_ms: i64,
+        repeat_rule: Option<&str>,
+    ) -> Result<ReminderItem, String> {
+        let clean_title: String = title.trim().chars().take(180).collect();
+        if clean_title.is_empty() {
+            return Err("Reminder title cannot be empty".to_string());
+        }
+        let norm_repeat = repeat_rule.and_then(|r| match r.trim().to_ascii_lowercase().as_str() {
+            "daily" | "weekdays" | "weekly" => Some(r.trim().to_ascii_lowercase()),
+            _ => None,
+        });
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let ts = now_ms();
+        conn.execute(
+            "INSERT INTO reminders (title, fire_at_ms, repeat_rule, enabled, fired_count, created_at)
+             VALUES (?1, ?2, ?3, 1, 0, ?4)",
+            params![clean_title, fire_at_ms, norm_repeat, ts],
+        )
+        .map_err(|e| e.to_string())?;
+        let id = conn.last_insert_rowid();
+        Self::get_reminder_locked(&conn, id)
+    }
+
+    pub fn list_reminders(&self, include_disabled: bool) -> Result<Vec<ReminderItem>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let sql = if include_disabled {
+            "SELECT id, title, fire_at_ms, repeat_rule, enabled, fired_count, created_at
+             FROM reminders
+             ORDER BY enabled DESC, fire_at_ms ASC
+             LIMIT 100"
+        } else {
+            "SELECT id, title, fire_at_ms, repeat_rule, enabled, fired_count, created_at
+             FROM reminders
+             WHERE enabled = 1
+             ORDER BY fire_at_ms ASC
+             LIMIT 100"
+        };
+        let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], Self::row_to_reminder)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn toggle_reminder(&self, id: i64, enabled: bool) -> Result<ReminderItem, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "UPDATE reminders SET enabled = ?1 WHERE id = ?2",
+            params![if enabled { 1 } else { 0 }, id],
+        )
+        .map_err(|e| e.to_string())?;
+        Self::get_reminder_locked(&conn, id)
+    }
+
+    pub fn snooze_reminder(&self, id: i64, minutes: i64) -> Result<ReminderItem, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let next_ms = now_ms() + minutes.clamp(1, 1440) * 60_000;
+        conn.execute(
+            "UPDATE reminders SET fire_at_ms = ?1, enabled = 1 WHERE id = ?2",
+            params![next_ms, id],
+        )
+        .map_err(|e| e.to_string())?;
+        Self::get_reminder_locked(&conn, id)
+    }
+
+    pub fn delete_reminder(&self, id: i64) -> Result<(), String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute("DELETE FROM reminders WHERE id = ?1", params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Atomically returns all enabled reminders due at or before `current_ms`,
+    /// advancing recurring reminders or disabling one-shot reminders.
+    pub fn pop_due_reminders(
+        &self,
+        current_ms: i64,
+        tz_offset_ms: i64,
+    ) -> Result<Vec<ReminderItem>, String> {
+        let conn = self.conn.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, fire_at_ms, repeat_rule, enabled, fired_count, created_at
+                 FROM reminders
+                 WHERE enabled = 1 AND fire_at_ms <= ?1
+                 ORDER BY fire_at_ms ASC",
+            )
+            .map_err(|e| e.to_string())?;
+        let due: Vec<ReminderItem> = stmt
+            .query_map(params![current_ms], Self::row_to_reminder)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .collect();
+
+        for item in &due {
+            if let Some(rule) = item.repeat_rule.as_deref() {
+                let next_ms = advance_repeat_fire_ms(item.fire_at_ms, rule, current_ms, tz_offset_ms);
+                let _ = conn.execute(
+                    "UPDATE reminders SET fire_at_ms = ?1, fired_count = fired_count + 1 WHERE id = ?2",
+                    params![next_ms, item.id],
+                );
+            } else {
+                let _ = conn.execute(
+                    "UPDATE reminders SET enabled = 0, fired_count = fired_count + 1 WHERE id = ?1",
+                    params![item.id],
+                );
+            }
+        }
+        Ok(due)
+    }
+
+    fn row_to_reminder(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReminderItem> {
+        Ok(ReminderItem {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            fire_at_ms: r.get(2)?,
+            repeat_rule: r.get(3)?,
+            enabled: r.get::<_, i64>(4)? != 0,
+            fired_count: r.get(5)?,
+            created_at: r.get(6)?,
+        })
+    }
+
+    fn get_reminder_locked(conn: &Connection, id: i64) -> Result<ReminderItem, String> {
+        conn.query_row(
+            "SELECT id, title, fire_at_ms, repeat_rule, enabled, fired_count, created_at
+             FROM reminders WHERE id = ?1",
+            params![id],
+            Self::row_to_reminder,
+        )
+        .map_err(|e| e.to_string())
     }
 
     pub fn append_chat_message(
@@ -844,6 +1330,38 @@ impl MemoryDb {
     }
 }
 
+/// Computes the next fire timestamp for recurring reminders in local civil time.
+/// Unix epoch (1970-01-01) was a Thursday (weekday 4 where Sun=0..Sat=6).
+fn advance_repeat_fire_ms(current_fire_ms: i64, rule: &str, now_ms: i64, tz_offset_ms: i64) -> i64 {
+    const DAY_MS: i64 = 86_400_000;
+    let mut next = current_fire_ms;
+    match rule {
+        "weekly" => {
+            while next <= now_ms {
+                next += 7 * DAY_MS;
+            }
+            next
+        }
+        "weekdays" => {
+            loop {
+                next += DAY_MS;
+                let local_days = (next + tz_offset_ms).div_euclid(DAY_MS);
+                let weekday = (local_days + 4).rem_euclid(7); // 0=Sun, 6=Sat
+                if next > now_ms && weekday != 0 && weekday != 6 {
+                    return next;
+                }
+            }
+        }
+        _ => {
+            // "daily"
+            while next <= now_ms {
+                next += DAY_MS;
+            }
+            next
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -969,6 +1487,100 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert!(all.iter().any(|c| c.id == id1 && c.message_count == 1));
         assert!(all.iter().any(|c| c.id == id2 && c.message_count == 0));
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_and_search_conversations_matches_message_content() {
+        let dir = temp_db_dir("rename_search");
+        let db = MemoryDb::open_at(dir.clone()).unwrap();
+
+        let c1 = db.create_conversation(Some("Morning chat")).unwrap();
+        let c2 = db.create_conversation(Some("Music hunt")).unwrap();
+        db.append_chat_message(c1.id, "user", "Let's debug WebView2 DPI scaling", None, None, None)
+            .unwrap();
+        db.append_chat_message(c2.id, "user", "Convert Jay Chou song to MP3", None, None, None)
+            .unwrap();
+
+        let renamed = db.rename_conversation(c1.id, "  WebView2 Notes  ").unwrap();
+        assert_eq!(renamed, "WebView2 Notes");
+
+        // Search by message body text not present in title
+        let hits = db.search_conversations("DPI scaling", 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, c1.id);
+        assert_eq!(hits[0].title, "WebView2 Notes");
+
+        // Search by title
+        let title_hits = db.search_conversations("Music", 20).unwrap();
+        assert_eq!(title_hits.len(), 1);
+        assert_eq!(title_hits[0].id, c2.id);
+        assert_eq!(db.get_conversation_title(c1.id).unwrap(), "WebView2 Notes");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pasted_image_pruner_removes_expired_entries_and_keeps_fresh() {
+        let dir = temp_db_dir("pasted_prune");
+        let pasted = dir.join("pasted");
+        std::fs::create_dir_all(&pasted).unwrap();
+        let sample = pasted.join("paste_test.png");
+        std::fs::write(&sample, b"fake-png").unwrap();
+
+        // With 7-day threshold, a newly written file must stay untouched
+        assert_eq!(MemoryDb::prune_expired_pasted_files(&pasted, 7 * 24 * 60 * 60), 0);
+        assert!(sample.exists());
+
+        // With 0-second threshold, it is cleanly pruned
+        assert_eq!(MemoryDb::prune_expired_pasted_files(&pasted, 0), 1);
+        assert!(!sample.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncate_bookmarks_and_reminders_roundtrip() {
+        let dir = temp_db_dir("stage123");
+        let db = MemoryDb::open_at(dir.clone()).unwrap();
+
+        // 1. Truncate conversation by 0-based user turn index
+        let conv = db.create_conversation(Some("Edit test")).unwrap();
+        db.append_chat_message(conv.id, "user", "first q", None, None, None).unwrap();
+        db.append_chat_message(conv.id, "assistant", "first a", None, None, None).unwrap();
+        db.append_chat_message(conv.id, "user", "second q", None, None, None).unwrap();
+        db.append_chat_message(conv.id, "assistant", "second a", None, None, None).unwrap();
+        let removed = db.truncate_conversation_by_user_index(conv.id, 1).unwrap();
+        assert_eq!(removed, 2);
+        let kept = db.list_chat_messages(conv.id, 10).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].content, "first q");
+        assert_eq!(kept[1].content, "first a");
+
+        // 2. Bookmarks upsert & delete
+        let bm = db.add_bookmark("Local App", "http://localhost:5173").unwrap();
+        let bm_upd = db.add_bookmark("Vite Dev", "http://localhost:5173").unwrap();
+        assert_eq!(bm.id, bm_upd.id);
+        assert_eq!(db.list_bookmarks().unwrap().len(), 1);
+        db.delete_bookmark(bm.id).unwrap();
+        assert!(db.list_bookmarks().unwrap().is_empty());
+
+        // 3. One-shot & recurring reminders
+        let base = 1_700_000_000_000i64;
+        let r_once = db.create_reminder("Drink water", base - 1000, None).unwrap();
+        let r_daily = db.create_reminder("Standup", base - 1000, Some("daily")).unwrap();
+        let fired = db.pop_due_reminders(base, 0).unwrap();
+        assert_eq!(fired.len(), 2);
+        let after = db.list_reminders(true).unwrap();
+        let once_after = after.iter().find(|r| r.id == r_once.id).unwrap();
+        let daily_after = after.iter().find(|r| r.id == r_daily.id).unwrap();
+        assert!(!once_after.enabled);
+        assert_eq!(once_after.fired_count, 1);
+        assert!(daily_after.enabled);
+        assert_eq!(daily_after.fire_at_ms, base - 1000 + 86_400_000);
 
         drop(db);
         let _ = std::fs::remove_dir_all(&dir);

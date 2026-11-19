@@ -2,6 +2,30 @@
 
 All notable changes to **Buddy** are documented in this file.
 
+## [0.3.0] - 2026-11-20
+
+### Added
+- **BuddyMobile Companion (Android APK + Mobile Web PWA + Cloudflare Directory)**:
+  - Built-in zero-dependency Desktop Mobile Bridge (`LAN` + `Tailscale` + one-click `cloudflared` HTTPS remote tunnel) with QR pairing, Bearer token auth, and SSE live event streaming.
+  - Pure-black desktop-aligned **BuddyMobile** mobile interface (`对话` / `记忆` / `连接` 3-tab dock with sliding pill indicator, directional page transitions, frameless living blinking Buddy eyes, on-demand PC desktop screen peek, full-screen 7-day screenshot viewer, one-tap native Android clipboard copy, and built-in APK auto-update checker).
+  - **Settings → Mobile** two-step QR guide (`① 下载手机端` / `② 扫码配对`) so first-time users can scan to download `BuddyMobile.apk` or launch the online mobile web app directly from the minimalist pure-black Buddy website.
+- **Large Window & Fullscreen Mode (Replaces Pin Toggle)**:
+  - Click the expand button on Buddy's expanded panel to enter a full desktop window (`1120×760` centered or maximized fullscreen) with smooth transition animations, Windows Taskbar / Alt+Tab visibility, and responsive desktop layouts across **Chat** (permanent history sidebar + centered `max-w-3xl` reading column), **7-Day Memory** (multi-column gallery + centered lightbox), **Plugins** (2-column `items-start` grid), and **Settings** (desktop left navigation rail).
+  - Compact Dynamic Island mode stays always-on-top and auto-collapses smoothly on blur.
+- **MCP Client (Stdio & HTTP) + Settings Integration**:
+  - Full Model Context Protocol client (`stdio` & Streamable `HTTP`) with JSON import, per-server tool inspection, trust controls, and automatic reconnection, organized cleanly under **Settings → MCP**.
+- **Persistent Scheduled Reminders**:
+  - Natural relative/absolute reminders (`20m`, `18:30`, daily/weekdays/weekly repeats) synced across Desktop Dynamic Island capsules and BuddyMobile push notifications.
+- **Cross-Device Conversation Sync & Source Badges**:
+  - Real-time `buddy://conversations-changed` sync so mobile chats immediately appear on Desktop Buddy without restarting, tagged with `📱` (mobile) and `💻` (desktop) source icons and empty-draft filtering.
+- **Chat Quality-of-Life Upgrades**:
+  - Inline user message edit & resend, copy/retry actions, native multi-file attachment picker, full-content conversation search & rename, Markdown export, and automatic 7-day cleanup for temporary pasted images.
+
+### Improved & Fixed
+- **Streamlined Chat Workspace**: Moved the 3-tier Agent Permission Switcher (`Ask / Default / Auto`) directly into the Chat top bar, moved Thinking Effort controls into **Settings → General**, and removed the manual built-in browser launcher button (while preserving autonomous Agent browser capabilities).
+- **Autonomous Long-Term Facts**: Kept Buddy's background `save_memory_fact` preference memory active while removing the manual Facts tab from both Desktop and Mobile Memory views for a cleaner 7-Day Memory & Reminders experience.
+- **Modular Codebase Refactor**: Split `agent_tools`, `plugins`, `screen_share`, `win32_sensors`, `commands`, `browser`, `mcp`, and `mobile_bridge` into focused submodules with full Rust & UI unit test coverage.
+
 ## [0.2.4] - 2026-11-19
 
 ### Added

@@ -1,0 +1,6 @@
+{
+  "versionCode": 4,
+  "versionName": "0.3.2",
+  "apkUrl": "https://buddy-companion.marcus-dev00.workers.dev/downloads/BuddyMobile.apk",
+  "notes": "手机端全面加入丝滑过渡动画：底部滑动胶囊、方向性页面切换、弹窗弹性入场与 Buddy 眨眼"
+}

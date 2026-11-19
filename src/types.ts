@@ -177,6 +177,7 @@ export interface ConversationSummary {
   id: number;
   title: string;
   message_count: number;
+  source?: "desktop" | "mobile" | string;
   created_at: number;
   updated_at: number;
 }
@@ -285,4 +286,98 @@ export interface GithubSkillCandidate {
   html_url: string;
   stars: number;
   is_repo: boolean;
+}
+
+export interface BrowserStatePayload {
+  active: boolean;
+  watching: boolean;
+  user_takeover: boolean;
+  navigating: boolean;
+  url: string;
+  title: string;
+  action_label: string;
+  needs_attention: boolean;
+  last_error: string;
+}
+
+export interface BrowserPreviewPayload {
+  data_url: string;
+  timestamp_ms: number;
+}
+
+export interface BrowserBookmark {
+  id: number;
+  title: string;
+  url: string;
+  created_at: number;
+}
+
+export interface ReminderItem {
+  id: number;
+  title: string;
+  fire_at_ms: number;
+  repeat_rule?: string | null;
+  enabled: boolean;
+  fired_count: number;
+  created_at: number;
+}
+
+export interface ReminderDuePayload {
+  id: number;
+  title: string;
+  repeat_rule?: string | null;
+  fired_at_ms: number;
+}
+
+export interface McpServerConfig {
+  id: string;
+  name: string;
+  transport: "stdio" | "http" | string;
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  url: string;
+  headers: Record<string, string>;
+  enabled: boolean;
+  trusted: boolean;
+}
+
+export interface McpToolInfo {
+  server_id: string;
+  server_name: string;
+  tool_name: string;
+  qualified_name: string;
+  description: string;
+  input_schema: Record<string, unknown>;
+  server_trusted: boolean;
+}
+
+export interface McpServerStatus {
+  config: McpServerConfig;
+  connected: boolean;
+  connecting: boolean;
+  tool_count: number;
+  tools: McpToolInfo[];
+  last_error?: string | null;
+}
+
+export interface MobileBridgeStatus {
+  enabled: boolean;
+  running: boolean;
+  port: number;
+  token: string;
+  pair_id: string;
+  device_name: string;
+  lan_url?: string | null;
+  tailscale_url?: string | null;
+  tunnel_url?: string | null;
+  tunnel_running: boolean;
+  tunnel_downloading: boolean;
+  tunnel_progress: number;
+  custom_remote_url: string;
+  directory_url: string;
+  effective_remote_url?: string | null;
+  pairing_payload: string;
+  connected_clients: number;
+  last_error?: string | null;
 }

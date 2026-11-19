@@ -80,6 +80,54 @@ pub async fn pick_files(
     .await
 }
 
+pub async fn save_file(
+    app: &AppHandle,
+    sensor_state: &Arc<AppSensorState>,
+    title: Option<String>,
+    default_name: Option<String>,
+    default_ext: Option<String>,
+    filter_name: Option<String>,
+    filter_spec: Option<String>,
+) -> Result<Option<String>, String> {
+    #[cfg(windows)]
+    {
+        let owner_raw: isize = app
+            .get_webview_window("main")
+            .and_then(|w| w.hwnd().ok())
+            .map(|h| h.0 as isize)
+            .unwrap_or(0);
+        let state = sensor_state.clone();
+        let cfg = SaveDialogConfig {
+            title,
+            default_name,
+            default_ext,
+            filter_name,
+            filter_spec,
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _guard = CollapseSuspendGuard::new(state);
+            let res = show_com_save_dialog(owner_raw, cfg);
+            let _ = tx.send(res);
+        });
+        rx.await
+            .map_err(|_| "Save dialog worker ended unexpectedly".to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (app, sensor_state, title, default_name, default_ext, filter_name, filter_spec);
+        Err("Native save dialog is currently implemented for Windows only".to_string())
+    }
+}
+
+struct SaveDialogConfig {
+    title: Option<String>,
+    default_name: Option<String>,
+    default_ext: Option<String>,
+    filter_name: Option<String>,
+    filter_spec: Option<String>,
+}
+
 struct OpenDialogConfig {
     folder: bool,
     multiple: bool,
@@ -242,6 +290,93 @@ fn show_com_open_dialog(owner_raw: isize, cfg: OpenDialogConfig) -> Result<Vec<S
             }
         }
         Ok(results)
+    }
+}
+
+#[cfg(windows)]
+fn show_com_save_dialog(owner_raw: isize, cfg: SaveDialogConfig) -> Result<Option<String>, String> {
+    use std::ffi::c_void;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
+    use windows::Win32::UI::Shell::{
+        FileSaveDialog, IFileSaveDialog, FOS_FORCEFILESYSTEM, FOS_NOCHANGEDIR,
+        FOS_OVERWRITEPROMPT, FOS_PATHMUSTEXIST,
+    };
+
+    struct ComInitGuard(bool);
+    impl Drop for ComInitGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    unsafe {
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let _com_guard = ComInitGuard(hr.is_ok());
+
+        let dialog: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_ALL)
+            .map_err(|e| format!("Failed to open Windows save dialog: {e}"))?;
+
+        let mut opts = dialog
+            .GetOptions()
+            .map_err(|e| format!("GetOptions failed: {e}"))?;
+        opts |= FOS_FORCEFILESYSTEM | FOS_NOCHANGEDIR | FOS_PATHMUSTEXIST | FOS_OVERWRITEPROMPT;
+        dialog
+            .SetOptions(opts)
+            .map_err(|e| format!("SetOptions failed: {e}"))?;
+
+        if let Some(title) = cfg.title.as_deref().filter(|s| !s.trim().is_empty()) {
+            let wide_title = to_wide_null(title);
+            let _ = dialog.SetTitle(PCWSTR(wide_title.as_ptr()));
+        }
+
+        if let Some(name) = cfg.default_name.as_deref().filter(|s| !s.trim().is_empty()) {
+            let wide_name = to_wide_null(name);
+            let _ = dialog.SetFileName(PCWSTR(wide_name.as_ptr()));
+        }
+
+        if let Some(ext) = cfg.default_ext.as_deref().filter(|s| !s.trim().is_empty()) {
+            let wide_ext = to_wide_null(ext);
+            let _ = dialog.SetDefaultExtension(PCWSTR(wide_ext.as_ptr()));
+        }
+
+        let _filter_buffers: Option<(Vec<u16>, Vec<u16>)> =
+            if let Some(spec) = cfg.filter_spec.as_deref().filter(|s| !s.trim().is_empty()) {
+                let label = cfg
+                    .filter_name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("Files");
+                let wide_name = to_wide_null(label);
+                let wide_spec = to_wide_null(spec);
+                let filters = [COMDLG_FILTERSPEC {
+                    pszName: PCWSTR(wide_name.as_ptr()),
+                    pszSpec: PCWSTR(wide_spec.as_ptr()),
+                }];
+                let _ = dialog.SetFileTypes(&filters);
+                Some((wide_name, wide_spec))
+            } else {
+                None
+            };
+
+        let owner = HWND(owner_raw as *mut c_void);
+        if let Err(err) = dialog.Show(owner) {
+            if err.code() == ERROR_CANCELLED.to_hresult() {
+                return Ok(None);
+            }
+            return Err(format!("Save dialog aborted: {err}"));
+        }
+
+        if let Ok(item) = dialog.GetResult() {
+            return Ok(extract_shell_item_path(&item));
+        }
+        Ok(None)
     }
 }
 

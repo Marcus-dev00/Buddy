@@ -3,14 +3,31 @@
 //! and approval-gated filesystem / shell mutations (`create_dir`, `write_file`, `edit_file`,
 //! `move_or_rename`, `copy_file`, `delete_path`, `run_shell`).
 
+mod schemas;
+mod security;
+mod web;
+
+pub use schemas::{
+    anthropic_tools_json, build_agent_system_appendix, gemini_tools_json, openai_tools_json,
+};
+#[allow(unused_imports)]
+pub use security::{
+    is_blocked_ip, resolve_user_path, user_home_dir, validate_public_url, AgentPermissionMode,
+};
+pub(crate) use security::check_path_allowed;
+use security::{approval_flags_for, is_dangerous_shell_command, ToolRiskKind};
+#[allow(unused_imports)]
+pub use web::{
+    execute_fetch_web_page, execute_web_search, html_to_readable_text, parse_ddg_html,
+};
+
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 use tokio::sync::oneshot;
 
 #[cfg(windows)]
@@ -99,129 +116,6 @@ pub struct ToolExecutionPlan {
     pub is_destructive: bool,
 }
 
-pub fn user_home_dir() -> PathBuf {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("C:\\"))
-}
-
-pub fn resolve_user_path(raw: &str, workspace_hint: Option<&Path>) -> Result<PathBuf, String> {
-    let trimmed = raw.trim().trim_matches('"');
-    if trimmed.is_empty() {
-        return Ok(workspace_hint
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(user_home_dir));
-    }
-
-    let home = user_home_dir();
-    let lower = trimmed.to_ascii_lowercase();
-
-    let expanded = if trimmed == "~" {
-        home
-    } else if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
-        home.join(rest)
-    } else if lower == "desktop" || lower.starts_with("desktop\\") || lower.starts_with("desktop/") {
-        let rest = &trimmed[7..].trim_start_matches(['\\', '/']);
-        if rest.is_empty() {
-            home.join("Desktop")
-        } else {
-            home.join("Desktop").join(rest)
-        }
-    } else if lower == "documents"
-        || lower.starts_with("documents\\")
-        || lower.starts_with("documents/")
-    {
-        let rest = &trimmed[9..].trim_start_matches(['\\', '/']);
-        if rest.is_empty() {
-            home.join("Documents")
-        } else {
-            home.join("Documents").join(rest)
-        }
-    } else if lower == "downloads"
-        || lower.starts_with("downloads\\")
-        || lower.starts_with("downloads/")
-    {
-        let rest = &trimmed[9..].trim_start_matches(['\\', '/']);
-        if rest.is_empty() {
-            home.join("Downloads")
-        } else {
-            home.join("Downloads").join(rest)
-        }
-    } else {
-        let p = PathBuf::from(trimmed);
-        if p.is_absolute() {
-            p
-        } else if let Some(base) = workspace_hint {
-            base.join(p)
-        } else {
-            home.join(p)
-        }
-    };
-
-    Ok(normalize_lexical(&expanded))
-}
-
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !matches!(
-                    out.components().next_back(),
-                    Some(Component::Prefix(_)) | Some(Component::RootDir) | None
-                ) {
-                    out.pop();
-                }
-            }
-            c => out.push(c.as_os_str()),
-        }
-    }
-    out
-}
-
-fn is_blocked_path(path: &Path, is_write: bool) -> bool {
-    let s = path.to_string_lossy().to_ascii_lowercase().replace('/', "\\");
-    let blocked_prefixes = [
-        "c:\\windows",
-        "c:\\$recycle.bin",
-        "c:\\system volume information",
-    ];
-    if blocked_prefixes.iter().any(|p| s == *p || s.starts_with(&format!("{p}\\"))) {
-        return true;
-    }
-    if is_write {
-        let write_protected = ["c:\\program files", "c:\\program files (x86)"];
-        if write_protected
-            .iter()
-            .any(|p| s == *p || s.starts_with(&format!("{p}\\")))
-        {
-            return true;
-        }
-    }
-    let sensitive_fragments = [
-        "\\buddy\\secret.dpapi",
-        "\\.ssh\\",
-        "\\.gnupg\\",
-        "\\.aws\\credentials",
-    ];
-    if sensitive_fragments.iter().any(|f| s.contains(f) || s.ends_with(f.trim_end_matches('\\'))) {
-        return true;
-    }
-    false
-}
-
-pub(crate) fn check_path_allowed(path: &Path, is_write: bool) -> Result<(), String> {
-    if is_blocked_path(path, is_write) {
-        return Err(format!(
-            "Access blocked for protected OS or credential path: {}",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
@@ -241,7 +135,7 @@ fn should_skip_dir_name(name: &str) -> bool {
     )
 }
 
-fn truncate_chars(s: &str, max_chars: usize) -> String {
+pub(super) fn truncate_chars(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars).collect();
     if s.chars().count() > max_chars {
         out.push_str("\n...[truncated]");
@@ -271,317 +165,6 @@ fn decode_text_lossy(bytes: &[u8]) -> Result<String, String> {
         .or_else(|_| Ok(String::from_utf8_lossy(bytes).into_owned()))
 }
 
-/// Canonical tool definitions for OpenAI, Anthropic, and Gemini schemas.
-fn raw_tool_definitions(include_media_downloader: bool) -> Vec<(&'static str, &'static str, Value)> {
-    let mut defs = vec![
-        (
-            "list_dir",
-            "List files and folders inside a directory on Windows. Supports `~`, `Desktop`, `Documents`, `Downloads`, or absolute paths.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Directory path to list." },
-                    "recursive": { "type": "boolean", "description": "Whether to traverse subdirectories (default false)." },
-                    "max_depth": { "type": "integer", "description": "Max depth when recursive=true (default 2, max 4)." }
-                },
-                "required": ["path"]
-            }),
-        ),
-        (
-            "find_files",
-            "Search for files or directories under `root` whose names contain `query` (case-insensitive) or match `*` wildcards.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "root": { "type": "string", "description": "Starting directory path." },
-                    "query": { "type": "string", "description": "Filename substring or pattern (e.g. '*.pdf', 'invoice')." }
-                },
-                "required": ["root", "query"]
-            }),
-        ),
-        (
-            "search_text",
-            "Search inside plain text/code/markdown/csv/json files under `root` for a text substring (case-insensitive).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "root": { "type": "string", "description": "Directory or file path to search in." },
-                    "query": { "type": "string", "description": "Text to search for." },
-                    "extension": { "type": "string", "description": "Optional extension filter without dot, e.g. 'md', 'rs', 'csv'." }
-                },
-                "required": ["root", "query"]
-            }),
-        ),
-        (
-            "read_file",
-            "Read a text file with 1-based line numbers. Supports line ranges so large files can be read in chunks.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path to read." },
-                    "start_line": { "type": "integer", "description": "Optional 1-based start line (default 1)." },
-                    "end_line": { "type": "integer", "description": "Optional 1-based end line (default start_line + 200)." }
-                },
-                "required": ["path"]
-            }),
-        ),
-        (
-            "create_dir",
-            "Create a directory (and missing parent directories). Requires user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Directory path to create." }
-                },
-                "required": ["path"]
-            }),
-        ),
-        (
-            "write_file",
-            "Create a new text file or overwrite an existing one (set overwrite=true to replace an existing file). Requires user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Destination file path." },
-                    "content": { "type": "string", "description": "Full text content to write." },
-                    "overwrite": { "type": "boolean", "description": "Must be true if replacing an existing file." }
-                },
-                "required": ["path", "content"]
-            }),
-        ),
-        (
-            "edit_file",
-            "Edit an existing text file by replacing an exact `target` substring with `replacement`. Requires user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path to modify." },
-                    "target": { "type": "string", "description": "Exact existing text block to replace (must match uniquely)." },
-                    "replacement": { "type": "string", "description": "Replacement text." }
-                },
-                "required": ["path", "target", "replacement"]
-            }),
-        ),
-        (
-            "move_or_rename",
-            "Move or rename a file or directory. Creates destination parent directory if needed. Requires user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "description": "Existing source file or directory path." },
-                    "destination": { "type": "string", "description": "New file or directory path." }
-                },
-                "required": ["source", "destination"]
-            }),
-        ),
-        (
-            "copy_file",
-            "Copy a file to a new destination path. Requires user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "description": "Source file path." },
-                    "destination": { "type": "string", "description": "Destination file path." }
-                },
-                "required": ["source", "destination"]
-            }),
-        ),
-        (
-            "delete_path",
-            "Send a file or folder safely to the Windows Recycle Bin. Always requires individual user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File or directory path to move to the Recycle Bin." }
-                },
-                "required": ["path"]
-            }),
-        ),
-        (
-            "run_shell",
-            "Run a Windows PowerShell command (e.g. for batch operations, archives, scripts, PDF/Office extraction via Python/PowerShell). Always requires individual user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string", "description": "PowerShell command or script snippet to execute." },
-                    "working_dir": { "type": "string", "description": "Optional working directory path." }
-                },
-                "required": ["command"]
-            }),
-        ),
-        (
-            "list_installed_skills",
-            "List all Agent Skills installed in Buddy's local skill directory (`%LOCALAPPDATA%/Buddy/skills/`), including enabled state and descriptions.",
-            json!({
-                "type": "object",
-                "properties": {}
-            }),
-        ),
-        (
-            "read_skill",
-            "Load the full `SKILL.md` instructions and file list of an installed Agent Skill by its `id` or `name` before executing it.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "skill_id": { "type": "string", "description": "Skill ID or name." }
-                },
-                "required": ["skill_id"]
-            }),
-        ),
-        (
-            "search_github_skills",
-            "Search GitHub for Agent Skill repositories (by keywords), or pass an `owner/repo` / GitHub URL to discover all `SKILL.md` subfolders inside that repo.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Search keywords (e.g. 'pdf', 'ocr') OR GitHub repo (`owner/repo` / URL)." }
-                },
-                "required": ["query"]
-            }),
-        ),
-        (
-            "install_github_skill",
-            "Download and install an Agent Skill from GitHub (`owner/repo` or `https://github.com/owner/repo/tree/<branch>/<subpath>`) into Buddy's skills directory. Always requires user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "description": "GitHub repository or subfolder URL containing `SKILL.md`." }
-                },
-                "required": ["source"]
-            }),
-        ),
-        (
-            "offline_ocr",
-            "Extract text from a screenshot or image file using fast Windows native offline OCR (zero AI cost). Use this when the user asks to OCR/extract text from an image or invokes `/ocr`.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "source": { "type": "string", "description": "Path to the image file (or screenshot path from attachments)." }
-                },
-                "required": ["source"]
-            }),
-        ),
-        (
-            "search_memories",
-            "Search Buddy's SQLite memory database (saved long-term facts, clipboard text/snippets, and screenshot records) by keywords.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Search keywords." },
-                    "limit": { "type": "integer", "description": "Max items to return (default 8, max 20)." }
-                },
-                "required": ["query"]
-            }),
-        ),
-        (
-            "save_memory_fact",
-            "Persist an important long-term user fact, preference, stack choice, or project detail into permanent memory (exempt from 7-day cleanup).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "content": { "type": "string", "description": "Concise self-contained fact worth remembering across sessions." },
-                    "category": { "type": "string", "description": "Short tag: preference | project | workflow | general." }
-                },
-                "required": ["content"]
-            }),
-        ),
-        (
-            "web_search",
-            "Search the public web for up-to-date facts, docs, releases, or answers (read-only).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "query": { "type": "string", "description": "Web search query." },
-                    "limit": { "type": "integer", "description": "Max results (default 5, max 8)." }
-                },
-                "required": ["query"]
-            }),
-        ),
-        (
-            "fetch_web_page",
-            "Fetch a public http:// or https:// web page and extract readable plain text (SSRF-protected against localhost/LAN URLs).",
-            json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "description": "Public http:// or https:// URL." },
-                    "max_chars": { "type": "integer", "description": "Maximum text characters to return (default 8000, max 16000)." }
-                },
-                "required": ["url"]
-            }),
-        ),
-    ];
-
-    if include_media_downloader {
-        defs.push((
-            "download_media",
-            "Download audio or video from a URL (YouTube, Bilibili, SoundCloud, etc.) using Buddy's yt-dlp + FFmpeg plugin. Prefer 'audio_best' (zero re-encode original audio stream, no secondary loss) or 'audio_flac' (lossless FLAC) for highest audio fidelity, 'mp4_lossless' (zero re-encode stream copy MP4) for video, or 'audio_mp3' (320kbps MP3) when explicit MP3 compatibility is requested. Always requires user approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "url": { "type": "string", "description": "Full http:// or https:// media/music URL." },
-                    "format": {
-                        "type": "string",
-                        "enum": ["audio_best", "mp4_lossless", "audio_flac", "audio_mp3"],
-                        "description": "Output mode. Use audio_best for zero secondary loss original audio, audio_flac for lossless FLAC, mp4_lossless for zero re-encode MP4 video, or audio_mp3 for 320kbps MP3."
-                    },
-                    "output_dir": {
-                        "type": "string",
-                        "description": "Optional target directory (defaults to Windows Downloads folder)."
-                    }
-                },
-                "required": ["url", "format"]
-            }),
-        ));
-    }
-
-    defs
-}
-
-pub fn openai_tools_json(include_media_downloader: bool) -> Value {
-    let arr: Vec<Value> = raw_tool_definitions(include_media_downloader)
-        .into_iter()
-        .map(|(name, desc, params)| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": desc,
-                    "parameters": params
-                }
-            })
-        })
-        .collect();
-    Value::Array(arr)
-}
-
-pub fn anthropic_tools_json(include_media_downloader: bool) -> Value {
-    let arr: Vec<Value> = raw_tool_definitions(include_media_downloader)
-        .into_iter()
-        .map(|(name, desc, params)| {
-            json!({
-                "name": name,
-                "description": desc,
-                "input_schema": params
-            })
-        })
-        .collect();
-    Value::Array(arr)
-}
-
-pub fn gemini_tools_json(include_media_downloader: bool) -> Value {
-    let decls: Vec<Value> = raw_tool_definitions(include_media_downloader)
-        .into_iter()
-        .map(|(name, desc, params)| {
-            json!({
-                "name": name,
-                "description": desc,
-                "parameters": params
-            })
-        })
-        .collect();
-    json!([{ "functionDeclarations": decls }])
-}
-
 fn short_path_label(path: &Path) -> String {
     let s = path.to_string_lossy();
     let chars: Vec<char> = s.chars().collect();
@@ -590,186 +173,6 @@ fn short_path_label(path: &Path) -> String {
     }
     let tail: String = chars[chars.len() - 36..].iter().collect();
     format!("...{tail}")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentPermissionMode {
-    Ask,
-    Default,
-    Auto,
-}
-
-impl AgentPermissionMode {
-    pub fn from_str(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "ask" => Self::Ask,
-            "auto" => Self::Auto,
-            _ => Self::Default,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolRiskKind {
-    ReadOnly,
-    ReversibleWrite,
-    ExternalSideEffect,
-    DangerousOrDelete,
-}
-
-fn approval_flags_for(mode: AgentPermissionMode, risk: ToolRiskKind) -> (bool, bool, bool) {
-    let is_destructive = risk == ToolRiskKind::DangerousOrDelete;
-    match (mode, risk) {
-        (_, ToolRiskKind::ReadOnly) => (false, false, false),
-        (
-            AgentPermissionMode::Ask,
-            ToolRiskKind::ReversibleWrite
-            | ToolRiskKind::ExternalSideEffect
-            | ToolRiskKind::DangerousOrDelete,
-        ) => (true, false, is_destructive),
-        (AgentPermissionMode::Default, ToolRiskKind::ReversibleWrite) => (true, true, false),
-        (
-            AgentPermissionMode::Default,
-            ToolRiskKind::ExternalSideEffect | ToolRiskKind::DangerousOrDelete,
-        ) => (true, false, is_destructive),
-        (
-            AgentPermissionMode::Auto,
-            ToolRiskKind::ReversibleWrite | ToolRiskKind::ExternalSideEffect,
-        ) => (false, false, false),
-        (AgentPermissionMode::Auto, ToolRiskKind::DangerousOrDelete) => (true, false, true),
-    }
-}
-
-fn is_dangerous_shell_command(cmd: &str) -> bool {
-    let normalized: String = cmd
-        .to_ascii_lowercase()
-        .replace('`', "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.is_empty() {
-        return true;
-    }
-
-    const SUBSTR_PATTERNS: &[&str] = &[
-        "remove-item",
-        "clear-content",
-        "clear-item",
-        "remove-itemproperty",
-        "set-itemproperty",
-        "new-itemproperty",
-        "stop-process",
-        "stop-service",
-        "set-service",
-        "remove-service",
-        "restart-computer",
-        "stop-computer",
-        "format-volume",
-        "format-disk",
-        "clear-disk",
-        "remove-partition",
-        "invoke-expression",
-        "-encodedcommand",
-        "frombase64string",
-        "start-bitstransfer",
-        "file]::delete",
-        "directory]::delete",
-        ".delete(",
-        "os.remove",
-        "os.unlink",
-        "shutil.rmtree",
-        "fs.unlink",
-        "fs.rm",
-        "rmsync",
-        "rmdirsync",
-        "unlinksync",
-        "uninstall-package",
-        "uninstall-module",
-        "winget uninstall",
-        "npm uninstall",
-        "pip uninstall",
-        "cargo clean",
-        "git clean",
-        "git reset --hard",
-        "git push",
-        "git branch -d",
-        "git checkout --",
-        "git restore",
-        "git rebase",
-        "reg delete",
-        "reg add",
-        "reg import",
-        "reg restore",
-        "-verb runas",
-        "-verb 'runas'",
-        "-verb \"runas\"",
-        " -force",
-        " --force",
-    ];
-    if SUBSTR_PATTERNS.iter().any(|p| normalized.contains(p)) {
-        return true;
-    }
-    if normalized.contains("cipher") && normalized.contains("/w") {
-        return true;
-    }
-    if normalized.contains(" -enc ") || normalized.ends_with(" -enc") {
-        return true;
-    }
-
-    const DANGEROUS_CMDS: &[&str] = &[
-        "rm",
-        "del",
-        "erase",
-        "rd",
-        "rmdir",
-        "ri",
-        "clc",
-        "kill",
-        "taskkill",
-        "shutdown",
-        "logoff",
-        "diskpart",
-        "bcdedit",
-        "vssadmin",
-        "wbadmin",
-        "reg",
-        "regedit",
-        "schtasks",
-        "netsh",
-        "net",
-        "icacls",
-        "takeown",
-        "iex",
-        "runas",
-        "format",
-        "sfc",
-        "dism",
-        "sc",
-    ];
-
-    for segment in normalized.split(|c| matches!(c, ';' | '|' | '&' | '\n' | '\r' | '(' | '{')) {
-        let mut iter = segment.split_whitespace().peekable();
-        // Skip shell wrappers / invocation prefixes to inspect the actual verb
-        while let Some(raw_tok) = iter.peek().copied() {
-            let tok = raw_tok
-                .trim_matches(|c| matches!(c, '\'' | '"' | '.'))
-                .trim_end_matches(".exe");
-            if matches!(
-                tok,
-                "" | "cmd" | "powershell" | "pwsh" | "/c" | "/k" | "-c" | "-command" | "-noprofile"
-                    | "-nologo" | "-noninteractive" | "sudo"
-            ) {
-                iter.next();
-                continue;
-            }
-            if DANGEROUS_CMDS.contains(&tok) {
-                return true;
-            }
-            break;
-        }
-    }
-
-    false
 }
 
 fn make_plan(
@@ -1095,6 +498,91 @@ pub fn plan_tool_execution(
                 ToolRiskKind::ReadOnly,
             )
         }
+        "browser_open" => {
+            let url = args["url"].as_str().unwrap_or("");
+            make_plan(
+                format!("Browser open `{}`", truncate_chars(url, 38)),
+                Some(url.to_string()),
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
+        }
+        "browser_read" => make_plan(
+            "Browser read page".to_string(),
+            None,
+            permission_mode,
+            ToolRiskKind::ReadOnly,
+        ),
+        "browser_click" => {
+            let t = args["target"].as_str().unwrap_or("");
+            make_plan(
+                format!("Browser click `{}`", truncate_chars(t, 34)),
+                Some(format!("Target element: {t}")),
+                permission_mode,
+                ToolRiskKind::ReversibleWrite,
+            )
+        }
+        "browser_type" => {
+            let t = args["target"].as_str().unwrap_or("");
+            let txt = args["text"].as_str().unwrap_or("");
+            make_plan(
+                format!("Browser type into `{}`", truncate_chars(t, 28)),
+                Some(format!("Target: {t}\nText: {}", truncate_chars(txt, 140))),
+                permission_mode,
+                ToolRiskKind::ReversibleWrite,
+            )
+        }
+        "browser_scroll" => {
+            let dir = args["direction"].as_str().unwrap_or("down");
+            make_plan(
+                format!("Browser scroll {dir}"),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
+        }
+        "browser_screenshot" => make_plan(
+            "Browser capture view".to_string(),
+            None,
+            permission_mode,
+            ToolRiskKind::ReadOnly,
+        ),
+        "browser_console" => make_plan(
+            "Read browser console logs".to_string(),
+            None,
+            permission_mode,
+            ToolRiskKind::ReadOnly,
+        ),
+        "browser_close" => make_plan(
+            "Close built-in browser".to_string(),
+            None,
+            permission_mode,
+            ToolRiskKind::ReadOnly,
+        ),
+        "create_reminder" => {
+            let title = args["title"].as_str().unwrap_or("Reminder");
+            make_plan(
+                format!("Set reminder `{}`", truncate_chars(title, 34)),
+                None,
+                permission_mode,
+                ToolRiskKind::ReadOnly,
+            )
+        }
+        "list_reminders" => make_plan(
+            "List reminders".to_string(),
+            None,
+            permission_mode,
+            ToolRiskKind::ReadOnly,
+        ),
+        "delete_reminder" => {
+            let id = args["id"].as_i64().unwrap_or(0);
+            make_plan(
+                format!("Delete reminder #{id}"),
+                None,
+                permission_mode,
+                ToolRiskKind::ReversibleWrite,
+            )
+        }
         "download_media" => {
             let url = args["url"].as_str().unwrap_or("");
             let fmt = args["format"].as_str().unwrap_or("audio_best");
@@ -1111,6 +599,23 @@ pub fn plan_tool_execution(
                 Some(format!("URL: {}\nFormat: {fmt}\nSave to: {dir_note}", truncate_chars(url, 180))),
                 permission_mode,
                 ToolRiskKind::ExternalSideEffect,
+            )
+        }
+        other if other.starts_with("mcp__") => {
+            let parts: Vec<&str> = other.splitn(3, "__").collect();
+            let (srv, tool) = if parts.len() == 3 {
+                (parts[1], parts[2])
+            } else {
+                ("mcp", other)
+            };
+            let args_preview = serde_json::to_string_pretty(args)
+                .ok()
+                .map(|s| truncate_chars(&s, 280));
+            make_plan(
+                format!("MCP [{srv}]: `{tool}`"),
+                args_preview,
+                permission_mode,
+                ToolRiskKind::ReversibleWrite,
             )
         }
         other => make_plan(
@@ -1742,457 +1247,10 @@ fn encode_powershell_utf16_base64(script: &str) -> String {
     B64.encode(&utf16_bytes)
 }
 
-pub fn build_agent_system_appendix(workspace_cfg: &str, media_downloader_ready: bool) -> String {
-    let home = user_home_dir();
-    let desktop = home.join("Desktop");
-    let documents = home.join("Documents");
-    let downloads = home.join("Downloads");
-    let ws_line = if workspace_cfg.trim().is_empty() {
-        format!("- Default Workspace: {} (and any dragged paths)", home.display())
-    } else {
-        format!("- Configured Workspace: {}", workspace_cfg.trim())
-    };
-    let media_line = if media_downloader_ready {
-        "\n- Enabled Plugin Tool: `download_media` (yt-dlp + FFmpeg) is active! When user sends a music/video link and asks to save/download audio/MP3/FLAC/MP4, explain briefly whether original stream avoids secondary loss if helpful and call `download_media`."
-    } else {
-        ""
-    };
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    format!(
-        "\n\n---\n\n# Desktop Agent Mode (Auto)\n\
-         You have local Windows file & PowerShell tools (`list_dir`, `find_files`, `search_text`, `read_file`, `create_dir`, `write_file`, `edit_file`, `move_or_rename`, `copy_file`, `delete_path`, `run_shell`), persistent memory tools (`search_memories`, `save_memory_fact`), and read-only web tools (`web_search`, `fetch_web_page`).{media_line}\n\
-         - User Profile: `{}`\n\
-         - Desktop: `{}` | Documents: `{}` | Downloads: `{}`\n\
-         {}\n\
-         - Epoch Seconds: {ts}\n\
-         - Operating Protocol:\n\
-           1. **Ask & Clarify First**: Before modifying files or committing to complex actions, clarify ambiguous goals, preferences, or constraints so you truly understand what the user wants.\n\
-           2. **Push Back Honestly**: If the user's request relies on wrong facts, strange contradictions, or very hard/impractical assumptions, tell them candidly and explain why instead of blindly agreeing.\n\
-           3. **Auto Judgment**: Conversational Q&A -> reply directly; clear well-scoped file task -> inspect with read tools first, then execute cleanly (mutations pause for user approval cards).\n\
-           4. **Truthfulness**: Never fabricate paths, outputs, or claim success for rejected, blocked, or failed actions.",
-        home.display(),
-        desktop.display(),
-        documents.display(),
-        downloads.display(),
-        ws_line
-    )
-}
-
-// ============================================================================
-// SSRF-Safe Web Read / Search Helpers
-// ============================================================================
-
-fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
-    let oct = ip.octets();
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        // CGNAT 100.64.0.0/10
-        || (oct[0] == 100 && (oct[1] & 0b1100_0000) == 64)
-        // Reserved / protocol / bench ranges
-        || (oct[0] == 192 && oct[1] == 0 && oct[2] == 0)
-        || (oct[0] == 198 && (oct[1] == 18 || oct[1] == 19))
-        || oct[0] >= 240
-}
-
-fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_blocked_ipv4(v4);
-    }
-    let seg0 = ip.segments()[0];
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
-        || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
-}
-
-pub fn is_blocked_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_blocked_ipv4(v4),
-        IpAddr::V6(v6) => is_blocked_ipv6(v6),
-    }
-}
-
-pub fn validate_public_url(raw_url: &str, resolve_dns: bool) -> Result<reqwest::Url, String> {
-    let trimmed = raw_url.trim();
-    let parsed = reqwest::Url::parse(trimmed).map_err(|e| format!("Invalid URL: {e}"))?;
-    let scheme = parsed.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(format!("Blocked non-HTTP URL scheme: {scheme}"));
-    }
-    let host_raw = parsed
-        .host_str()
-        .ok_or_else(|| "URL has no host".to_string())?;
-    let host = host_raw.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
-    if host.is_empty()
-        || host == "localhost"
-        || host.ends_with(".localhost")
-        || host.ends_with(".local")
-        || host.ends_with(".internal")
-        || host.ends_with(".lan")
-    {
-        return Err(format!("Blocked local/private host: {host}"));
-    }
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        if is_blocked_ip(ip) {
-            return Err(format!("Blocked non-public IP: {ip}"));
-        }
-        return Ok(parsed);
-    }
-    if !host.contains('.') {
-        return Err(format!("Blocked single-label intranet host: {host}"));
-    }
-    if resolve_dns {
-        let port = parsed.port_or_known_default().unwrap_or(80);
-        let addrs: Vec<_> = (host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|e| format!("DNS resolution failed for `{host}`: {e}"))?
-            .collect();
-        if addrs.is_empty() {
-            return Err(format!("No DNS addresses resolved for `{host}`"));
-        }
-        for sa in addrs {
-            if is_blocked_ip(sa.ip()) {
-                return Err(format!(
-                    "Blocked host `{host}` resolving to private/local IP {}",
-                    sa.ip()
-                ));
-            }
-        }
-    }
-    Ok(parsed)
-}
-
-fn strip_tag_block(html: &str, tag: &str) -> String {
-    let lower = html.to_ascii_lowercase();
-    let open_pat = format!("<{tag}");
-    let close_pat = format!("</{tag}>");
-    let mut out = String::with_capacity(html.len());
-    let mut i = 0usize;
-    while i < html.len() {
-        if let Some(rel_start) = lower[i..].find(&open_pat) {
-            let abs_start = i + rel_start;
-            out.push_str(&html[i..abs_start]);
-            if let Some(rel_end) = lower[abs_start..].find(&close_pat) {
-                i = abs_start + rel_end + close_pat.len();
-            } else {
-                break;
-            }
-        } else {
-            out.push_str(&html[i..]);
-            break;
-        }
-    }
-    out
-}
-
-fn decode_basic_entities(text: &str) -> String {
-    text.replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&#x27;", "'")
-}
-
-pub fn html_to_readable_text(html: &str, max_chars: usize) -> String {
-    let mut cleaned = strip_tag_block(html, "script");
-    cleaned = strip_tag_block(&cleaned, "style");
-    cleaned = strip_tag_block(&cleaned, "noscript");
-    cleaned = strip_tag_block(&cleaned, "svg");
-
-    let mut plain = String::with_capacity(cleaned.len() / 2);
-    let mut in_tag = false;
-    let mut tag_buf = String::new();
-    for ch in cleaned.chars() {
-        if in_tag {
-            if ch == '>' {
-                in_tag = false;
-                let tag_lower = tag_buf.trim().to_ascii_lowercase();
-                let name = tag_lower
-                    .trim_start_matches('/')
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("");
-                if matches!(
-                    name,
-                    "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "section" | "article"
-                ) {
-                    plain.push('\n');
-                }
-                tag_buf.clear();
-            } else if tag_buf.len() < 40 {
-                tag_buf.push(ch);
-            }
-        } else if ch == '<' {
-            in_tag = true;
-            tag_buf.clear();
-        } else {
-            plain.push(ch);
-        }
-    }
-
-    let decoded = decode_basic_entities(&plain);
-    let mut lines = Vec::new();
-    for raw_line in decoded.lines() {
-        let collapsed = raw_line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !collapsed.is_empty() {
-            lines.push(collapsed);
-        }
-    }
-    truncate_chars(&lines.join("\n"), max_chars)
-}
-
-fn url_encode_query(q: &str) -> String {
-    let mut out = String::with_capacity(q.len() * 2);
-    for b in q.as_bytes() {
-        match *b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char);
-            }
-            b' ' => out.push('+'),
-            other => {
-                out.push('%');
-                out.push_str(&format!("{other:02X}"));
-            }
-        }
-    }
-    out
-}
-
-fn percent_decode_lossy(raw: &str) -> String {
-    let bytes = raw.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3]) {
-                if let Ok(val) = u8::from_str_radix(hex, 16) {
-                    out.push(val);
-                    i += 3;
-                    continue;
-                }
-            }
-        } else if bytes[i] == b'+' {
-            out.push(b' ');
-            i += 1;
-            continue;
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn extract_attr(tag: &str, attr: &str) -> Option<String> {
-    let needle = format!("{attr}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let end = tag[start..].find('"')? + start;
-    Some(decode_basic_entities(&tag[start..end]))
-}
-
-fn clean_ddg_href(raw_href: &str) -> String {
-    let normalized = if raw_href.starts_with("//") {
-        format!("https:{raw_href}")
-    } else {
-        raw_href.to_string()
-    };
-    if let Some(pos) = normalized.find("uddg=") {
-        let rest = &normalized[pos + 5..];
-        let end = rest.find('&').unwrap_or(rest.len());
-        return percent_decode_lossy(&rest[..end]);
-    }
-    normalized
-}
-
-pub fn parse_ddg_html(html: &str, limit: usize) -> Vec<(String, String, String)> {
-    let mut results = Vec::new();
-    let mut cursor = 0usize;
-    while results.len() < limit {
-        let Some(pos) = html[cursor..].find("result__a") else {
-            break;
-        };
-        let marker = cursor + pos;
-        let a_start = html[..marker].rfind("<a").unwrap_or(marker);
-        let Some(tag_end_rel) = html[a_start..].find('>') else {
-            break;
-        };
-        let tag_end = a_start + tag_end_rel;
-        let a_tag = &html[a_start..=tag_end];
-        let Some(close_rel) = html[tag_end + 1..].find("</a>") else {
-            break;
-        };
-        let title_raw = &html[tag_end + 1..tag_end + 1 + close_rel];
-        let title = html_to_readable_text(title_raw, 180);
-        let url = extract_attr(a_tag, "href")
-            .map(|h| clean_ddg_href(&h))
-            .unwrap_or_default();
-
-        let after_link = tag_end + 1 + close_rel + 4;
-        let window_end = (after_link + 2000).min(html.len());
-        let snippet = if let Some(sp) = html[after_link..window_end].find("result__snippet") {
-            let s_pos = after_link + sp;
-            if let Some(gt) = html[s_pos..window_end].find('>') {
-                let body_start = s_pos + gt + 1;
-                let end_tag = html[body_start..window_end]
-                    .find("</a>")
-                    .or_else(|| html[body_start..window_end].find("</div>"))
-                    .unwrap_or((window_end - body_start).min(400));
-                html_to_readable_text(&html[body_start..body_start + end_tag], 260)
-            } else {
-                String::new()
-            }
-        } else {
-            String::new()
-        };
-
-        if !title.is_empty() && url.starts_with("http") {
-            results.push((title, url, snippet));
-        }
-        cursor = after_link;
-    }
-    results
-}
-
-pub async fn execute_web_search(query: &str, limit: usize) -> Result<String, String> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return Err("`query` cannot be empty".to_string());
-    }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
-
-    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode_query(trimmed));
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("Web search request failed: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("Web search HTTP {status}"));
-    }
-    let html = resp
-        .text()
-        .await
-        .map_err(|e| format!("Failed reading search response: {e}"))?;
-    let hits = parse_ddg_html(&html, limit.clamp(1, 8));
-    if hits.is_empty() {
-        return Ok(format!("No web search results extracted for `{trimmed}`."));
-    }
-    let formatted = hits
-        .into_iter()
-        .enumerate()
-        .map(|(idx, (title, link, snippet))| {
-            if snippet.is_empty() {
-                format!("{}. **{}**\n   {}", idx + 1, title, link)
-            } else {
-                format!("{}. **{}**\n   {}\n   {}", idx + 1, title, link, snippet)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    Ok(formatted)
-}
-
-pub async fn execute_fetch_web_page(raw_url: &str, max_chars: usize) -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(18))
-        .redirect(reqwest::redirect::Policy::none())
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) BuddyDesktop/1.0")
-        .build()
-        .map_err(|e| format!("HTTP client error: {e}"))?;
-
-    let mut current = validate_public_url(raw_url, true)?;
-    let mut final_resp = None;
-
-    for _hop in 0..=3 {
-        let resp = client
-            .get(current.clone())
-            .send()
-            .await
-            .map_err(|e| format!("Fetch failed: {e}"))?;
-        if resp.status().is_redirection() {
-            let loc = resp
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| "Redirect missing Location header".to_string())?;
-            let next_url = current
-                .join(loc)
-                .map_err(|e| format!("Invalid redirect URL: {e}"))?;
-            current = validate_public_url(next_url.as_str(), true)?;
-            continue;
-        }
-        final_resp = Some(resp);
-        break;
-    }
-
-    let resp = final_resp.ok_or_else(|| "Too many redirects".to_string())?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("HTTP {status} from {current}"));
-    }
-
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !content_type.is_empty()
-        && !content_type.contains("text/")
-        && !content_type.contains("json")
-        && !content_type.contains("xml")
-        && !content_type.contains("javascript")
-    {
-        return Err(format!("Unsupported binary content type: {content_type}"));
-    }
-
-    const MAX_BODY_BYTES: usize = 1_500_000;
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("Failed reading response body: {e}"))?;
-    let slice = if bytes.len() > MAX_BODY_BYTES {
-        &bytes[..MAX_BODY_BYTES]
-    } else {
-        &bytes[..]
-    };
-    let raw_text = String::from_utf8_lossy(slice);
-    let cap = max_chars.clamp(500, 16_000);
-    let body = if content_type.contains("json") || content_type.contains("text/plain") {
-        truncate_chars(&raw_text, cap)
-    } else {
-        html_to_readable_text(&raw_text, cap)
-    };
-    Ok(format!("URL: {current}\n\n{body}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn path_blocking_protects_os_and_secrets() {
-        assert!(is_blocked_path(Path::new("C:\\Windows\\System32\\cmd.exe"), false));
-        assert!(is_blocked_path(Path::new("C:\\Program Files\\App\\a.dll"), true));
-        assert!(is_blocked_path(Path::new("C:\\Users\\Test\\AppData\\Local\\Buddy\\secret.dpapi"), false));
-        assert!(!is_blocked_path(Path::new("C:\\Users\\Test\\Desktop\\notes.md"), true));
-    }
+    use serde_json::json;
 
     #[test]
     fn agent_file_tools_roundtrip() {
@@ -2245,41 +1303,6 @@ mod tests {
         assert!(find_out.contains("renamed.txt"));
 
         let _ = fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn ssrf_blocks_local_private_and_metadata_urls() {
-        assert!(validate_public_url("http://127.0.0.1:8080/admin", false).is_err());
-        assert!(validate_public_url("http://localhost:1420/", false).is_err());
-        assert!(validate_public_url("http://169.254.169.254/latest/meta-data", false).is_err());
-        assert!(validate_public_url("http://192.168.1.1/", false).is_err());
-        assert!(validate_public_url("http://[::1]:3000/", false).is_err());
-        assert!(validate_public_url("file:///C:/Windows/win.ini", false).is_err());
-        assert!(validate_public_url("https://example.com/docs", false).is_ok());
-    }
-
-    #[test]
-    fn extracts_readable_html_and_ddg_results() {
-        let html = r#"
-          <html><head><style>.a{color:red}</style><script>alert(1)</script></head>
-          <body><h1>Rust Docs</h1><p>Hello &amp; welcome!</p></body></html>
-        "#;
-        let text = html_to_readable_text(html, 500);
-        assert!(!text.contains("alert(1)"));
-        assert!(text.contains("Rust Docs"));
-        assert!(text.contains("Hello & welcome!"));
-
-        let ddg = r#"
-          <div class="result">
-            <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F&amp;rut=1">Rust Language</a>
-            <a class="result__snippet">Systems programming language.</a>
-          </div>
-        "#;
-        let hits = parse_ddg_html(ddg, 5);
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].0, "Rust Language");
-        assert_eq!(hits[0].1, "https://rust-lang.org/");
-        assert!(hits[0].2.contains("Systems programming"));
     }
 
     #[test]

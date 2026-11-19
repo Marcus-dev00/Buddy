@@ -5,23 +5,34 @@
 //! and live endpoint verification.
 
 use crate::agent_tools::{
-    anthropic_tools_json, build_agent_system_appendix, execute_fetch_web_page, execute_tool,
-    execute_web_search, gemini_tools_json, openai_tools_json, plan_tool_execution,
-    resolve_user_path, AgentApprovalManager, AgentPermissionMode, AgentStepEvent, ApprovalDecision,
+    build_agent_system_appendix, execute_fetch_web_page, execute_tool, execute_web_search,
+    plan_tool_execution, resolve_user_path, AgentApprovalManager, AgentPermissionMode,
+    AgentStepEvent, ApprovalDecision,
 };
-use crate::db::MemoryDb;
+use crate::browser::BrowserManager;
+use crate::db::{now_ms, MemoryDb};
+use crate::llm_protocols::{
+    emit_chunk, run_anthropic_turn, run_gemini_turn, run_openai_turn, ParsedToolCall, TurnOutcome,
+};
+pub use crate::llm_protocols::{run_oneshot_vision, verify_model_connection};
+use crate::mcp::McpManager;
 use crate::plugins::{run_media_download, run_offline_ocr, PluginManager};
 use crate::prompts::PromptsManager;
+use crate::reminders::{format_local_datetime, local_utc_offset_ms, parse_fire_at_ms};
 use crate::settings::{ResolvedModelConfig, SettingsManager};
 use crate::skills::{search_github_skills, SkillsManager};
+use crate::thinking::{
+    build_thinking_appendix_for_lang, clamp_thinking_level, classify_protocol, detect_thinking_lang,
+    detect_thinking_language_hint, infer_thinking_capability_with_mode, ThinkingLang,
+};
+use crate::win32_sensors::AppSensorState;
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -36,18 +47,6 @@ pub struct AttachmentPayload {
 pub struct InlineImageFrame {
     pub label: String,
     pub jpeg_b64: String,
-}
-
-#[derive(Clone, Serialize)]
-pub struct AiChunkPayload {
-    pub stream_id: String,
-    pub delta: String,
-}
-
-#[derive(Clone, Serialize)]
-pub struct AiThoughtPayload {
-    pub stream_id: String,
-    pub delta: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -66,944 +65,50 @@ pub struct AiErrorPayload {
 #[derive(Default)]
 pub struct AiStreamController {
     pub cancel_flag: Arc<AtomicBool>,
+    pub is_streaming: Arc<AtomicBool>,
+    pub steer_queue: Mutex<Vec<String>>,
 }
 
-#[derive(Clone, Debug)]
-struct ParsedToolCall {
-    id: String,
-    name: String,
-    args: Value,
-    raw_arguments: String,
-}
-
-enum TurnOutcome {
-    Finished {
-        turn_text: String,
-        turn_thought: String,
-    },
-    ToolCalls {
-        turn_text: String,
-        turn_thought: String,
-        native_reasoning: String,
-        calls: Vec<ParsedToolCall>,
-        gemini_raw_parts: Vec<Value>,
-        anthropic_raw_blocks: Vec<Value>,
-    },
-}
-
-const OPEN_TAG: &str = "<buddy_thought>";
-const CLOSE_TAG: &str = "</buddy_thought>";
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SplitPhase {
-    Preamble,
-    InsideThought,
-    Answer,
-}
-
-/// Splits `<buddy_thought>...</buddy_thought>` out of streamed text deltas cleanly in real time.
-struct ThoughtTagSplitter {
-    enabled: bool,
-    phase: SplitPhase,
-    buf: String,
-}
-
-impl ThoughtTagSplitter {
-    fn new(enabled: bool) -> Self {
-        Self {
-            enabled,
-            phase: if enabled {
-                SplitPhase::Preamble
-            } else {
-                SplitPhase::Answer
-            },
-            buf: String::new(),
+impl AiStreamController {
+    pub fn push_steer(&self, msg: String) {
+        let trimmed = msg.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Ok(mut q) = self.steer_queue.lock() {
+            q.push(trimmed);
         }
     }
 
-    fn push(&mut self, delta: &str) -> (String, String) {
-        if delta.is_empty() {
-            return (String::new(), String::new());
-        }
-        if !self.enabled || self.phase == SplitPhase::Answer {
-            return (String::new(), delta.to_string());
-        }
-
-        self.buf.push_str(delta);
-        let mut thought_out = String::new();
-        let mut answer_out = String::new();
-
-        loop {
-            match self.phase {
-                SplitPhase::Preamble => {
-                    let trimmed = self.buf.trim_start();
-                    if trimmed.is_empty() {
-                        break;
-                    }
-                    if let Some(after) = trimmed.strip_prefix(OPEN_TAG) {
-                        let rest = after.trim_start_matches(['\r', '\n']).to_string();
-                        self.buf = rest;
-                        self.phase = SplitPhase::InsideThought;
-                        continue;
-                    }
-                    if OPEN_TAG.starts_with(trimmed) {
-                        break;
-                    }
-                    answer_out.push_str(&self.buf);
-                    self.buf.clear();
-                    self.phase = SplitPhase::Answer;
-                    break;
-                }
-                SplitPhase::InsideThought => {
-                    if let Some(pos) = self.buf.find(CLOSE_TAG) {
-                        thought_out.push_str(&self.buf[..pos]);
-                        let after = self.buf[pos + CLOSE_TAG.len()..]
-                            .trim_start_matches(['\r', '\n'])
-                            .to_string();
-                        self.buf.clear();
-                        self.phase = SplitPhase::Answer;
-                        if !after.is_empty() {
-                            answer_out.push_str(&after);
-                        }
-                        break;
-                    }
-                    let hold = trailing_tag_prefix_len(&self.buf, CLOSE_TAG);
-                    let emit_len = self.buf.len().saturating_sub(hold);
-                    if emit_len > 0 {
-                        // Make sure emit_len lands on UTF-8 char boundary
-                        let mut safe_len = emit_len;
-                        while safe_len > 0 && !self.buf.is_char_boundary(safe_len) {
-                            safe_len -= 1;
-                        }
-                        if safe_len > 0 {
-                            thought_out.push_str(&self.buf[..safe_len]);
-                            self.buf.drain(..safe_len);
-                        }
-                    }
-                    break;
-                }
-                SplitPhase::Answer => {
-                    if !self.buf.is_empty() {
-                        answer_out.push_str(&self.buf);
-                        self.buf.clear();
-                    }
-                    break;
-                }
-            }
-        }
-
-        (thought_out, answer_out)
+    pub fn has_pending_steers(&self) -> bool {
+        self.steer_queue
+            .lock()
+            .map(|q| !q.is_empty())
+            .unwrap_or(false)
     }
 
-    fn finish(&mut self) -> (String, String) {
-        if self.buf.is_empty() {
-            return (String::new(), String::new());
-        }
-        let leftover = std::mem::take(&mut self.buf);
-        if self.phase == SplitPhase::InsideThought {
-            (leftover, String::new())
-        } else {
-            (String::new(), leftover)
+    pub fn drain_steers(&self) -> Vec<String> {
+        self.steer_queue
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
+    }
+
+    pub fn clear_steers(&self) {
+        if let Ok(mut q) = self.steer_queue.lock() {
+            q.clear();
         }
     }
 }
 
-fn trailing_tag_prefix_len(text: &str, tag: &str) -> usize {
-    let max_check = tag.len().saturating_sub(1).min(text.len());
-    for len in (1..=max_check).rev() {
-        let start = text.len() - len;
-        if text.is_char_boundary(start) && tag.starts_with(&text[start..]) {
-            return len;
-        }
+fn clamp_history_turn_text(text: &str) -> String {
+    const MAX_HISTORY_TURN_CHARS: usize = 3600;
+    let total = text.chars().count();
+    if total <= MAX_HISTORY_TURN_CHARS {
+        return text.to_string();
     }
-    0
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ApiProtocol {
-    OpenAi,
-    Anthropic,
-    Gemini,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThinkingBackend {
-    PromptOnly,
-    GeminiBudget { pro_min: bool },
-    GeminiLevel { allow_minimal: bool },
-    AnthropicBudget,
-    AnthropicAdaptive,
-    OpenAiEffort { allow_minimal: bool, allow_xhigh: bool },
-    DeepSeekChat,
-    BinaryThinkingToggle,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ThinkingCapability {
-    levels: &'static [&'static str],
-    backend: ThinkingBackend,
-}
-
-const LEVELS_ALL: &[&str] = &["off", "low", "medium", "high", "max"];
-const LEVELS_FLASH_3: &[&str] = &["off", "low", "medium", "high"];
-const LEVELS_NO_OFF_4: &[&str] = &["low", "medium", "high", "max"];
-const LEVELS_3_TIER: &[&str] = &["low", "medium", "high"];
-const LEVELS_DEEPSEEK_CHAT: &[&str] = &["off", "low", "high", "max"];
-const LEVELS_DEEPSEEK_R1: &[&str] = &["low", "high", "max"];
-const LEVELS_BINARY: &[&str] = &["off", "high"];
-
-fn strip_vendor_prefix(model_lower: &str) -> &str {
-    let trimmed = model_lower.trim().trim_start_matches("models/");
-    trimmed.rsplit('/').next().unwrap_or(trimmed)
-}
-
-fn parse_claude_version(model_lower: &str) -> Option<(u8, u8)> {
-    // Handles patterns like claude-sonnet-4-5, claude-3-7-sonnet, claude-opus-4.7, claude-sonnet-5
-    let m = strip_vendor_prefix(model_lower);
-    if !m.contains("claude") && !m.contains("opus") && !m.contains("sonnet") && !m.contains("haiku") {
-        return None;
-    }
-    let tokens: Vec<&str> = m.split(|c: char| !c.is_ascii_alphanumeric()).collect();
-    for i in 0..tokens.len() {
-        let Ok(major) = tokens[i].parse::<u8>() else {
-            continue;
-        };
-        if !(3..=9).contains(&major) {
-            continue;
-        }
-        let minor = tokens
-            .get(i + 1)
-            .and_then(|t| t.parse::<u8>().ok())
-            .filter(|&n| n <= 20)
-            .unwrap_or(0);
-        return Some((major, minor));
-    }
-    None
-}
-
-fn has_gemini_gen3_plus(model_lower: &str) -> bool {
-    let m = strip_vendor_prefix(model_lower);
-    m.contains("gemini-3")
-        || m.contains("gemini3")
-        || m.contains("gemini-4")
-        || m.contains("gemini4")
-}
-
-fn parse_gpt5_minor(model_lower: &str) -> Option<(u8, bool)> {
-    let m = strip_vendor_prefix(model_lower);
-    let idx = m.find("gpt-5")?;
-    let rest = &m[idx + "gpt-5".len()..];
-    if let Some(after_dot) = rest.strip_prefix('.') {
-        let minor: u8 = after_dot
-            .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse()
-            .unwrap_or(0);
-        return Some((minor, m.contains("-pro")));
-    }
-    if rest.is_empty() || rest.starts_with('-') {
-        return Some((0, m.contains("-pro")));
-    }
-    None
-}
-
-fn is_openai_o_series(model_lower: &str) -> bool {
-    let m = strip_vendor_prefix(model_lower);
-    if m == "o1-mini" || m == "o1-preview" {
-        return false;
-    }
-    m == "o1"
-        || m.starts_with("o1-")
-        || m == "o3"
-        || m.starts_with("o3-")
-        || m == "o4"
-        || m.starts_with("o4-")
-}
-
-fn infer_thinking_capability(
-    api_provider: &str,
-    base_url: &str,
-    model_id: &str,
-) -> ThinkingCapability {
-    let (_, is_anthropic, is_gemini, clean_url) = classify_protocol(api_provider, base_url);
-    let url_lower = clean_url.to_ascii_lowercase();
-    let model_lower = model_id.trim().to_ascii_lowercase();
-    let model_short = strip_vendor_prefix(&model_lower);
-
-    if is_gemini {
-        if has_gemini_gen3_plus(&model_lower) {
-            if model_short.contains("pro") {
-                return ThinkingCapability {
-                    levels: LEVELS_3_TIER,
-                    backend: ThinkingBackend::GeminiLevel {
-                        allow_minimal: false,
-                    },
-                };
-            }
-            return ThinkingCapability {
-                levels: LEVELS_FLASH_3,
-                backend: ThinkingBackend::GeminiLevel {
-                    allow_minimal: true,
-                },
-            };
-        }
-        if model_short.contains("2.5") || model_short.contains("thinking") {
-            let is_pro = model_short.contains("pro");
-            return ThinkingCapability {
-                levels: if is_pro { LEVELS_NO_OFF_4 } else { LEVELS_ALL },
-                backend: ThinkingBackend::GeminiBudget { pro_min: is_pro },
-            };
-        }
-        return ThinkingCapability {
-            levels: LEVELS_ALL,
-            backend: ThinkingBackend::PromptOnly,
-        };
-    }
-
-    if is_anthropic {
-        if let Some((major, minor)) = parse_claude_version(&model_lower) {
-            if (major, minor) >= (4, 7) {
-                return ThinkingCapability {
-                    levels: LEVELS_ALL,
-                    backend: ThinkingBackend::AnthropicAdaptive,
-                };
-            }
-            if (major, minor) >= (3, 7) {
-                return ThinkingCapability {
-                    levels: LEVELS_ALL,
-                    backend: ThinkingBackend::AnthropicBudget,
-                };
-            }
-        }
-        return ThinkingCapability {
-            levels: LEVELS_ALL,
-            backend: ThinkingBackend::PromptOnly,
-        };
-    }
-
-    if url_lower.contains("xiaomimimo.com") || model_short.starts_with("mimo") {
-        return ThinkingCapability {
-            levels: LEVELS_BINARY,
-            backend: ThinkingBackend::BinaryThinkingToggle,
-        };
-    }
-
-    if url_lower.contains("deepseek.com") || model_short.starts_with("deepseek") {
-        let is_reasoner = model_short.contains("reasoner") || model_short.contains("r1");
-        if url_lower.contains("deepseek.com") {
-            if is_reasoner {
-                return ThinkingCapability {
-                    levels: LEVELS_DEEPSEEK_R1,
-                    backend: ThinkingBackend::OpenAiEffort {
-                        allow_minimal: false,
-                        allow_xhigh: false,
-                    },
-                };
-            }
-            return ThinkingCapability {
-                levels: LEVELS_DEEPSEEK_CHAT,
-                backend: ThinkingBackend::DeepSeekChat,
-            };
-        }
-        return ThinkingCapability {
-            levels: if is_reasoner {
-                LEVELS_NO_OFF_4
-            } else {
-                LEVELS_ALL
-            },
-            backend: ThinkingBackend::PromptOnly,
-        };
-    }
-
-    if is_openai_o_series(&model_lower) {
-        return ThinkingCapability {
-            levels: LEVELS_3_TIER,
-            backend: ThinkingBackend::OpenAiEffort {
-                allow_minimal: false,
-                allow_xhigh: false,
-            },
-        };
-    }
-
-    if let Some((minor, is_pro)) = parse_gpt5_minor(&model_lower) {
-        let supports_xhigh = minor >= 2 || is_pro;
-        return ThinkingCapability {
-            levels: if supports_xhigh {
-                LEVELS_ALL
-            } else {
-                LEVELS_FLASH_3
-            },
-            backend: ThinkingBackend::OpenAiEffort {
-                allow_minimal: true,
-                allow_xhigh: supports_xhigh,
-            },
-        };
-    }
-
-    ThinkingCapability {
-        levels: LEVELS_ALL,
-        backend: ThinkingBackend::PromptOnly,
-    }
-}
-
-fn infer_thinking_capability_with_mode(
-    api_provider: &str,
-    base_url: &str,
-    model_id: &str,
-    thinking_mode: &str,
-) -> ThinkingCapability {
-    let mode = thinking_mode.trim().to_ascii_lowercase();
-    if mode == "prompt" {
-        return ThinkingCapability {
-            levels: LEVELS_ALL,
-            backend: ThinkingBackend::PromptOnly,
-        };
-    }
-    let auto = infer_thinking_capability(api_provider, base_url, model_id);
-    if mode == "native" && auto.backend == ThinkingBackend::PromptOnly {
-        let (_, is_anthropic, is_gemini, _) = classify_protocol(api_provider, base_url);
-        if is_gemini {
-            return ThinkingCapability {
-                levels: LEVELS_FLASH_3,
-                backend: ThinkingBackend::GeminiLevel {
-                    allow_minimal: true,
-                },
-            };
-        }
-        if is_anthropic {
-            return ThinkingCapability {
-                levels: LEVELS_ALL,
-                backend: ThinkingBackend::AnthropicAdaptive,
-            };
-        }
-        return ThinkingCapability {
-            levels: LEVELS_FLASH_3,
-            backend: ThinkingBackend::OpenAiEffort {
-                allow_minimal: true,
-                allow_xhigh: false,
-            },
-        };
-    }
-    auto
-}
-
-fn level_rank(level: &str) -> i32 {
-    match level {
-        "off" => 0,
-        "low" => 1,
-        "medium" => 2,
-        "high" => 3,
-        "max" => 4,
-        _ => 2,
-    }
-}
-
-fn clamp_thinking_level(requested: &str, cap: &ThinkingCapability) -> &'static str {
-    let norm = normalize_thinking_level(requested);
-    for &lvl in cap.levels {
-        if lvl == norm {
-            return lvl;
-        }
-    }
-    let req_rank = level_rank(norm);
-    // Never downgrade an explicitly active thinking level to "off" if an active level exists.
-    let candidates: Vec<&'static str> = if norm != "off" {
-        let non_off: Vec<&'static str> = cap
-            .levels
-            .iter()
-            .copied()
-            .filter(|&l| l != "off")
-            .collect();
-        if non_off.is_empty() {
-            cap.levels.to_vec()
-        } else {
-            non_off
-        }
-    } else {
-        cap.levels.to_vec()
-    };
-
-    candidates
-        .into_iter()
-        .min_by_key(|&lvl| ((level_rank(lvl) - req_rank).abs(), level_rank(lvl)))
-        .unwrap_or("medium")
-}
-
-/// Applies provider-native thinking fields to `body` and reports whether any native fields were injected.
-fn apply_native_thinking(body: &mut Value, backend: ThinkingBackend, effective_level: &str) -> bool {
-    match backend {
-        ThinkingBackend::PromptOnly => false,
-        ThinkingBackend::GeminiBudget { pro_min } => {
-            let cfg = match effective_level {
-                "off" if !pro_min => json!({ "thinkingBudget": 0, "includeThoughts": false }),
-                "off" => json!({ "thinkingBudget": 128, "includeThoughts": false }),
-                "low" => json!({ "thinkingBudget": 1024, "includeThoughts": true }),
-                "high" => json!({ "thinkingBudget": 10240, "includeThoughts": true }),
-                "max" => json!({ "thinkingBudget": 24576, "includeThoughts": true }),
-                _ => json!({ "thinkingBudget": 4096, "includeThoughts": true }),
-            };
-            body["generationConfig"]["thinkingConfig"] = cfg;
-            true
-        }
-        ThinkingBackend::GeminiLevel { allow_minimal } => {
-            let (lvl_str, include_thoughts) = match effective_level {
-                "off" if allow_minimal => ("minimal", false),
-                "off" | "low" => ("low", effective_level != "off"),
-                "high" | "max" => ("high", true),
-                _ => ("medium", true),
-            };
-            body["generationConfig"]["thinkingConfig"] = json!({
-                "thinkingLevel": lvl_str,
-                "includeThoughts": include_thoughts
-            });
-            true
-        }
-        ThinkingBackend::AnthropicBudget => {
-            if effective_level == "off" {
-                return false;
-            }
-            let (budget, max_tok) = match effective_level {
-                "low" => (1024_u64, 8192_u64),
-                "high" => (10240_u64, 20480_u64),
-                "max" => (20480_u64, 32000_u64),
-                _ => (4096_u64, 12288_u64),
-            };
-            body["max_tokens"] = json!(max_tok);
-            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-            true
-        }
-        ThinkingBackend::AnthropicAdaptive => {
-            if effective_level == "off" {
-                return false;
-            }
-            let effort = match effective_level {
-                "low" => "low",
-                "high" => "high",
-                "max" => "max",
-                _ => "medium",
-            };
-            body["max_tokens"] = json!(16384_u64);
-            body["thinking"] = json!({ "type": "adaptive" });
-            body["output_config"] = json!({ "effort": effort });
-            true
-        }
-        ThinkingBackend::OpenAiEffort {
-            allow_minimal,
-            allow_xhigh,
-        } => {
-            let effort = match effective_level {
-                "off" if allow_minimal => "minimal",
-                "off" | "low" => "low",
-                "high" => "high",
-                "max" if allow_xhigh => "xhigh",
-                "max" => "high",
-                _ => "medium",
-            };
-            body["reasoning_effort"] = json!(effort);
-            true
-        }
-        ThinkingBackend::DeepSeekChat => {
-            if effective_level == "off" {
-                body["thinking"] = json!({ "type": "disabled" });
-            } else {
-                let effort = match effective_level {
-                    "low" => "low",
-                    "max" => "max",
-                    _ => "high",
-                };
-                body["thinking"] = json!({ "type": "enabled" });
-                body["reasoning_effort"] = json!(effort);
-            }
-            true
-        }
-        ThinkingBackend::BinaryThinkingToggle => {
-            body["thinking"] = json!({
-                "type": if effective_level == "off" { "disabled" } else { "enabled" }
-            });
-            true
-        }
-    }
-}
-
-fn strip_native_thinking(body: &mut Value, protocol: ApiProtocol) {
-    match protocol {
-        ApiProtocol::Gemini => {
-            if let Some(gen_cfg) = body.get_mut("generationConfig").and_then(|v| v.as_object_mut())
-            {
-                gen_cfg.remove("thinkingConfig");
-                if gen_cfg.is_empty() {
-                    if let Some(root) = body.as_object_mut() {
-                        root.remove("generationConfig");
-                    }
-                }
-            }
-        }
-        ApiProtocol::Anthropic => {
-            if let Some(root) = body.as_object_mut() {
-                root.remove("thinking");
-                root.remove("output_config");
-                if root
-                    .get("max_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0)
-                    > 4096
-                {
-                    root.insert("max_tokens".to_string(), json!(4096));
-                }
-            }
-        }
-        ApiProtocol::OpenAi => {
-            if let Some(root) = body.as_object_mut() {
-                root.remove("reasoning_effort");
-                root.remove("thinking");
-            }
-        }
-    }
-}
-
-fn is_thinking_param_rejection(status: reqwest::StatusCode, err_txt: &str) -> bool {
-    let code = status.as_u16();
-    if code != 400 && code != 422 {
-        return false;
-    }
-    let low = err_txt.to_ascii_lowercase();
-    let mentions_field = low.contains("thinking")
-        || low.contains("reasoning")
-        || low.contains("budget")
-        || low.contains("effort")
-        || low.contains("output_config")
-        || low.contains("thought");
-    let mentions_invalid = low.contains("unknown")
-        || low.contains("unsupported")
-        || low.contains("unrecognized")
-        || low.contains("invalid")
-        || low.contains("extra")
-        || low.contains("unexpected");
-    mentions_field && mentions_invalid
-}
-
-fn retry_delay_ms(attempt: usize, retry_after_secs: Option<u64>) -> u64 {
-    let base_ms: u64 = match attempt {
-        0 => 1200,
-        1 => 2600,
-        _ => 5200,
-    };
-    let jitter_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| (d.subsec_nanos() % 350) as u64)
-        .unwrap_or(0);
-    let computed = base_ms + jitter_ms;
-    retry_after_secs
-        .map(|s| s.clamp(1, 15) * 1000)
-        .unwrap_or(0)
-        .max(computed)
-        .min(15_000)
-}
-
-async fn sleep_cancellable(ms: u64, cancel_flag: Option<&AtomicBool>) -> bool {
-    let mut elapsed = 0_u64;
-    while elapsed < ms {
-        if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            return false;
-        }
-        let step = (ms - elapsed).min(120);
-        tokio::time::sleep(std::time::Duration::from_millis(step)).await;
-        elapsed += step;
-    }
-    !cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed))
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn send_post_with_retry(
-    client: &reqwest::Client,
-    protocol: ApiProtocol,
-    endpoint: &str,
-    api_key: &str,
-    body: &mut Value,
-    native_thinking_injected: bool,
-    cancel_flag: Option<&AtomicBool>,
-    max_attempts: usize,
-) -> Result<reqwest::Response, String> {
-    let mut downgraded = false;
-    let mut attempt = 0_usize;
-    let max_tries = max_attempts.max(1);
-
-    loop {
-        if cancel_flag.is_some_and(|f| f.load(Ordering::Relaxed)) {
-            return Err("Cancelled by user.".to_string());
-        }
-
-        let mut req = client.post(endpoint);
-        match protocol {
-            ApiProtocol::Gemini => {
-                req = req.header("x-goog-api-key", api_key.trim());
-            }
-            ApiProtocol::Anthropic => {
-                req = req
-                    .header("x-api-key", api_key.trim())
-                    .header("anthropic-version", "2023-06-01");
-            }
-            ApiProtocol::OpenAi => {
-                if !api_key.trim().is_empty() {
-                    req = req.bearer_auth(api_key.trim());
-                }
-            }
-        }
-        let resp_res = req.json(body).send().await;
-
-        match resp_res {
-            Err(e) => {
-                if (e.is_timeout() || e.is_connect()) && attempt + 1 < max_tries {
-                    let wait_ms = retry_delay_ms(attempt, None);
-                    attempt += 1;
-                    crate::logger::log_warn(
-                        "ai",
-                        &format!("transient network error ({e}); retrying in {wait_ms}ms"),
-                    );
-                    if !sleep_cancellable(wait_ms, cancel_flag).await {
-                        return Err("Cancelled by user.".to_string());
-                    }
-                    continue;
-                }
-                return Err(format!("Request failed: {e}"));
-            }
-            Ok(resp) => {
-                if resp.status().is_success() {
-                    return Ok(resp);
-                }
-                let status = resp.status();
-                let retry_after = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.trim().parse::<u64>().ok());
-                let err_txt = resp.text().await.unwrap_or_default();
-
-                if native_thinking_injected
-                    && !downgraded
-                    && is_thinking_param_rejection(status, &err_txt)
-                {
-                    strip_native_thinking(body, protocol);
-                    downgraded = true;
-                    crate::logger::log_warn(
-                        "ai",
-                        &format!(
-                            "API rejected native thinking params ({status}); retrying without native thinking"
-                        ),
-                    );
-                    continue;
-                }
-
-                let is_transient = matches!(status.as_u16(), 429 | 500 | 502 | 503 | 504);
-                if is_transient && attempt + 1 < max_tries {
-                    let wait_ms = retry_delay_ms(attempt, retry_after);
-                    attempt += 1;
-                    crate::logger::log_warn(
-                        "ai",
-                        &format!(
-                            "transient HTTP {status} on attempt {attempt}; retrying in {wait_ms}ms"
-                        ),
-                    );
-                    if !sleep_cancellable(wait_ms, cancel_flag).await {
-                        return Err("Cancelled by user.".to_string());
-                    }
-                    continue;
-                }
-
-                return Err(format!(
-                    "API returned {status}: {}",
-                    err_txt.chars().take(240).collect::<String>()
-                ));
-            }
-        }
-    }
-}
-
-fn normalize_thinking_level(raw: &str) -> &'static str {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "off" => "off",
-        "low" => "low",
-        "high" => "high",
-        "max" => "max",
-        _ => "medium",
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThinkingLang {
-    Zh,
-    Ja,
-    Ko,
-    En,
-    MatchUser,
-}
-
-fn is_non_prose_prompt(trimmed: &str) -> bool {
-    if trimmed.is_empty() {
-        return true;
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    if lower == "analyze attached item" || lower == "analyze attached items" {
-        return true;
-    }
-    let has_latin = trimmed.chars().any(|c| c.is_ascii_alphabetic());
-    if !has_latin {
-        return true;
-    }
-    // Pure single URL or Windows path without prose words
-    !trimmed.contains(' ')
-        && (lower.starts_with("http://")
-            || lower.starts_with("https://")
-            || trimmed.contains(":\\")
-            || trimmed.starts_with('/'))
-}
-
-fn detect_text_script_lang(text: &str) -> Option<ThinkingLang> {
-    if text
-        .chars()
-        .any(|c| matches!(c as u32, 0x4E00..=0x9FFF | 0x3400..=0x4DBF))
-    {
-        return Some(ThinkingLang::Zh);
-    }
-    if text
-        .chars()
-        .any(|c| matches!(c as u32, 0x3040..=0x30FF))
-    {
-        return Some(ThinkingLang::Ja);
-    }
-    if text
-        .chars()
-        .any(|c| matches!(c as u32, 0xAC00..=0xD7AF))
-    {
-        return Some(ThinkingLang::Ko);
-    }
-    None
-}
-
-fn detect_thinking_lang(
-    prompt: &str,
-    history: &[(String, String)],
-    ui_language: &str,
-) -> ThinkingLang {
-    let trimmed = prompt.trim();
-    if let Some(script) = detect_text_script_lang(trimmed) {
-        return script;
-    }
-    if is_non_prose_prompt(trimmed) {
-        for (role, content) in history.iter().rev() {
-            if role == "user" {
-                if let Some(script) = detect_text_script_lang(content) {
-                    return script;
-                }
-            }
-        }
-        return if ui_language.eq_ignore_ascii_case("zh") {
-            ThinkingLang::Zh
-        } else {
-            ThinkingLang::En
-        };
-    }
-    ThinkingLang::MatchUser
-}
-
-fn detect_thinking_language_hint(prompt: &str, ui_language: &str) -> &'static str {
-    match detect_thinking_lang(prompt, &[], ui_language) {
-        ThinkingLang::Zh => "Simplified Chinese (简体中文)",
-        ThinkingLang::Ja => "Japanese (日本語)",
-        ThinkingLang::Ko => "Korean (한국어)",
-        ThinkingLang::En => "English",
-        ThinkingLang::MatchUser => "the exact same language as the user's latest message",
-    }
-}
-
-fn build_thinking_appendix_for_lang(level: &str, lang: ThinkingLang) -> String {
-    let norm = normalize_thinking_level(level);
-    if lang == ThinkingLang::Zh {
-        return match norm {
-            "off" => "\n\n---\n\n# 思考模式：关闭（OFF）\n\
-                      - 直接、自然地回复用户，不做多余停顿。\n\
-                      - 不要输出 `<buddy_thought>` 标签，全程使用简体中文回答。"
-                .to_string(),
-            "low" => "\n\n---\n\n# 思考深度：轻量（LOW · 简体中文）\n\
-                      - **强制语言规则**：无论原生思考块（`reasoning_content` / `thinking`）还是 `<buddy_thought>...</buddy_thought>`，**从第一句起必须全程使用地道、接地气的简体中文思考**（比如日常口语化的内心独白：“先确认下他核心想要啥”、“这个点得核实一下”），严禁使用英文推演或英文模板句（文件名/代码标识符除外）。\n\
-                      - 快速核对核心事实和意图即可，不要过度发散；若用 `<buddy_thought>`，正式回复写在 `</buddy_thought>` 之后。"
-                .to_string(),
-            "high" => "\n\n---\n\n# 思考深度：深入（HIGH · 简体中文）\n\
-                      - **强制语言规则**：无论原生思考块（`reasoning_content` / `thinking`）还是 `<buddy_thought>...</buddy_thought>`，**从第一个字到最后一个字都必须全程使用自然、口语化、像真人搭档一样的简体中文推演**，绝对不要用英文思考或套英文思维模板（代码标识符、命令、路径名除外）。\n\
-                      - 动手回答前按以下步骤仔细过一遍：\n\
-                        1）先搞清楚用户真正要什么（若有歧义或涉及高风险改动，先简短追问确认）。\n\
-                        2）核对事实准确性、技术可行性与边界情况——如果用户前提有误或不现实，准备温和但坦诚的纠偏。\n\
-                        3）梳理清楚最有条理、有依据且带点日常人情味的表达结构后再作答（若使用 `<buddy_thought>`，把最终回答放在 `</buddy_thought>` 之后）。"
-                .to_string(),
-            "max" => "\n\n---\n\n# 思考深度：极致核验（MAX · 简体中文）\n\
-                      - **强制语言规则**：无论原生思考块（`reasoning_content` / `thinking`）还是 `<buddy_thought>...</buddy_thought>`，**从第一句开始必须全程使用自然、接地气、像真人朋友般的简体中文思考**，严禁切换成英文自言自语（代码标识符、命令、路径名除外）。\n\
-                      - 回答前进行穷举式推演：\n\
-                        1）列出所有可能的理解方向与边界条件。\n\
-                        2）预演每种方案的结果，排查报错、矛盾或不可行之处。\n\
-                        3）逐一复核事实、路径、命令与前提假设；若需要澄清或坦诚指出不妥之处，明确标注。\n\
-                        4）确认结论完全站得住脚后，再在外部给出清晰自然的正式答复。"
-                .to_string(),
-            _ => "\n\n---\n\n# 思考深度：均衡（MEDIUM · 简体中文）\n\
-                  - **强制语言规则**：无论原生思考块（`reasoning_content` / `thinking`）还是 `<buddy_thought>...</buddy_thought>`，**从第一句起必须全程使用自然、有日常人情味的简体中文思考**，严禁使用英文推演（代码标识符、命令、路径名除外）。\n\
-                  - 回答前梳理好意图、判断是否需要先行确认或坦诚纠偏，核对关键步骤与事实；若使用 `<buddy_thought>`，正式回复写在 `</buddy_thought>` 之后。"
-                .to_string(),
-        };
-    }
-
-    let lang_hint = match lang {
-        ThinkingLang::Zh => "Simplified Chinese (简体中文)",
-        ThinkingLang::Ja => "Japanese (日本語)",
-        ThinkingLang::Ko => "Korean (한국어)",
-        ThinkingLang::En => "English",
-        ThinkingLang::MatchUser => "the exact same language as the user's latest message",
-    };
-    let lang_rule = format!(
-        "- Write ALL internal reasoning (both native thinking/reasoning blocks and `<buddy_thought>...</buddy_thought>`) in {lang_hint}, in a natural, conversational, down-to-earth inner voice (no stiff English-only template thoughts unless the user wrote in English)."
-    );
-    match norm {
-        "off" => "\n\n---\n\n# Thinking Level: OFF\n\
-                  - Respond immediately and directly with zero deliberation.\n\
-                  - Do NOT output `<buddy_thought>` tags."
-            .to_string(),
-        "low" => format!(
-            "\n\n---\n\n# Thinking Level: LOW\n\
-             {lang_rule}\n\
-             - Before answering, do a quick 1-2 line sanity check inside `<buddy_thought>...</buddy_thought>` (check core facts, catch obvious errors or unclear intent; skip the tag if you emit native model reasoning blocks).\n\
-             - Keep the final response outside the tag concise, natural, and accurate."
-        ),
-        "high" => format!(
-            "\n\n---\n\n# Thinking Level: HIGH\n\
-             {lang_rule}\n\
-             - Think thoroughly step-by-step inside `<buddy_thought>...</buddy_thought>` before writing your final reply (skip the tag if using native model reasoning blocks):\n\
-               1) Verify what the user actually wants (clarify first if ambiguous).\n\
-               2) Check factual accuracy, technical feasibility, and edge cases — prepare honest pushback if the premise is flawed or unrealistic.\n\
-               3) Structure the cleanest, verified answer in natural human phrasing.\n\
-             - Write ONLY the polished final reply outside `</buddy_thought>`."
-        ),
-        "max" => format!(
-            "\n\n---\n\n# Thinking Level: MAX (Exhaustive Verification)\n\
-             {lang_rule}\n\
-             - Think exhaustively inside `<buddy_thought>...</buddy_thought>` before answering (skip the tag if using native model reasoning blocks):\n\
-               1) Explore every plausible interpretation and edge case.\n\
-               2) Simulate each possible outcome / solution branch and check for failures, contradictions, or hard feasibility limits.\n\
-               3) Double-check every calculation, fact, path, and assumption; identify if you need to ask clarifying questions first or push back honestly on faulty claims.\n\
-               4) Verify the planned reply is 100% sound before writing a single word to the user.\n\
-             - Deliver ONLY the confirmed, natural, well-structured final response after `</buddy_thought>`."
-        ),
-        _ => format!(
-            "\n\n---\n\n# Thinking Level: MEDIUM\n\
-             {lang_rule}\n\
-             - Before answering, think cleanly inside `<buddy_thought>...</buddy_thought>` (identify true intent, check whether clarification or honest pushback is needed, verify facts/steps; skip the tag if using native model reasoning blocks).\n\
-             - Put ONLY the final user-facing reply after `</buddy_thought>`."
-        ),
-    }
-}
-
-#[cfg(test)]
-fn build_thinking_appendix(level: &str, prompt: &str, ui_language: &str) -> String {
-    let lang = detect_thinking_lang(prompt, &[], ui_language);
-    build_thinking_appendix_for_lang(level, lang)
+    let kept: String = text.chars().take(MAX_HISTORY_TURN_CHARS).collect();
+    format!("{kept}\n... [earlier long turn truncated]")
 }
 
 /// Resizes `DynamicImage` longest edge to `<= max_dim` and encodes JPEG returning raw base64.
@@ -1212,14 +317,15 @@ fn build_gemini_contents(
         if content.trim().is_empty() {
             continue;
         }
+        let capped = clamp_history_turn_text(&content);
         let g_role = if role == "assistant" { "model" } else { "user" };
         if let Some((last_role, last_parts)) = turns.last_mut() {
             if last_role == g_role {
-                last_parts.push(json!({ "text": content }));
+                last_parts.push(json!({ "text": capped }));
                 continue;
             }
         }
-        turns.push((g_role.to_string(), vec![json!({ "text": content })]));
+        turns.push((g_role.to_string(), vec![json!({ "text": capped })]));
     }
 
     while turns.last().map(|(r, _)| r.as_str()) == Some("user") {
@@ -1259,16 +365,17 @@ fn build_anthropic_history(
         if content.trim().is_empty() {
             continue;
         }
+        let capped = clamp_history_turn_text(&content);
         let norm_role = if role == "assistant" { "assistant" } else { "user" };
         if let Some((last_role, last_val)) = msgs.last_mut() {
             if last_role == norm_role {
                 if let Some(prev_s) = last_val.as_str() {
-                    *last_val = Value::String(format!("{prev_s}\n\n{content}"));
+                    *last_val = Value::String(format!("{prev_s}\n\n{capped}"));
                     continue;
                 }
             }
         }
-        msgs.push((norm_role.to_string(), Value::String(content)));
+        msgs.push((norm_role.to_string(), Value::String(capped)));
     }
 
     while msgs.last().map(|(r, _)| r.as_str()) == Some("user") {
@@ -1308,7 +415,7 @@ fn build_openai_history(
         .rev()
     {
         if !content.trim().is_empty() {
-            api_messages.push(json!({ "role": role, "content": content }));
+            api_messages.push(json!({ "role": role, "content": clamp_history_turn_text(&content) }));
         }
     }
     api_messages.push(json!({
@@ -1318,616 +425,8 @@ fn build_openai_history(
     api_messages
 }
 
-fn emit_chunk(app: &AppHandle, stream_id: &str, delta: &str) {
-    if !delta.is_empty() {
-        let _ = app.emit(
-            "buddy://ai-chunk",
-            AiChunkPayload {
-                stream_id: stream_id.to_string(),
-                delta: delta.to_string(),
-            },
-        );
-    }
-}
-
-fn emit_thought(app: &AppHandle, stream_id: &str, delta: &str) {
-    if !delta.is_empty() {
-        let _ = app.emit(
-            "buddy://ai-thought",
-            AiThoughtPayload {
-                stream_id: stream_id.to_string(),
-                delta: delta.to_string(),
-            },
-        );
-    }
-}
-
 fn emit_step(app: &AppHandle, payload: &AgentStepEvent) {
     let _ = app.emit("buddy://agent-step", payload);
-}
-
-#[derive(Default)]
-struct OpenAiPartialTool {
-    id: String,
-    name: String,
-    arguments: String,
-}
-
-#[derive(Default)]
-struct AnthropicBlock {
-    kind: String,
-    id: String,
-    name: String,
-    partial_json: String,
-    text: String,
-    thinking_text: String,
-    signature: String,
-    redacted_data: String,
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_openai_turn(
-    app: &AppHandle,
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    model_id: &str,
-    messages: &[Value],
-    agent_mode: bool,
-    include_media_downloader: bool,
-    thinking_level: &str,
-    thinking_backend: ThinkingBackend,
-    stream_id: &str,
-    turn_idx: usize,
-    cancel_flag: &AtomicBool,
-) -> Result<TurnOutcome, String> {
-    let endpoint = format!("{base_url}/chat/completions");
-    let mut body = json!({
-        "model": model_id,
-        "stream": true,
-        "messages": messages
-    });
-    let native_thinking = apply_native_thinking(&mut body, thinking_backend, thinking_level);
-    if agent_mode {
-        body["tools"] = openai_tools_json(include_media_downloader);
-        body["tool_choice"] = json!("auto");
-    }
-
-    let mut resp = send_post_with_retry(
-        client,
-        ApiProtocol::OpenAi,
-        &endpoint,
-        api_key,
-        &mut body,
-        native_thinking,
-        Some(cancel_flag),
-        4,
-    )
-    .await?;
-
-    let mut turn_text = String::new();
-    let mut turn_thought = String::new();
-    let mut native_reasoning = String::new();
-    let mut splitter = ThoughtTagSplitter::new(thinking_level != "off");
-    let mut sse_buffer = String::new();
-    let mut partial_tools: BTreeMap<usize, OpenAiPartialTool> = BTreeMap::new();
-    let mut stream_finished = false;
-
-    while !stream_finished {
-        if cancel_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        match resp.chunk().await {
-            Ok(Some(bytes)) => {
-                sse_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(newline_pos) = sse_buffer.find('\n') {
-                    let line = sse_buffer[..newline_pos].trim().to_string();
-                    sse_buffer.drain(..=newline_pos);
-                    if !line.starts_with("data:") {
-                        continue;
-                    }
-                    let data = line.trim_start_matches("data:").trim();
-                    if data == "[DONE]" {
-                        stream_finished = true;
-                        break;
-                    }
-                    if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                        if let Some(err_msg) = parsed["error"]["message"].as_str() {
-                            return Err(err_msg.to_string());
-                        }
-                        let delta_obj = &parsed["choices"][0]["delta"];
-                        // Native OpenAI/DeepSeek/Qwen reasoning_content stream
-                        if let Some(rc) = delta_obj["reasoning_content"]
-                            .as_str()
-                            .or_else(|| delta_obj["reasoning"].as_str())
-                        {
-                            if !rc.is_empty() {
-                                native_reasoning.push_str(rc);
-                                if thinking_level != "off" {
-                                    turn_thought.push_str(rc);
-                                    emit_thought(app, stream_id, rc);
-                                }
-                            }
-                        }
-                        if let Some(delta) = delta_obj["content"].as_str() {
-                            let (th, ans) = splitter.push(delta);
-                            if !th.is_empty() {
-                                turn_thought.push_str(&th);
-                                emit_thought(app, stream_id, &th);
-                            }
-                            if !ans.is_empty() {
-                                turn_text.push_str(&ans);
-                                emit_chunk(app, stream_id, &ans);
-                            }
-                        }
-                        if let Some(tcs) = delta_obj["tool_calls"].as_array() {
-                            for (fallback_idx, tc) in tcs.iter().enumerate() {
-                                let idx =
-                                    tc["index"].as_u64().unwrap_or(fallback_idx as u64) as usize;
-                                let entry = partial_tools.entry(idx).or_default();
-                                if let Some(id) = tc["id"].as_str() {
-                                    if !id.is_empty() {
-                                        entry.id = id.to_string();
-                                    }
-                                }
-                                if let Some(name) = tc["function"]["name"].as_str() {
-                                    entry.name.push_str(name);
-                                }
-                                if let Some(args) = tc["function"]["arguments"].as_str() {
-                                    entry.arguments.push_str(args);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(e) => return Err(format!("Stream interrupted: {e}")),
-        }
-    }
-
-    let (th_tail, ans_tail) = splitter.finish();
-    if !th_tail.is_empty() {
-        turn_thought.push_str(&th_tail);
-        emit_thought(app, stream_id, &th_tail);
-    }
-    if !ans_tail.is_empty() {
-        turn_text.push_str(&ans_tail);
-        emit_chunk(app, stream_id, &ans_tail);
-    }
-
-    if partial_tools.is_empty() {
-        Ok(TurnOutcome::Finished {
-            turn_text,
-            turn_thought,
-        })
-    } else {
-        let calls = partial_tools
-            .into_iter()
-            .filter(|(_, t)| !t.name.trim().is_empty())
-            .map(|(idx, t)| {
-                let raw_arguments = if t.arguments.trim().is_empty() {
-                    "{}".to_string()
-                } else {
-                    t.arguments.clone()
-                };
-                let args: Value =
-                    serde_json::from_str(&raw_arguments).unwrap_or_else(|_| json!({}));
-                let id = if t.id.is_empty() {
-                    format!("call_{turn_idx}_{idx}")
-                } else {
-                    t.id
-                };
-                ParsedToolCall {
-                    id,
-                    name: t.name.trim().to_string(),
-                    args,
-                    raw_arguments,
-                }
-            })
-            .collect();
-        Ok(TurnOutcome::ToolCalls {
-            turn_text,
-            turn_thought,
-            native_reasoning,
-            calls,
-            gemini_raw_parts: Vec::new(),
-            anthropic_raw_blocks: Vec::new(),
-        })
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_anthropic_turn(
-    app: &AppHandle,
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    model_id: &str,
-    sys_prompt: &str,
-    messages: &[Value],
-    agent_mode: bool,
-    include_media_downloader: bool,
-    thinking_level: &str,
-    thinking_backend: ThinkingBackend,
-    stream_id: &str,
-    turn_idx: usize,
-    cancel_flag: &AtomicBool,
-) -> Result<TurnOutcome, String> {
-    let endpoint = if base_url.ends_with("/v1") {
-        format!("{base_url}/messages")
-    } else {
-        format!("{base_url}/v1/messages")
-    };
-    let mut body = json!({
-        "model": model_id,
-        "max_tokens": 4096,
-        "stream": true,
-        "system": sys_prompt,
-        "messages": messages
-    });
-    let native_thinking = apply_native_thinking(&mut body, thinking_backend, thinking_level);
-    if agent_mode {
-        body["tools"] = anthropic_tools_json(include_media_downloader);
-    }
-
-    let mut resp = send_post_with_retry(
-        client,
-        ApiProtocol::Anthropic,
-        &endpoint,
-        api_key,
-        &mut body,
-        native_thinking,
-        Some(cancel_flag),
-        4,
-    )
-    .await?;
-
-    let mut turn_text = String::new();
-    let mut turn_thought = String::new();
-    let mut splitter = ThoughtTagSplitter::new(thinking_level != "off");
-    let mut sse_buffer = String::new();
-    let mut blocks: BTreeMap<usize, AnthropicBlock> = BTreeMap::new();
-    let mut stream_finished = false;
-
-    while !stream_finished {
-        if cancel_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        match resp.chunk().await {
-            Ok(Some(bytes)) => {
-                sse_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(newline_pos) = sse_buffer.find('\n') {
-                    let line = sse_buffer[..newline_pos].trim().to_string();
-                    sse_buffer.drain(..=newline_pos);
-                    if !line.starts_with("data:") {
-                        continue;
-                    }
-                    let data = line.trim_start_matches("data:").trim();
-                    if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                        let evt_type = parsed["type"].as_str().unwrap_or("");
-                        match evt_type {
-                            "content_block_start" => {
-                                let idx = parsed["index"].as_u64().unwrap_or(0) as usize;
-                                let cb = &parsed["content_block"];
-                                let btype = cb["type"].as_str().unwrap_or("").to_string();
-                                blocks.insert(
-                                    idx,
-                                    AnthropicBlock {
-                                        kind: btype,
-                                        id: cb["id"].as_str().unwrap_or("").to_string(),
-                                        name: cb["name"].as_str().unwrap_or("").to_string(),
-                                        partial_json: String::new(),
-                                        text: cb["text"].as_str().unwrap_or("").to_string(),
-                                        thinking_text: cb["thinking"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        signature: cb["signature"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        redacted_data: cb["data"].as_str().unwrap_or("").to_string(),
-                                    },
-                                );
-                            }
-                            "content_block_delta" => {
-                                let idx = parsed["index"].as_u64().unwrap_or(0) as usize;
-                                let dtype = parsed["delta"]["type"].as_str().unwrap_or("");
-                                if dtype == "thinking_delta" {
-                                    if let Some(th) = parsed["delta"]["thinking"].as_str() {
-                                        if let Some(b) = blocks.get_mut(&idx) {
-                                            b.thinking_text.push_str(th);
-                                        }
-                                        if !th.is_empty() && thinking_level != "off" {
-                                            turn_thought.push_str(th);
-                                            emit_thought(app, stream_id, th);
-                                        }
-                                    }
-                                } else if dtype == "signature_delta" {
-                                    if let Some(sig) = parsed["delta"]["signature"].as_str() {
-                                        if let Some(b) = blocks.get_mut(&idx) {
-                                            b.signature.push_str(sig);
-                                        }
-                                    }
-                                } else if dtype == "text_delta" || parsed["delta"]["text"].is_string() {
-                                    if let Some(delta) = parsed["delta"]["text"].as_str() {
-                                        if let Some(b) = blocks.get_mut(&idx) {
-                                            b.text.push_str(delta);
-                                        }
-                                        let (th, ans) = splitter.push(delta);
-                                        if !th.is_empty() {
-                                            turn_thought.push_str(&th);
-                                            emit_thought(app, stream_id, &th);
-                                        }
-                                        if !ans.is_empty() {
-                                            turn_text.push_str(&ans);
-                                            emit_chunk(app, stream_id, &ans);
-                                        }
-                                    }
-                                } else if dtype == "input_json_delta" {
-                                    if let Some(part) = parsed["delta"]["partial_json"].as_str() {
-                                        if let Some(b) = blocks.get_mut(&idx) {
-                                            b.partial_json.push_str(part);
-                                        }
-                                    }
-                                }
-                            }
-                            "message_stop" => {
-                                stream_finished = true;
-                                break;
-                            }
-                            "error" => {
-                                let msg = parsed["error"]["message"]
-                                    .as_str()
-                                    .unwrap_or("Anthropic stream error");
-                                return Err(msg.to_string());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(e) => return Err(format!("Stream interrupted: {e}")),
-        }
-    }
-
-    let (th_tail, ans_tail) = splitter.finish();
-    if !th_tail.is_empty() {
-        turn_thought.push_str(&th_tail);
-        emit_thought(app, stream_id, &th_tail);
-    }
-    if !ans_tail.is_empty() {
-        turn_text.push_str(&ans_tail);
-        emit_chunk(app, stream_id, &ans_tail);
-    }
-
-    let mut anthropic_raw_blocks: Vec<Value> = Vec::new();
-    let mut tool_calls: Vec<ParsedToolCall> = Vec::new();
-    for (idx, b) in blocks {
-        match b.kind.as_str() {
-            "thinking" => {
-                if !b.thinking_text.is_empty() || !b.signature.is_empty() {
-                    anthropic_raw_blocks.push(json!({
-                        "type": "thinking",
-                        "thinking": b.thinking_text,
-                        "signature": b.signature
-                    }));
-                }
-            }
-            "redacted_thinking" => {
-                if !b.redacted_data.is_empty() {
-                    anthropic_raw_blocks.push(json!({
-                        "type": "redacted_thinking",
-                        "data": b.redacted_data
-                    }));
-                }
-            }
-            "text" => {
-                if !b.text.is_empty() {
-                    anthropic_raw_blocks.push(json!({
-                        "type": "text",
-                        "text": b.text
-                    }));
-                }
-            }
-            "tool_use" if !b.name.trim().is_empty() => {
-                let raw_arguments = if b.partial_json.trim().is_empty() {
-                    "{}".to_string()
-                } else {
-                    b.partial_json
-                };
-                let args: Value =
-                    serde_json::from_str(&raw_arguments).unwrap_or_else(|_| json!({}));
-                let id = if b.id.is_empty() {
-                    format!("toolu_{turn_idx}_{idx}")
-                } else {
-                    b.id
-                };
-                anthropic_raw_blocks.push(json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": b.name,
-                    "input": args
-                }));
-                tool_calls.push(ParsedToolCall {
-                    id,
-                    name: b.name,
-                    args,
-                    raw_arguments,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    if tool_calls.is_empty() {
-        Ok(TurnOutcome::Finished {
-            turn_text,
-            turn_thought,
-        })
-    } else {
-        Ok(TurnOutcome::ToolCalls {
-            turn_text,
-            turn_thought,
-            native_reasoning: String::new(),
-            calls: tool_calls,
-            gemini_raw_parts: Vec::new(),
-            anthropic_raw_blocks,
-        })
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_gemini_turn(
-    app: &AppHandle,
-    client: &reqwest::Client,
-    base_url: &str,
-    api_key: &str,
-    model_id: &str,
-    sys_prompt: &str,
-    contents: &[Value],
-    agent_mode: bool,
-    include_media_downloader: bool,
-    thinking_level: &str,
-    thinking_backend: ThinkingBackend,
-    stream_id: &str,
-    turn_idx: usize,
-    cancel_flag: &AtomicBool,
-) -> Result<TurnOutcome, String> {
-    let model_clean = model_id.trim().trim_start_matches("models/");
-    let endpoint = if base_url.ends_with("/v1beta") || base_url.ends_with("/v1") {
-        format!("{base_url}/models/{model_clean}:streamGenerateContent?alt=sse")
-    } else {
-        format!("{base_url}/v1beta/models/{model_clean}:streamGenerateContent?alt=sse")
-    };
-    let mut body = json!({
-        "systemInstruction": {
-            "parts": [{ "text": sys_prompt }]
-        },
-        "contents": contents
-    });
-
-    let lvl = normalize_thinking_level(thinking_level);
-    let native_thinking = apply_native_thinking(&mut body, thinking_backend, lvl);
-
-    if agent_mode {
-        body["tools"] = gemini_tools_json(include_media_downloader);
-    }
-
-    let mut resp = send_post_with_retry(
-        client,
-        ApiProtocol::Gemini,
-        &endpoint,
-        api_key,
-        &mut body,
-        native_thinking,
-        Some(cancel_flag),
-        4,
-    )
-    .await?;
-
-    let mut turn_text = String::new();
-    let mut turn_thought = String::new();
-    let mut splitter = ThoughtTagSplitter::new(lvl != "off");
-    let mut sse_buffer = String::new();
-    let mut raw_model_parts: Vec<Value> = Vec::new();
-    let mut calls: Vec<ParsedToolCall> = Vec::new();
-
-    loop {
-        if cancel_flag.load(Ordering::Relaxed) {
-            break;
-        }
-        match resp.chunk().await {
-            Ok(Some(bytes)) => {
-                sse_buffer.push_str(&String::from_utf8_lossy(&bytes));
-                while let Some(newline_pos) = sse_buffer.find('\n') {
-                    let line = sse_buffer[..newline_pos].trim().to_string();
-                    sse_buffer.drain(..=newline_pos);
-                    if !line.starts_with("data:") {
-                        continue;
-                    }
-                    let data = line.trim_start_matches("data:").trim();
-                    if data == "[DONE]" {
-                        break;
-                    }
-                    if let Ok(parsed) = serde_json::from_str::<Value>(data) {
-                        if let Some(err_msg) = parsed["error"]["message"].as_str() {
-                            return Err(err_msg.to_string());
-                        }
-                        if let Some(parts) = parsed["candidates"][0]["content"]["parts"].as_array() {
-                            for part in parts {
-                                raw_model_parts.push(part.clone());
-                                if part["thought"].as_bool() == Some(true) {
-                                    if let Some(th) = part["text"].as_str() {
-                                        if !th.is_empty() && lvl != "off" {
-                                            turn_thought.push_str(th);
-                                            emit_thought(app, stream_id, th);
-                                        }
-                                    }
-                                    continue;
-                                }
-                                if let Some(fc) = part.get("functionCall") {
-                                    if let Some(name) = fc["name"].as_str() {
-                                        let args =
-                                            fc.get("args").cloned().unwrap_or_else(|| json!({}));
-                                        let idx = calls.len();
-                                        calls.push(ParsedToolCall {
-                                            id: format!("gem_{turn_idx}_{idx}"),
-                                            name: name.to_string(),
-                                            raw_arguments: args.to_string(),
-                                            args,
-                                        });
-                                    }
-                                    continue;
-                                }
-                                if let Some(delta) = part["text"].as_str() {
-                                    let (th, ans) = splitter.push(delta);
-                                    if !th.is_empty() {
-                                        turn_thought.push_str(&th);
-                                        emit_thought(app, stream_id, &th);
-                                    }
-                                    if !ans.is_empty() {
-                                        turn_text.push_str(&ans);
-                                        emit_chunk(app, stream_id, &ans);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(e) => return Err(format!("Stream interrupted: {e}")),
-        }
-    }
-
-    let (th_tail, ans_tail) = splitter.finish();
-    if !th_tail.is_empty() {
-        turn_thought.push_str(&th_tail);
-        emit_thought(app, stream_id, &th_tail);
-    }
-    if !ans_tail.is_empty() {
-        turn_text.push_str(&ans_tail);
-        emit_chunk(app, stream_id, &ans_tail);
-    }
-
-    if calls.is_empty() {
-        Ok(TurnOutcome::Finished {
-            turn_text,
-            turn_thought,
-        })
-    } else {
-        Ok(TurnOutcome::ToolCalls {
-            turn_text,
-            turn_thought,
-            native_reasoning: String::new(),
-            calls,
-            gemini_raw_parts: raw_model_parts,
-            anthropic_raw_blocks: Vec::new(),
-        })
-    }
 }
 
 fn derive_workspace_hint(configured: &str, attachments: &[AttachmentPayload]) -> Option<PathBuf> {
@@ -1948,11 +447,20 @@ fn derive_workspace_hint(configured: &str, attachments: &[AttachmentPayload]) ->
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_tool_with_approval(
     app: &AppHandle,
     approval_mgr: &AgentApprovalManager,
     skills_mgr: &SkillsManager,
     plugin_mgr: &PluginManager,
+    browser_mgr: &Arc<BrowserManager>,
+    sensor_state: &Arc<AppSensorState>,
+    mcp_mgr: &Arc<McpManager>,
+    settings_mgr: &SettingsManager,
+    controller: &AiStreamController,
+    http_client: &reqwest::Client,
+    chat_model: &ResolvedModelConfig,
+    chat_api_key: &str,
     db: &Arc<MemoryDb>,
     mirror_prefix: &str,
     stream_id: &str,
@@ -1964,7 +472,14 @@ async fn run_tool_with_approval(
     approve_all_turn: &mut bool,
     cancel_flag: &AtomicBool,
 ) -> (String, AgentStepEvent) {
-    let plan = plan_tool_execution(&call.name, &call.args, workspace_hint, permission_mode);
+    let mut plan = plan_tool_execution(&call.name, &call.args, workspace_hint, permission_mode);
+    if call.name.starts_with("mcp__") {
+        if let Some(meta) = mcp_mgr.find_tool(&call.name) {
+            if meta.server_trusted && permission_mode != AgentPermissionMode::Ask {
+                plan.requires_approval = false;
+            }
+        }
+    }
     let step_id = format!("{stream_id}_{turn_idx}_{call_idx}");
 
     let needs_prompt = plan.requires_approval && !(plan.allow_approve_all && *approve_all_turn);
@@ -2153,11 +668,184 @@ async fn run_tool_with_approval(
             match run_media_download(app, plugin_mgr, url, fmt, out_dir).await {
                 Ok(out) => {
                     let saved = out.outputs.first().cloned().unwrap_or_default();
+                    if !saved.is_empty() {
+                        plan.preview = Some(format!("Saved: {saved}"));
+                    }
                     (
                         true,
                         format!("{}\nSaved Path: {saved}", out.summary),
                         out.summary,
                     )
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "browser_open" | "browser_read" | "browser_click" | "browser_type" | "browser_scroll" | "browser_screenshot" | "browser_console" | "browser_close" => {
+            // If user paused AI for manual interaction ("我来操作"), wait cleanly until resumed or steered
+            if browser_mgr.is_user_takeover() && call.name != "browser_close" {
+                let wait_start = std::time::Instant::now();
+                while browser_mgr.is_user_takeover()
+                    && !cancel_flag.load(Ordering::Relaxed)
+                    && !controller.has_pending_steers()
+                    && wait_start.elapsed() < std::time::Duration::from_secs(300)
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+                if browser_mgr.is_user_takeover() && controller.has_pending_steers() {
+                    browser_mgr.set_user_takeover(app, false);
+                }
+            }
+            if cancel_flag.load(Ordering::Relaxed) {
+                (false, "Cancelled by user.".to_string(), "Cancelled".to_string())
+            } else {
+                match call.name.as_str() {
+                    "browser_open" => {
+                        let url = call.args["url"].as_str().unwrap_or("");
+                        let wait_ms = call.args["wait_ms"].as_u64().unwrap_or(5500);
+                        match browser_mgr.execute_open(app, sensor_state, url, wait_ms).await {
+                            Ok((out, det)) => (true, out, det),
+                            Err(e) => (false, format!("Error: {e}"), e),
+                        }
+                    }
+                    "browser_read" => {
+                        let max_chars = call.args["max_chars"].as_u64().unwrap_or(10_000).clamp(500, 16_000) as usize;
+                        match browser_mgr.execute_read(app, sensor_state, max_chars).await {
+                            Ok((out, det)) => (true, out, det),
+                            Err(e) => (false, format!("Error: {e}"), e),
+                        }
+                    }
+                    "browser_click" => {
+                        let target = call.args["target"].as_str().unwrap_or("");
+                        match browser_mgr.execute_click(app, sensor_state, target).await {
+                            Ok((out, det)) => (true, out, det),
+                            Err(e) => (false, format!("Error: {e}"), e),
+                        }
+                    }
+                    "browser_type" => {
+                        let target = call.args["target"].as_str().unwrap_or("");
+                        let text = call.args["text"].as_str().unwrap_or("");
+                        let submit = call.args["submit"].as_bool().unwrap_or(true);
+                        match browser_mgr.execute_type(app, sensor_state, target, text, submit).await {
+                            Ok((out, det)) => (true, out, det),
+                            Err(e) => (false, format!("Error: {e}"), e),
+                        }
+                    }
+                    "browser_scroll" => {
+                        let dir = call.args["direction"].as_str().unwrap_or("down");
+                        let amount = call.args["amount"].as_i64().unwrap_or(650) as i32;
+                        match browser_mgr.execute_scroll(app, sensor_state, dir, amount).await {
+                            Ok((out, det)) => (true, out, det),
+                            Err(e) => (false, format!("Error: {e}"), e),
+                        }
+                    }
+                    "browser_screenshot" => match browser_mgr.execute_screenshot_b64(app).await {
+                        Ok(b64) => {
+                            let (vis_model, vis_key) = if chat_model.supports_vision {
+                                (chat_model.clone(), chat_api_key.to_string())
+                            } else {
+                                settings_mgr.resolve_watch_target(None)
+                            };
+                            if vis_model.supports_vision {
+                                let frames = vec![InlineImageFrame {
+                                    label: "Built-in Browser Viewport".to_string(),
+                                    jpeg_b64: b64,
+                                }];
+                                match run_oneshot_vision(
+                                    http_client,
+                                    &vis_model,
+                                    &vis_key,
+                                    "Describe the key visual layout, playable media items, titles, buttons, errors, or prompts shown in this browser viewport concisely for another AI assistant.",
+                                    "Inspect this browser screenshot.",
+                                    &frames,
+                                    520,
+                                )
+                                .await
+                                {
+                                    Ok(desc) => (true, format!("[Browser Visual Snapshot]\n{desc}"), "Viewport inspected".to_string()),
+                                    Err(e) => (false, format!("Vision inspection failed: {e}"), "Vision error".to_string()),
+                                }
+                            } else {
+                                (
+                                    true,
+                                    "Visual inspection skipped (no Vision-enabled model configured); rely on `browser_read` text & element tags.".to_string(),
+                                    "No vision model".to_string(),
+                                )
+                            }
+                        }
+                        Err(e) => (false, format!("Error: {e}"), e),
+                    },
+                    "browser_console" => {
+                        let clear = call.args["clear"].as_bool().unwrap_or(false);
+                        match browser_mgr.execute_console(app, clear).await {
+                            Ok((out, det)) => (true, out, det),
+                            Err(e) => (false, format!("Error: {e}"), e),
+                        }
+                    }
+                    _ => {
+                        browser_mgr.close_browser(app, sensor_state);
+                        (true, "Built-in browser closed and memory freed.".to_string(), "Closed".to_string())
+                    }
+                }
+            }
+        }
+        "create_reminder" => {
+            let title = call.args["title"].as_str().unwrap_or("").trim();
+            let delay_min = call.args["delay_minutes"].as_f64();
+            let at_time = call.args["at_time"].as_str();
+            let repeat = call.args["repeat"].as_str();
+            let tz = local_utc_offset_ms();
+            match parse_fire_at_ms(delay_min, at_time, now_ms(), tz)
+                .and_then(|fire_ms| db.create_reminder(title, fire_ms, repeat))
+            {
+                Ok(rem) => {
+                    let _ = app.emit("buddy://reminders-changed", ());
+                    let when_str = format_local_datetime(rem.fire_at_ms, tz);
+                    let rep_str = rem
+                        .repeat_rule
+                        .as_deref()
+                        .map(|r| format!(" (repeat: {r})"))
+                        .unwrap_or_default();
+                    (
+                        true,
+                        format!("Reminder #{} scheduled for {}{}: {}", rem.id, when_str, rep_str, rem.title),
+                        when_str,
+                    )
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "list_reminders" => {
+            let include_done = call.args["include_completed"].as_bool().unwrap_or(false);
+            let tz = local_utc_offset_ms();
+            match db.list_reminders(include_done) {
+                Ok(items) if items.is_empty() => (
+                    true,
+                    "No reminders scheduled.".to_string(),
+                    "0 reminders".to_string(),
+                ),
+                Ok(items) => {
+                    let count = items.len();
+                    let lines = items
+                        .into_iter()
+                        .map(|r| {
+                            let when_str = format_local_datetime(r.fire_at_ms, tz);
+                            let rep = r.repeat_rule.as_deref().unwrap_or("once");
+                            let st = if r.enabled { "active" } else { "done" };
+                            format!("- [id={} {st} {rep}] {when_str} — {}", r.id, r.title)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (true, lines, format!("{count} reminders"))
+                }
+                Err(e) => (false, format!("Error: {e}"), e),
+            }
+        }
+        "delete_reminder" => {
+            let id = call.args["id"].as_i64().unwrap_or(0);
+            match db.delete_reminder(id) {
+                Ok(()) => {
+                    let _ = app.emit("buddy://reminders-changed", ());
+                    (true, format!("Deleted reminder #{id}."), "Deleted".to_string())
                 }
                 Err(e) => (false, format!("Error: {e}"), e),
             }
@@ -2228,6 +916,10 @@ async fn run_tool_with_approval(
                 Err(e) => (false, format!("Error: {e}"), e),
             }
         }
+        name if name.starts_with("mcp__") => match mcp_mgr.call_tool(name, call.args.clone()).await {
+            Ok(out) => (true, out, "MCP tool done".into()),
+            Err(e) => (false, format!("Error: {e}"), e),
+        },
         _ => {
             let name_owned = call.name.clone();
             let args_owned = call.args.clone();
@@ -2253,196 +945,6 @@ async fn run_tool_with_approval(
     };
     emit_step(app, &step);
     (output, step)
-}
-
-fn classify_protocol(api_provider: &str, base_url: &str) -> (bool, bool, bool, String) {
-    let clean_url = base_url.trim().trim_end_matches('/').to_string();
-    let is_local = clean_url.contains("localhost") || clean_url.contains("127.0.0.1");
-    let is_anthropic = api_provider == "anthropic" || clean_url.contains("anthropic.com");
-    let is_gemini = api_provider == "gemini"
-        || (clean_url.contains("generativelanguage.googleapis.com")
-            && !clean_url.contains("/openai"));
-    (is_local, is_anthropic, is_gemini, clean_url)
-}
-
-/// Non-streaming one-shot multimodal call used by the background screen sentinel & text-model fallback.
-pub async fn run_oneshot_vision(
-    client: &reqwest::Client,
-    model: &ResolvedModelConfig,
-    api_key: &str,
-    sys_prompt: &str,
-    user_prompt: &str,
-    frames: &[InlineImageFrame],
-    max_tokens: u32,
-) -> Result<String, String> {
-    let (is_local, is_anthropic, is_gemini, base_url) =
-        classify_protocol(&model.api_provider, &model.base_url);
-
-    if api_key.trim().is_empty() && !is_local {
-        return Err("No API Key configured for Watch model.".to_string());
-    }
-
-    if is_gemini {
-        let model_clean = model.model_id.trim().trim_start_matches("models/");
-        let endpoint = if base_url.ends_with("/v1beta") || base_url.ends_with("/v1") {
-            format!("{base_url}/models/{model_clean}:generateContent")
-        } else {
-            format!("{base_url}/v1beta/models/{model_clean}:generateContent")
-        };
-        let mut parts: Vec<Value> = Vec::new();
-        for f in frames {
-            parts.push(json!({
-                "inlineData": { "mimeType": "image/jpeg", "data": f.jpeg_b64 }
-            }));
-        }
-        parts.push(json!({ "text": user_prompt }));
-
-        let mut body = json!({
-            "contents": [{ "role": "user", "parts": parts }],
-            "generationConfig": { "maxOutputTokens": max_tokens }
-        });
-        let cap = infer_thinking_capability_with_mode(
-            &model.api_provider,
-            &model.base_url,
-            &model.model_id,
-            &model.thinking_mode,
-        );
-        let native_thinking = match cap.backend {
-            ThinkingBackend::GeminiBudget { .. } | ThinkingBackend::GeminiLevel { .. } => {
-                let min_lvl = clamp_thinking_level("off", &cap);
-                apply_native_thinking(&mut body, cap.backend, min_lvl)
-            }
-            _ => false,
-        };
-        if !sys_prompt.trim().is_empty() {
-            body["systemInstruction"] = json!({ "parts": [{ "text": sys_prompt }] });
-        }
-
-        let resp = send_post_with_retry(
-            client,
-            ApiProtocol::Gemini,
-            &endpoint,
-            api_key,
-            &mut body,
-            native_thinking,
-            None,
-            2,
-        )
-        .await
-        .map_err(|e| format!("Watch {e}"))?;
-        let val: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Watch parse failed: {e}"))?;
-        let mut out = String::new();
-        if let Some(arr) = val
-            .get("candidates")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("content"))
-            .and_then(|c| c.get("parts"))
-            .and_then(|p| p.as_array())
-        {
-            for p in arr {
-                if p.get("thought").and_then(|t| t.as_bool()).unwrap_or(false) {
-                    continue;
-                }
-                if let Some(t) = p.get("text").and_then(|v| v.as_str()) {
-                    out.push_str(t);
-                }
-            }
-        }
-        Ok(out.trim().to_string())
-    } else if is_anthropic {
-        let endpoint = if base_url.ends_with("/v1") {
-            format!("{base_url}/messages")
-        } else {
-            format!("{base_url}/v1/messages")
-        };
-        let mut content_parts: Vec<Value> = Vec::new();
-        for f in frames {
-            content_parts.push(json!({
-                "type": "image",
-                "source": { "type": "base64", "media_type": "image/jpeg", "data": f.jpeg_b64 }
-            }));
-        }
-        content_parts.push(json!({ "type": "text", "text": user_prompt }));
-        let mut body = json!({
-            "model": model.model_id.trim(),
-            "max_tokens": max_tokens,
-            "system": sys_prompt,
-            "messages": [{ "role": "user", "content": content_parts }]
-        });
-        let resp = send_post_with_retry(
-            client,
-            ApiProtocol::Anthropic,
-            &endpoint,
-            api_key,
-            &mut body,
-            false,
-            None,
-            2,
-        )
-        .await
-        .map_err(|e| format!("Watch {e}"))?;
-        let val: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Watch parse failed: {e}"))?;
-        let mut out = String::new();
-        if let Some(arr) = val.get("content").and_then(|c| c.as_array()) {
-            for blk in arr {
-                if blk.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    if let Some(t) = blk.get("text").and_then(|v| v.as_str()) {
-                        out.push_str(t);
-                    }
-                }
-            }
-        }
-        Ok(out.trim().to_string())
-    } else {
-        let endpoint = format!("{base_url}/chat/completions");
-        let mut user_parts: Vec<Value> = vec![json!({ "type": "text", "text": user_prompt })];
-        for f in frames {
-            user_parts.push(json!({
-                "type": "image_url",
-                "image_url": { "url": format!("data:image/jpeg;base64,{raw}", raw = f.jpeg_b64), "detail": "high" }
-            }));
-        }
-        let mut body = json!({
-            "model": model.model_id.trim(),
-            "max_tokens": max_tokens,
-            "messages": [
-                { "role": "system", "content": sys_prompt },
-                { "role": "user", "content": user_parts }
-            ]
-        });
-        let resp = send_post_with_retry(
-            client,
-            ApiProtocol::OpenAi,
-            &endpoint,
-            api_key,
-            &mut body,
-            false,
-            None,
-            2,
-        )
-        .await
-        .map_err(|e| format!("Watch {e}"))?;
-        let val: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Watch parse failed: {e}"))?;
-        let text = val
-            .get("choices")
-            .and_then(|c| c.get(0))
-            .and_then(|c| c.get("message"))
-            .and_then(|m| m.get("content"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        Ok(text)
-    }
 }
 
 fn build_screen_watch_prompts(
@@ -2577,6 +1079,21 @@ pub async fn run_screen_watch_check(
     Ok(Some(trimmed.to_string()))
 }
 
+struct StreamCleanupGuard {
+    app: AppHandle,
+    controller: Arc<AiStreamController>,
+    browser_mgr: Arc<BrowserManager>,
+    sensor_state: Arc<AppSensorState>,
+}
+
+impl Drop for StreamCleanupGuard {
+    fn drop(&mut self) {
+        self.controller.is_streaming.store(false, Ordering::Release);
+        self.controller.clear_steers();
+        self.browser_mgr.on_agent_turn_finished(&self.app, &self.sensor_state);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_chat_stream(
     app: AppHandle,
@@ -2584,6 +1101,9 @@ pub fn spawn_chat_stream(
     prompts_mgr: Arc<PromptsManager>,
     skills_mgr: Arc<SkillsManager>,
     plugin_mgr: Arc<PluginManager>,
+    browser_mgr: Arc<BrowserManager>,
+    mcp_mgr: Arc<McpManager>,
+    sensor_state: Arc<AppSensorState>,
     db: Arc<MemoryDb>,
     controller: Arc<AiStreamController>,
     approval_mgr: Arc<AgentApprovalManager>,
@@ -2598,9 +1118,17 @@ pub fn spawn_chat_stream(
     watch_profile_override: Option<String>,
 ) {
     controller.cancel_flag.store(false, Ordering::Relaxed);
+    controller.clear_steers();
+    controller.is_streaming.store(true, Ordering::Release);
     let cancel_flag = controller.cancel_flag.clone();
 
     tauri::async_runtime::spawn(async move {
+        let _cleanup_guard = StreamCleanupGuard {
+            app: app.clone(),
+            controller: controller.clone(),
+            browser_mgr: browser_mgr.clone(),
+            sensor_state: sensor_state.clone(),
+        };
         let cfg = settings_mgr.get();
         let (chat_model, api_key) = settings_mgr.resolve_chat_target();
         let (is_local, is_anthropic, is_gemini, base_url) =
@@ -2627,6 +1155,7 @@ pub fn spawn_chat_stream(
         let thinking_backend = thinking_cap.backend;
         let mirror_prefix = plugin_mgr.list().mirror_prefix;
         let media_dl_ready = plugin_mgr.is_engine_ready("media_downloader");
+        let active_mcp_tools = mcp_mgr.list_active_tools();
         let thinking_lang = detect_thinking_lang(&prompt, &history, &cfg.ui_language);
         let mut sys_prompt = if thinking_lang == ThinkingLang::Zh {
             format!(
@@ -2801,6 +1330,7 @@ pub fn spawn_chat_stream(
                     &gemini_contents,
                     cfg.agent_mode,
                     media_dl_ready,
+                    &active_mcp_tools,
                     thinking_level,
                     thinking_backend,
                     &stream_id,
@@ -2819,6 +1349,7 @@ pub fn spawn_chat_stream(
                     &anthropic_msgs,
                     cfg.agent_mode,
                     media_dl_ready,
+                    &active_mcp_tools,
                     thinking_level,
                     thinking_backend,
                     &stream_id,
@@ -2836,6 +1367,7 @@ pub fn spawn_chat_stream(
                     &openai_msgs,
                     cfg.agent_mode,
                     media_dl_ready,
+                    &active_mcp_tools,
                     thinking_level,
                     thinking_backend,
                     &stream_id,
@@ -2872,7 +1404,36 @@ pub fn spawn_chat_stream(
                         }
                         full_thought.push_str(&turn_thought);
                     }
-                    break;
+                    let pending_steers = controller.drain_steers();
+                    if pending_steers.is_empty() || cancel_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let combined_steer = format!(
+                        "[LIVE USER INSTRUCTION DURING TASK]\n{}",
+                        pending_steers.join("\n")
+                    );
+                    if is_gemini {
+                        if !turn_text.is_empty() {
+                            gemini_contents.push(json!({
+                                "role": "model",
+                                "parts": [{ "text": turn_text }]
+                            }));
+                        }
+                        gemini_contents.push(json!({
+                            "role": "user",
+                            "parts": [{ "text": combined_steer }]
+                        }));
+                    } else if is_anthropic {
+                        if !turn_text.is_empty() {
+                            anthropic_msgs.push(json!({ "role": "assistant", "content": turn_text }));
+                        }
+                        anthropic_msgs.push(json!({ "role": "user", "content": combined_steer }));
+                    } else {
+                        if !turn_text.is_empty() {
+                            openai_msgs.push(json!({ "role": "assistant", "content": turn_text }));
+                        }
+                        openai_msgs.push(json!({ "role": "user", "content": combined_steer }));
+                    }
                 }
                 Ok(TurnOutcome::ToolCalls {
                     turn_text,
@@ -2960,6 +1521,14 @@ pub fn spawn_chat_stream(
                             &approval_mgr,
                             &skills_mgr,
                             &plugin_mgr,
+                            &browser_mgr,
+                            &sensor_state,
+                            &mcp_mgr,
+                            &settings_mgr,
+                            &controller,
+                            &client,
+                            &chat_model,
+                            &api_key,
                             &db,
                             &mirror_prefix,
                             &stream_id,
@@ -3008,6 +1577,30 @@ pub fn spawn_chat_stream(
                             "content": anthropic_results
                         }));
                     }
+
+                    let live_steers = controller.drain_steers();
+                    if !live_steers.is_empty() {
+                        let steer_msg = format!(
+                            "[LIVE USER INSTRUCTION DURING TASK]\n{}",
+                            live_steers.join("\n")
+                        );
+                        if is_gemini {
+                            gemini_contents.push(json!({
+                                "role": "user",
+                                "parts": [{ "text": steer_msg }]
+                            }));
+                        } else if is_anthropic {
+                            anthropic_msgs.push(json!({
+                                "role": "user",
+                                "content": steer_msg
+                            }));
+                        } else {
+                            openai_msgs.push(json!({
+                                "role": "user",
+                                "content": steer_msg
+                            }));
+                        }
+                    }
                 }
             }
         }
@@ -3048,6 +1641,10 @@ pub fn spawn_chat_stream(
                 full_text,
                 full_thought,
             },
+        );
+        let _ = app.emit(
+            "buddy://conversations-changed",
+            serde_json::json!({ "conversation_id": conversation_id }),
         );
 
         // Background rolling compaction when uncompacted conversation messages exceed threshold
@@ -3120,380 +1717,18 @@ pub fn spawn_chat_stream(
     });
 }
 
-/// Lightweight live connectivity probe for OpenAI-compatible, Anthropic Claude, and Google Gemini endpoints.
-/// Returns latency in milliseconds on success.
-pub async fn verify_model_connection(
-    api_provider: &str,
-    base_url_raw: &str,
-    model_id: &str,
-    api_key: &str,
-) -> Result<u64, String> {
-    let base_url = base_url_raw.trim().trim_end_matches('/').to_string();
-    if base_url.is_empty() {
-        return Err("Base URL cannot be empty".to_string());
-    }
-    let is_local = base_url.contains("localhost") || base_url.contains("127.0.0.1");
-    if api_key.trim().is_empty() && !is_local {
-        return Err("API Key is required for remote endpoints".to_string());
-    }
-
-    let is_anthropic = api_provider == "anthropic" || base_url.contains("anthropic.com");
-    let is_gemini = api_provider == "gemini"
-        || (base_url.contains("generativelanguage.googleapis.com") && !base_url.contains("/openai"));
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(12))
-        .build()
-        .map_err(|e| format!("HTTP client init failed: {e}"))?;
-
-    let started = std::time::Instant::now();
-
-    if is_gemini {
-        let model_clean = model_id.trim().trim_start_matches("models/");
-        let endpoint = if base_url.ends_with("/v1beta") || base_url.ends_with("/v1") {
-            format!("{base_url}/models/{model_clean}")
-        } else {
-            format!("{base_url}/v1beta/models/{model_clean}")
-        };
-        let resp = client
-            .get(&endpoint)
-            .header("x-goog-api-key", api_key.trim())
-            .send()
-            .await
-            .map_err(|e| format!("Connection failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "HTTP {status}: {}",
-                txt.chars().take(120).collect::<String>()
-            ));
-        }
-    } else if is_anthropic {
-        let endpoint = if base_url.ends_with("/v1") {
-            format!("{base_url}/messages")
-        } else {
-            format!("{base_url}/v1/messages")
-        };
-        let body = json!({
-            "model": model_id.trim(),
-            "max_tokens": 1,
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        let resp = client
-            .post(&endpoint)
-            .header("x-api-key", api_key.trim())
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Connection failed: {e}"))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "HTTP {status}: {}",
-                txt.chars().take(120).collect::<String>()
-            ));
-        }
-    } else {
-        let models_url = format!("{base_url}/models");
-        let mut req = client.get(&models_url);
-        if !api_key.trim().is_empty() {
-            req = req.bearer_auth(api_key.trim());
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("Connection failed: {e}"))?;
-        let status = resp.status();
-        if status.as_u16() == 404 || status.as_u16() == 405 {
-            let chat_url = format!("{base_url}/chat/completions");
-            let body = json!({
-                "model": model_id.trim(),
-                "max_tokens": 1,
-                "messages": [{ "role": "user", "content": "hi" }]
-            });
-            let mut creq = client.post(&chat_url).json(&body);
-            if !api_key.trim().is_empty() {
-                creq = creq.bearer_auth(api_key.trim());
-            }
-            let cresp = creq
-                .send()
-                .await
-                .map_err(|e| format!("Connection failed: {e}"))?;
-            let cstatus = cresp.status();
-            if !cstatus.is_success() {
-                let txt = cresp.text().await.unwrap_or_default();
-                return Err(format!(
-                    "HTTP {cstatus}: {}",
-                    txt.chars().take(120).collect::<String>()
-                ));
-            }
-        } else if !status.is_success() {
-            let txt = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "HTTP {status}: {}",
-                txt.chars().take(120).collect::<String>()
-            ));
-        }
-    }
-
-    Ok(started.elapsed().as_millis() as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn thought_splitter_separates_chunked_tags_without_leaking() {
-        let mut s = ThoughtTagSplitter::new(true);
-        let chunks = [
-            "  <budd",
-            "y_thought>\nSte",
-            "p 1: check fact",
-            "</bud",
-            "dy_thought>\n\n1+1 ",
-            "= 2.",
-        ];
-        let mut th_all = String::new();
-        let mut ans_all = String::new();
-        for c in chunks {
-            let (th, ans) = s.push(c);
-            th_all.push_str(&th);
-            ans_all.push_str(&ans);
-        }
-        let (th_t, ans_t) = s.finish();
-        th_all.push_str(&th_t);
-        ans_all.push_str(&ans_t);
-
-        assert_eq!(th_all, "Step 1: check fact");
-        assert_eq!(ans_all, "1+1 = 2.");
-    }
-
-    #[test]
-    fn thought_splitter_passes_plain_text_when_no_tag_or_off() {
-        let mut s = ThoughtTagSplitter::new(true);
-        let (th, ans) = s.push("Hello world!");
-        assert_eq!(th, "");
-        assert_eq!(ans, "Hello world!");
-
-        let mut s_off = ThoughtTagSplitter::new(false);
-        let (th2, ans2) = s_off.push("<buddy_thought>raw");
-        assert_eq!(th2, "");
-        assert_eq!(ans2, "<buddy_thought>raw");
-    }
-
-    #[test]
-    fn infers_and_clamps_model_specific_thinking_capabilities() {
-        // Gemini 3.5 Flash Lite -> 4 native tiers, clamps max -> high
-        let g35 = infer_thinking_capability(
-            "gemini",
-            "https://generativelanguage.googleapis.com",
-            "gemini-3.5-flash-lite",
-        );
-        assert_eq!(g35.levels, &["off", "low", "medium", "high"]);
-        assert_eq!(
-            g35.backend,
-            ThinkingBackend::GeminiLevel {
-                allow_minimal: true
-            }
-        );
-        assert_eq!(clamp_thinking_level("max", &g35), "high");
-        assert_eq!(clamp_thinking_level("off", &g35), "off");
-
-        // Gemini 2.5 Pro -> cannot turn off completely
-        let g25p = infer_thinking_capability(
-            "gemini",
-            "https://generativelanguage.googleapis.com",
-            "gemini-2.5-pro",
-        );
-        assert_eq!(g25p.levels, &["low", "medium", "high", "max"]);
-        assert_eq!(clamp_thinking_level("off", &g25p), "low");
-        assert_eq!(clamp_thinking_level("max", &g25p), "max");
-
-        // Claude 4.5 (budget_tokens) vs Claude 4.7+ (adaptive) vs Claude 3.5 Haiku (prompt)
-        let c45 = infer_thinking_capability(
-            "anthropic",
-            "https://api.anthropic.com",
-            "claude-sonnet-4-5",
-        );
-        assert_eq!(c45.backend, ThinkingBackend::AnthropicBudget);
-
-        let c47 = infer_thinking_capability(
-            "anthropic",
-            "https://api.anthropic.com",
-            "claude-opus-4-7",
-        );
-        assert_eq!(c47.backend, ThinkingBackend::AnthropicAdaptive);
-
-        let c35h = infer_thinking_capability(
-            "anthropic",
-            "https://api.anthropic.com",
-            "claude-3-5-haiku-latest",
-        );
-        assert_eq!(c35h.backend, ThinkingBackend::PromptOnly);
-
-        // OpenAI o3 vs GPT-5 vs GPT-5.2 vs GPT-4o
-        let o3 = infer_thinking_capability("openai", "https://api.openai.com/v1", "o3");
-        assert_eq!(o3.levels, &["low", "medium", "high"]);
-        assert_eq!(clamp_thinking_level("off", &o3), "low");
-        assert_eq!(clamp_thinking_level("max", &o3), "high");
-
-        let gpt5 = infer_thinking_capability("openai", "https://api.openai.com/v1", "gpt-5-mini");
-        assert_eq!(gpt5.levels, &["off", "low", "medium", "high"]);
-        assert_eq!(clamp_thinking_level("max", &gpt5), "high");
-
-        let gpt52 = infer_thinking_capability("openai", "https://api.openai.com/v1", "gpt-5.2");
-        assert_eq!(gpt52.levels, &["off", "low", "medium", "high", "max"]);
-
-        let gpt4o = infer_thinking_capability("openai", "https://api.openai.com/v1", "gpt-4o-mini");
-        assert_eq!(gpt4o.backend, ThinkingBackend::PromptOnly);
-
-        // MiMo binary thinking toggle: active low preference must NOT clamp down to off
-        let mimo = infer_thinking_capability(
-            "openai",
-            "https://api.xiaomimimo.com/v1",
-            "mimo-v2-flash",
-        );
-        assert_eq!(mimo.levels, &["off", "high"]);
-        assert_eq!(clamp_thinking_level("low", &mimo), "high");
-        assert_eq!(clamp_thinking_level("off", &mimo), "off");
-
-        // DeepSeek Chat V3
-        let ds = infer_thinking_capability(
-            "openai",
-            "https://api.deepseek.com/v1",
-            "deepseek-chat",
-        );
-        assert_eq!(ds.levels, &["off", "low", "high", "max"]);
-        assert_eq!(clamp_thinking_level("medium", &ds), "low");
-    }
-
-    #[test]
-    fn native_thinking_payload_and_strip_work_cleanly() {
-        // Gemini 3 uses thinkingLevel and never sets thinkingBudget
-        let mut g_body = json!({ "contents": [] });
-        assert!(apply_native_thinking(
-            &mut g_body,
-            ThinkingBackend::GeminiLevel {
-                allow_minimal: true
-            },
-            "high"
-        ));
-        assert_eq!(
-            g_body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
-            "high"
-        );
-        assert!(g_body["generationConfig"]["thinkingConfig"]
-            .get("thinkingBudget")
-            .is_none());
-        strip_native_thinking(&mut g_body, ApiProtocol::Gemini);
-        assert!(g_body.get("generationConfig").is_none());
-
-        // Anthropic budget ensures max_tokens > budget_tokens and cleans up on downgrade
-        let mut a_body = json!({ "model": "claude-sonnet-4-5", "max_tokens": 4096 });
-        assert!(apply_native_thinking(
-            &mut a_body,
-            ThinkingBackend::AnthropicBudget,
-            "max"
-        ));
-        assert!(
-            a_body["max_tokens"].as_u64().unwrap()
-                > a_body["thinking"]["budget_tokens"].as_u64().unwrap()
-        );
-        strip_native_thinking(&mut a_body, ApiProtocol::Anthropic);
-        assert!(a_body.get("thinking").is_none());
-        assert_eq!(a_body["max_tokens"], 4096);
-
-        // OpenAI strip cleans reasoning_effort & thinking
-        let mut o_body = json!({ "model": "deepseek-chat" });
-        assert!(apply_native_thinking(
-            &mut o_body,
-            ThinkingBackend::DeepSeekChat,
-            "max"
-        ));
-        assert_eq!(o_body["reasoning_effort"], "max");
-        assert_eq!(o_body["thinking"]["type"], "enabled");
-        strip_native_thinking(&mut o_body, ApiProtocol::OpenAi);
-        assert!(o_body.get("reasoning_effort").is_none());
-        assert!(o_body.get("thinking").is_none());
-    }
-
-    #[test]
-    fn error_classifiers_and_retry_delays_are_bounded() {
-        assert!(is_thinking_param_rejection(
-            reqwest::StatusCode::BAD_REQUEST,
-            "Invalid value for 'reasoning_effort': unsupported"
-        ));
-        assert!(!is_thinking_param_rejection(
-            reqwest::StatusCode::BAD_REQUEST,
-            "Invalid API key provided"
-        ));
-        assert!(!is_thinking_param_rejection(
-            reqwest::StatusCode::SERVICE_UNAVAILABLE,
-            "This model is currently experiencing high demand"
-        ));
-
-        let d0 = retry_delay_ms(0, None);
-        let d2 = retry_delay_ms(2, Some(60));
-        assert!((1200..=1600).contains(&d0));
-        assert_eq!(d2, 15_000);
-    }
-
-    #[test]
-    fn manual_thinking_mode_overrides_auto_detection() {
-        let prompt_forced = infer_thinking_capability_with_mode(
-            "gemini",
-            "https://generativelanguage.googleapis.com",
-            "gemini-3.5-flash-lite",
-            "prompt",
-        );
-        assert_eq!(prompt_forced.backend, ThinkingBackend::PromptOnly);
-        assert_eq!(prompt_forced.levels, &["off", "low", "medium", "high", "max"]);
-
-        let native_forced = infer_thinking_capability_with_mode(
-            "openai",
-            "https://my-proxy.example.com/v1",
-            "custom-reasoning-alias",
-            "native",
-        );
-        assert_eq!(
-            native_forced.backend,
-            ThinkingBackend::OpenAiEffort {
-                allow_minimal: true,
-                allow_xhigh: false
-            }
-        );
-        assert_eq!(native_forced.levels, &["off", "low", "medium", "high"]);
-    }
-
-    #[test]
-    fn thinking_appendix_follows_user_language_and_natural_tone() {
-        assert_eq!(
-            detect_thinking_language_hint("帮我看看这个报错怎么回事", "en"),
-            "Simplified Chinese (简体中文)"
-        );
-        assert_eq!(
-            detect_thinking_language_hint("", "zh"),
-            "Simplified Chinese (简体中文)"
-        );
-        assert_eq!(
-            detect_thinking_language_hint("Analyze attached item", "zh"),
-            "Simplified Chinese (简体中文)"
-        );
-        assert_eq!(
-            detect_thinking_language_hint("https://example.com", "zh"),
-            "Simplified Chinese (简体中文)"
-        );
-        assert_eq!(
-            detect_thinking_language_hint("Explain this Rust error", "zh"),
-            "the exact same language as the user's latest message"
-        );
-        let app_zh = build_thinking_appendix("high", "帮我排查一下", "zh");
-        assert!(app_zh.contains("简体中文"));
-        assert!(app_zh.contains("reasoning_content"));
+    fn history_turn_clamping_caps_huge_turns_cleanly() {
+        let short = "hello buddy";
+        assert_eq!(clamp_history_turn_text(short), short);
+        let huge = "a".repeat(5000);
+        let clamped = clamp_history_turn_text(&huge);
+        assert!(clamped.chars().count() < 3700);
+        assert!(clamped.contains("truncated"));
     }
 
     #[test]

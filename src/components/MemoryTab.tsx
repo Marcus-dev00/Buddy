@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
+  Bell,
   Check,
   Copy,
   FolderOpen,
   Image as ImageIcon,
   Maximize2,
   Pin,
+  Plus,
   ScanText,
   Search,
   Sparkles,
@@ -15,9 +18,9 @@ import {
   X,
 } from "lucide-react";
 import { formatRelativeTime, getStrings } from "../i18n";
-import type { ClipboardParseResult, MemoryItem, OcrResult, UiLang } from "../types";
+import type { ClipboardParseResult, MemoryItem, OcrResult, ReminderItem, UiLang } from "../types";
 
-type MemoryFilter = "all" | "images" | "clipboard";
+type MemoryFilter = "all" | "images" | "clipboard" | "reminders";
 
 function BuddyMiniLogo() {
   return (
@@ -40,6 +43,7 @@ function BuddyMiniLogo() {
 
 interface MemoryTabProps {
   lang: UiLang;
+  isWindowMode?: boolean;
   refreshTrigger: number;
   enabledPlugins?: Record<string, boolean>;
   onAskAi: (item: MemoryItem) => void;
@@ -81,6 +85,7 @@ function MemoryImageView({
 
 export default function MemoryTab({
   lang,
+  isWindowMode = false,
   refreshTrigger,
   enabledPlugins = {},
   onAskAi,
@@ -90,6 +95,12 @@ export default function MemoryTab({
   const [filter, setFilter] = useState<MemoryFilter>("all");
   const [starredOnly, setStarredOnly] = useState(false);
   const [items, setItems] = useState<MemoryItem[]>([]);
+  const [reminders, setReminders] = useState<ReminderItem[]>([]);
+  const [remTitle, setRemTitle] = useState("");
+  const [remTimeSpec, setRemTimeSpec] = useState("20m");
+  const [remRepeat, setRemRepeat] = useState<"none" | "daily" | "weekdays" | "weekly">("none");
+  const [remError, setRemError] = useState<string | null>(null);
+  const [addingRem, setAddingRem] = useState(false);
   const [selectedItem, setSelectedItem] = useState<MemoryItem | null>(null);
   const [selectedParsed, setSelectedParsed] = useState<ClipboardParseResult | null>(null);
   const [copiedId, setCopiedId] = useState<number | null>(null);
@@ -106,10 +117,62 @@ export default function MemoryTab({
       .catch(() => {});
   };
 
+  const loadReminders = () => {
+    void invoke<ReminderItem[]>("list_reminders", { includeCompleted: true })
+      .then(setReminders)
+      .catch(() => {});
+  };
+
   useEffect(() => {
     const timer = window.setTimeout(() => loadMemories(query), 120);
     return () => window.clearTimeout(timer);
   }, [query, refreshTrigger]);
+
+  useEffect(() => {
+    loadReminders();
+  }, [refreshTrigger]);
+
+  useEffect(() => {
+    const u1 = listen("buddy://reminders-changed", () => loadReminders());
+    const u2 = listen("buddy://reminder-due", () => loadReminders());
+    return () => {
+      void u1.then((fn) => fn());
+      void u2.then((fn) => fn());
+    };
+  }, []);
+
+  const handleAddReminder = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const title = remTitle.trim();
+    const spec = remTimeSpec.trim();
+    if (!title || !spec || addingRem) return;
+    setRemError(null);
+    setAddingRem(true);
+    try {
+      const relMatch = /^(\d+(?:\.\d+)?)\s*(m|min|mins|h|hr|hrs|分钟|小时)?$/i.exec(spec);
+      let delayMinutes: number | null = null;
+      let atTime: string | null = null;
+      if (relMatch && !spec.includes(":")) {
+        const val = parseFloat(relMatch[1]);
+        const unit = (relMatch[2] ?? "m").toLowerCase();
+        delayMinutes = unit.startsWith("h") || unit.includes("小时") ? val * 60 : val;
+      } else {
+        atTime = spec;
+      }
+      const created = await invoke<ReminderItem>("create_reminder", {
+        title,
+        delayMinutes,
+        atTime,
+        repeatRule: remRepeat === "none" ? null : remRepeat,
+      });
+      setReminders((prev) => [created, ...prev]);
+      setRemTitle("");
+    } catch (err) {
+      setRemError(String(err));
+    } finally {
+      setAddingRem(false);
+    }
+  };
 
   useEffect(() => {
     setSelectedParsed(null);
@@ -184,13 +247,17 @@ export default function MemoryTab({
       });
   };
 
-  const baseItems = starredOnly ? items.filter((m) => m.is_starred) : items;
+  const baseItems = (starredOnly ? items.filter((m) => m.is_starred) : items).filter(
+    (m) => m.kind !== "fact"
+  );
   const imageItems = baseItems.filter(
     (m) => m.kind === "screenshot" || m.kind === "clipboard_image"
   );
-  const textItems = baseItems.filter(
-    (m) => m.kind === "clipboard_text" || m.kind === "fact"
-  );
+  const textItems = baseItems.filter((m) => m.kind === "clipboard_text");
+  const filteredReminders = query.trim()
+    ? reminders.filter((r) => r.title.toLowerCase().includes(query.trim().toLowerCase()))
+    : reminders;
+  const activeReminderCount = reminders.filter((r) => r.enabled).length;
 
   const showImages = filter === "all" || filter === "images";
   const showTexts = filter === "all" || filter === "clipboard";
@@ -200,61 +267,231 @@ export default function MemoryTab({
     (filter === "clipboard" && textItems.length === 0);
 
   return (
-    <div className="relative flex-1 flex flex-col min-h-0 space-y-2">
-      {/* Search Bar */}
-      <div className="relative shrink-0">
-        <Search className="w-3.5 h-3.5 text-white/40 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder={s.searchPlaceholder}
-          className="w-full rounded-xl bg-white/[0.07] border border-white/15 focus:border-white/35 outline-none pl-8 pr-3 py-1.5 text-[12px] text-white placeholder:text-white/40"
-        />
-      </div>
+    <div
+      className={`relative flex-1 flex flex-col min-h-0 ${
+        isWindowMode ? "max-w-5xl w-full mx-auto space-y-4" : "space-y-2"
+      }`}
+    >
+      {/* Toolbar: Horizontal single row in Window Mode, stacked compact in Island Mode */}
+      <div
+        className={
+          isWindowMode
+            ? "flex items-center justify-between gap-4 shrink-0"
+            : "space-y-2 shrink-0"
+        }
+      >
+        {!isWindowMode && (
+          <div className="relative shrink-0">
+            <Search className="w-3.5 h-3.5 text-white/40 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={s.searchPlaceholder}
+              className="w-full rounded-full bg-white/[0.06] border border-white/15 focus:border-white/35 outline-none pl-8 pr-3 py-1.5 text-[12px] text-white placeholder:text-white/40 transition"
+            />
+          </div>
+        )}
 
-      {/* Category Filter Tabs (Separate Screenshots & Copied Text) */}
-      <div className="flex items-center justify-between gap-2 shrink-0">
-        <div className="flex items-center gap-1 rounded-xl bg-white/[0.05] p-0.5 border border-white/10">
-          {(
-            [
-              { id: "all", label: `${s.tabAll} (${baseItems.length})` },
-              { id: "images", label: `${s.tabImages} (${imageItems.length})` },
-              { id: "clipboard", label: `${s.tabClipboard} (${textItems.length})` },
-            ] as const
-          ).map((tab) => (
+        <div className="flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-0.5 rounded-full bg-white/[0.045] p-0.5 border border-white/10 min-w-0 overflow-x-auto [&::-webkit-scrollbar]:hidden">
+            {(
+              [
+                { id: "all", label: `${s.tabAll} (${baseItems.length})` },
+                { id: "images", label: `${s.tabImages} (${imageItems.length})` },
+                { id: "clipboard", label: `${s.tabClipboard} (${textItems.length})` },
+                { id: "reminders", label: `${s.tabReminders} (${activeReminderCount})` },
+              ] as const
+            ).map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setFilter(tab.id)}
+                className={`shrink-0 whitespace-nowrap rounded-full border font-medium transition-all duration-200 ${
+                  isWindowMode ? "px-3.5 py-1 text-[12.5px]" : "px-2 py-0.5 text-[10.5px]"
+                } ${
+                  filter === tab.id
+                    ? "bg-white text-black border-white"
+                    : "border-transparent text-white/55 hover:text-white/90 hover:bg-white/[0.05]"
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+
+          {filter !== "reminders" && (
             <button
-              key={tab.id}
               type="button"
-              onClick={() => setFilter(tab.id)}
-              className={`px-2 py-0.5 rounded-lg text-[10.5px] font-medium transition ${
-                filter === tab.id
-                  ? "bg-white/15 text-white"
-                  : "text-white/50 hover:text-white/85"
+              onClick={() => setStarredOnly((v) => !v)}
+              title={s.starredFilter}
+              className={`rounded-full border shrink-0 transition ${
+                isWindowMode ? "p-2" : "p-1.5"
+              } ${
+                starredOnly
+                  ? "bg-amber-500/20 border-amber-400/35 text-amber-300"
+                  : "bg-white/[0.05] border-white/10 text-white/45 hover:text-white"
               }`}
             >
-              {tab.label}
+              <Star className={`w-3.5 h-3.5 ${starredOnly ? "fill-amber-300" : ""}`} />
             </button>
-          ))}
+          )}
         </div>
 
-        <button
-          type="button"
-          onClick={() => setStarredOnly((v) => !v)}
-          title={s.starredFilter}
-          className={`p-1 rounded-lg border transition ${
-            starredOnly
-              ? "bg-amber-500/20 border-amber-400/35 text-amber-300"
-              : "bg-white/[0.05] border-white/10 text-white/45 hover:text-white"
-          }`}
-        >
-          <Star className={`w-3.5 h-3.5 ${starredOnly ? "fill-amber-300" : ""}`} />
-        </button>
+        {isWindowMode && (
+          <div className="relative w-72 shrink-0">
+            <Search className="w-4 h-4 text-white/40 absolute left-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+            <input
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder={s.searchPlaceholder}
+              className="w-full rounded-full bg-white/[0.06] border border-white/15 focus:border-white/35 outline-none pl-9 pr-3.5 py-1.5 text-[13px] text-white placeholder:text-white/40 transition"
+            />
+          </div>
+        )}
       </div>
 
       {/* Scrollable Content */}
-      <div className="flex-1 overflow-y-auto space-y-3 pr-1">
-        {isEmpty ? (
+      <div className={`flex-1 overflow-y-auto pr-1 ${isWindowMode ? "space-y-5 pb-4" : "space-y-3"}`}>
+        {filter === "reminders" ? (
+          <div className={isWindowMode ? "max-w-2xl mx-auto w-full space-y-3" : "space-y-2.5"}>
+            <div className="rounded-2xl bg-sky-500/[0.07] border border-sky-400/20 p-2.5 space-y-2">
+              <div className="flex items-center gap-1.5 text-[11px] font-medium text-sky-200">
+                <Bell className="w-3.5 h-3.5 shrink-0" />
+                <span>{s.remindersTitle}</span>
+              </div>
+              <p className="text-[10.5px] text-white/55 leading-relaxed">{s.remindersHint}</p>
+              <form onSubmit={(e) => void handleAddReminder(e)} className="space-y-1.5">
+                <input
+                  type="text"
+                  value={remTitle}
+                  onChange={(e) => setRemTitle(e.target.value)}
+                  placeholder={s.remindersTitlePlaceholder}
+                  className="w-full rounded-xl bg-black/35 border border-white/12 focus:border-sky-400/50 outline-none px-2.5 py-1.5 text-[11px] text-white placeholder:text-white/35"
+                />
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={remTimeSpec}
+                    onChange={(e) => setRemTimeSpec(e.target.value)}
+                    placeholder={s.remindersTimePlaceholder}
+                    className="w-28 rounded-xl bg-black/35 border border-white/12 focus:border-sky-400/50 outline-none px-2 py-1 text-[10.5px] font-mono text-white placeholder:text-white/35"
+                  />
+                  <select
+                    value={remRepeat}
+                    onChange={(e) =>
+                      setRemRepeat(e.target.value as "none" | "daily" | "weekdays" | "weekly")
+                    }
+                    className="flex-1 rounded-xl bg-black/45 border border-white/12 outline-none px-2 py-1 text-[10.5px] text-white"
+                  >
+                    <option value="none">{s.repeatOnce}</option>
+                    <option value="daily">{s.repeatDaily}</option>
+                    <option value="weekdays">{s.repeatWeekdays}</option>
+                    <option value="weekly">{s.repeatWeekly}</option>
+                  </select>
+                  <button
+                    type="submit"
+                    disabled={!remTitle.trim() || !remTimeSpec.trim() || addingRem}
+                    className="px-2.5 py-1 rounded-xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 text-slate-950 text-[10.5px] font-semibold inline-flex items-center gap-1 shrink-0 transition"
+                  >
+                    <Plus className="w-3 h-3" />
+                    <span>{s.remindersAddBtn}</span>
+                  </button>
+                </div>
+                {remError && <div className="text-[10px] text-rose-300">{remError}</div>}
+              </form>
+            </div>
+
+            {filteredReminders.length === 0 ? (
+              <div className="rounded-2xl bg-white/[0.03] border border-white/10 p-5 text-center text-[11.5px] text-white/45">
+                {query.trim() ? s.noMatches : s.remindersEmpty}
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                {filteredReminders.map((rem) => {
+                  const dt = new Date(rem.fire_at_ms);
+                  const whenLabel = `${dt.getMonth() + 1}/${dt.getDate()} ${String(
+                    dt.getHours()
+                  ).padStart(2, "0")}:${String(dt.getMinutes()).padStart(2, "0")}`;
+                  const repLabel =
+                    rem.repeat_rule === "daily"
+                      ? s.repeatDaily
+                      : rem.repeat_rule === "weekdays"
+                      ? s.repeatWeekdays
+                      : rem.repeat_rule === "weekly"
+                      ? s.repeatWeekly
+                      : s.repeatOnce;
+                  return (
+                    <div
+                      key={rem.id}
+                      className={`group rounded-xl border px-3 py-2 flex items-center justify-between gap-2 transition ${
+                        rem.enabled
+                          ? "bg-white/[0.045] hover:bg-white/[0.07] border-white/10"
+                          : "bg-white/[0.02] border-white/[0.06] opacity-55"
+                      }`}
+                    >
+                      <div className="min-w-0 flex-1 space-y-0.5">
+                        <div className="text-[11.5px] text-white/90 font-medium truncate">
+                          {rem.title}
+                        </div>
+                        <div className="flex items-center gap-1.5 text-[9.5px] text-white/45 font-mono">
+                          <span className="text-sky-300/85">{whenLabel}</span>
+                          <span>·</span>
+                          <span className="px-1.5 py-[1px] rounded bg-white/[0.06] text-white/65">
+                            {repLabel}
+                          </span>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={rem.enabled}
+                          onClick={() => {
+                            void invoke<ReminderItem>("toggle_reminder", {
+                              id: rem.id,
+                              enabled: !rem.enabled,
+                            })
+                              .then((upd) =>
+                                setReminders((prev) =>
+                                  prev.map((x) => (x.id === upd.id ? upd : x))
+                                )
+                              )
+                              .catch(() => {});
+                          }}
+                          className={`relative w-7 h-4 rounded-full transition-colors ${
+                            rem.enabled ? "bg-sky-500" : "bg-white/20"
+                          }`}
+                        >
+                          <span
+                            className={`block w-3 h-3 rounded-full bg-white shadow transition-transform ${
+                              rem.enabled ? "translate-x-[14px]" : "translate-x-[2px]"
+                            }`}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void invoke("delete_reminder", { id: rem.id })
+                              .then(() =>
+                                setReminders((prev) => prev.filter((x) => x.id !== rem.id))
+                              )
+                              .catch(() => {});
+                          }}
+                          title={s.deleteTip}
+                          className="p-1.5 rounded-lg opacity-60 group-hover:opacity-100 text-white/45 hover:text-rose-300 hover:bg-rose-500/20 transition"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        ) : isEmpty ? (
           <div className="h-full flex flex-col items-center justify-center text-center py-8 text-white/45 text-[12px]">
             <p>{query ? s.noMatches : s.empty}</p>
           </div>
@@ -268,18 +505,26 @@ export default function MemoryTab({
                     {s.sectionImages} · {imageItems.length}
                   </div>
                 )}
-                <div className="grid grid-cols-2 gap-2">
+                <div
+                  className={
+                    isWindowMode
+                      ? "grid grid-cols-3 lg:grid-cols-4 gap-3.5"
+                      : "grid grid-cols-2 gap-2"
+                  }
+                >
                   {imageItems.map((item) => {
                     const imgPath = item.thumb_path || item.file_path || "";
                     return (
                       <div
                         key={item.id}
-                        className="group rounded-xl bg-white/[0.05] hover:bg-white/[0.08] border border-white/10 overflow-hidden flex flex-col transition"
+                        className="group rounded-2xl bg-white/[0.05] hover:bg-white/[0.08] border border-white/10 overflow-hidden flex flex-col transition"
                       >
                         <button
                           type="button"
                           onClick={() => setSelectedItem(item)}
-                          className="relative w-full h-24 bg-black/70 overflow-hidden cursor-zoom-in block text-left"
+                          className={`relative w-full bg-black/70 overflow-hidden cursor-zoom-in block text-left ${
+                            isWindowMode ? "aspect-[16/10]" : "h-24"
+                          }`}
                         >
                           <MemoryImageView
                             path={imgPath}
@@ -388,14 +633,17 @@ export default function MemoryTab({
             {showTexts && textItems.length > 0 && (
               <div className="space-y-1.5">
                 {filter === "all" && (
-                  <div className="text-[10px] font-medium uppercase tracking-wider text-white/45 px-0.5">
+                  <div className="text-[10.5px] font-medium uppercase tracking-wider text-white/45 px-0.5">
                     {s.sectionClipboard} · {textItems.length}
                   </div>
                 )}
+                <div className={isWindowMode ? "grid grid-cols-1 lg:grid-cols-2 gap-3" : "space-y-1.5"}>
                 {textItems.map((item) => (
                   <div
                     key={item.id}
-                    className="rounded-xl bg-white/[0.05] hover:bg-white/[0.08] border border-white/10 p-2.5 space-y-1.5 transition"
+                    className={`rounded-2xl bg-white/[0.05] hover:bg-white/[0.08] border border-white/10 space-y-1.5 transition ${
+                      isWindowMode ? "p-3.5" : "p-2.5"
+                    }`}
                   >
                     <div className="flex items-center justify-between gap-2">
                       <button
@@ -467,27 +715,38 @@ export default function MemoryTab({
                     <button
                       type="button"
                       onClick={() => setSelectedItem(item)}
-                      className="w-full text-left text-[11.5px] text-white/90 hover:text-white font-mono line-clamp-2 break-all leading-relaxed cursor-pointer"
+                      className={`w-full text-left text-white/90 hover:text-white font-mono line-clamp-2 break-all leading-relaxed cursor-pointer ${
+                        isWindowMode ? "text-[12.5px]" : "text-[11.5px]"
+                      }`}
                     >
                       {item.content_text || ""}
                     </button>
                   </div>
                 ))}
+                </div>
               </div>
             )}
           </>
         )}
       </div>
 
-      {/* IN-PANEL LIGHTBOX / TEXT READER MODAL */}
+      {/* IN-PANEL / CENTERED LIGHTBOX MODAL */}
       {selectedItem && (
         <div
           onClick={() => setSelectedItem(null)}
-          className="absolute inset-0 z-30 rounded-2xl bg-[#07070a]/95 backdrop-blur-md border border-white/15 p-3 flex flex-col space-y-2.5"
+          className={
+            isWindowMode
+              ? "fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-8"
+              : "absolute inset-0 z-30 rounded-2xl bg-[#07070a]/95 backdrop-blur-md border border-white/15 p-3 flex flex-col space-y-2.5"
+          }
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="flex-1 flex flex-col min-h-0 space-y-2.5"
+            className={
+              isWindowMode
+                ? "w-full max-w-4xl max-h-[84vh] rounded-2xl bg-[#0b0b0f] border border-white/15 shadow-2xl p-4 flex flex-col min-h-0 space-y-3"
+                : "flex-1 flex flex-col min-h-0 space-y-2.5"
+            }
           >
             {/* Modal Header */}
             <div className="flex items-center justify-between gap-2 shrink-0">

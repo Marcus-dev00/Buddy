@@ -1,24 +1,16 @@
-import React, { useEffect, useRef, useState } from "react";
-import Markdown from "react-markdown";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   Bot,
-  Brain,
   Check,
-  Copy,
-  CheckCircle2,
   ChevronDown,
-  ChevronRight,
   Download,
   FileText,
   Film,
-  Folder,
-  FolderOpen,
   History,
   ImageDown,
   Loader2,
   Lock,
-  MessageSquare,
   Monitor,
   Music,
   Paperclip,
@@ -26,101 +18,42 @@ import {
   Pin,
   Play,
   Plus,
-  RefreshCw,
   ScanText,
-  Search,
   Shield,
-  ShieldAlert,
-  ShieldCheck,
   Sparkles,
   Square,
-  Trash2,
   X,
-  XCircle,
-  Zap,
 } from "lucide-react";
-import { formatRelativeTime, getStrings } from "../i18n";
-import {
-  ALL_THINKING_LEVELS,
-  formatThinkingBadge,
-  type ModelThinkingCapability,
-} from "../thinking";
+import { getStrings } from "../i18n";
+import { ChatHistoryDrawer } from "./ChatHistoryDrawer";
+import { BrowserWatchCard } from "./BrowserWatchCard";
+import { AttachmentIcon, ChatMessageItem } from "./ChatMessageItem";
+import { ScreenSharePanel } from "./ScreenSharePanel";
+export { getStepDisplay, ThinkingSlider } from "./ChatSliders";
 import type {
   AgentPermissionMode,
-  AgentStep,
   ApprovalDecision,
   AttachmentPayload,
+  BrowserBookmark,
+  BrowserPreviewPayload,
+  BrowserStatePayload,
   ChatMessage,
   ConversationSummary,
   MemoryItem,
   ModelProfile,
   PluginProgressPayload,
   ShareStatePayload,
-  ShareTargetInfo,
   SkillInfo,
   ThinkingLevel,
   UiLang,
 } from "../types";
 
-function extractNodeText(node: React.ReactNode): string {
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(extractNodeText).join("");
-  if (node && typeof node === "object" && "props" in node) {
-    const props = (node as { props?: { children?: React.ReactNode } }).props;
-    return extractNodeText(props?.children);
-  }
-  return "";
-}
-
-function MarkdownCodePre({
-  children,
-  copyLabel,
-  copiedLabel,
-}: {
-  children?: React.ReactNode;
-  copyLabel: string;
-  copiedLabel: string;
-}) {
-  const [copied, setCopied] = useState(false);
-  const firstChild = Array.isArray(children) ? children[0] : children;
-  const childClass =
-    firstChild && typeof firstChild === "object" && "props" in firstChild
-      ? String((firstChild as { props?: { className?: string } }).props?.className ?? "")
-      : "";
-  const langMatch = /language-([\w-]+)/.exec(childClass);
-  const codeText = extractNodeText(children).replace(/\n$/, "");
-
-  return (
-    <div className="my-1.5 rounded-lg border border-white/10 bg-black/55 overflow-hidden">
-      <div className="flex items-center justify-between px-2.5 py-1 bg-white/[0.04] border-b border-white/[0.06] text-[10px] font-mono text-white/50">
-        <span>{langMatch ? langMatch[1] : "code"}</span>
-        <button
-          type="button"
-          onClick={() => {
-            void navigator.clipboard.writeText(codeText).then(() => {
-              setCopied(true);
-              window.setTimeout(() => setCopied(false), 1400);
-            });
-          }}
-          className="inline-flex items-center gap-1 text-white/65 hover:text-white transition"
-        >
-          {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
-          <span>{copied ? copiedLabel : copyLabel}</span>
-        </button>
-      </div>
-      <pre className="p-2 overflow-x-auto m-0 bg-transparent text-[11px] font-mono leading-relaxed">
-        {children}
-      </pre>
-    </div>
-  );
-}
-
 interface ChatTabProps {
   lang: UiLang;
+  isWindowMode?: boolean;
   agentMode: boolean;
   permissionMode: AgentPermissionMode;
   thinkingLevel: ThinkingLevel;
-  thinkingCapability?: ModelThinkingCapability;
   activeStreamId: string | null;
   messages: ChatMessage[];
   conversations: ConversationSummary[];
@@ -132,16 +65,20 @@ interface ChatTabProps {
   attachments: AttachmentPayload[];
   recentMemory: MemoryItem | null;
   onDismissRecent: () => void;
+  onAddAttachment?: (att: AttachmentPayload) => void;
+  onAddAttachments?: (atts: AttachmentPayload[]) => void;
   onRemoveAttachment: (idx: number) => void;
   onSend: (promptOverride?: string, attOverride?: AttachmentPayload[]) => void;
+  onRetryMessage?: (assistantMsgId: number) => void;
+  onEditMessage?: (userMsgId: number, newText: string) => void;
   onStopStream: () => void;
   onToggleAgentMode: () => void;
   onChangePermissionMode: (mode: AgentPermissionMode) => void;
-  onChangeThinkingLevel: (level: ThinkingLevel) => void;
   onResolveApproval: (stepId: string, decision: ApprovalDecision) => void;
   onNewChat: () => void;
   onSelectConversation: (id: number) => void;
   onDeleteConversation: (id: number) => void;
+  onRenameConversation: (id: number, title: string) => void;
   onOpenSettings: () => void;
   enabledPlugins?: Record<string, boolean>;
   installedPlugins?: Record<string, boolean>;
@@ -151,7 +88,12 @@ interface ChatTabProps {
   onQuickDownloadUrl?: (url: string, format: string) => void;
   pluginProgress?: Record<string, PluginProgressPayload>;
   shareState?: ShareStatePayload | null;
+  browserState?: BrowserStatePayload | null;
+  browserPreview?: BrowserPreviewPayload | null;
   modelProfiles?: ModelProfile[];
+  activeChatProfileId?: string;
+  activeModelName?: string;
+  onSelectChatModel?: (profileId: string) => void;
   defaultWatchProfileId?: string;
 }
 
@@ -172,453 +114,12 @@ export function memoryToAttachment(m: MemoryItem): AttachmentPayload {
   };
 }
 
-function AttachmentIcon({ kind }: { kind: AttachmentPayload["kind"] }) {
-  if (kind === "folder") return <Folder className="w-3 h-3 text-amber-300 shrink-0" />;
-  if (kind === "file") return <FileText className="w-3 h-3 text-emerald-300 shrink-0" />;
-  return <Paperclip className="w-3 h-3 shrink-0" />;
-}
-
-function AgentStepCard({
-  step,
-  lang,
-  onResolve,
-}: {
-  step: AgentStep;
-  lang: UiLang;
-  onResolve: (stepId: string, decision: ApprovalDecision) => void;
-}) {
-  const [expanded, setExpanded] = useState(step.status === "waiting_approval");
-  const s = getStrings(lang).chat;
-
-  if (step.status === "waiting_approval") {
-    const allowAll = step.detail === "allow_all" && !step.is_destructive;
-    return (
-      <div className="rounded-xl bg-amber-500/10 border border-amber-400/35 p-2 space-y-1.5">
-        <div className="flex items-start justify-between gap-2">
-          <div className="flex items-start gap-1.5 min-w-0">
-            <ShieldAlert className="w-3.5 h-3.5 text-amber-300 shrink-0 mt-0.5" />
-            <div className="min-w-0">
-              <div className="text-[11px] font-medium text-amber-200 leading-snug break-all">
-                {step.summary}
-              </div>
-              <div className="text-[10px] text-amber-300/75">
-                {step.is_destructive ? s.destructiveWarning : s.approvalRequired}
-              </div>
-            </div>
-          </div>
-          <span className="px-1.5 py-0.5 rounded bg-black/35 font-mono text-[9.5px] text-amber-300 shrink-0">
-            {step.tool_name}
-          </span>
-        </div>
-
-        {step.preview && (
-          <pre className="max-h-24 overflow-y-auto rounded-lg bg-black/55 border border-white/10 px-2 py-1.5 text-[10px] font-mono text-white/80 whitespace-pre-wrap break-all">
-            {step.preview}
-          </pre>
-        )}
-
-        <div className="flex items-center justify-end gap-1.5 pt-0.5">
-          <button
-            type="button"
-            onClick={() => onResolve(step.step_id, "reject")}
-            className="px-2 py-1 rounded-lg bg-white/10 hover:bg-rose-500/30 text-[10.5px] text-white/85 flex items-center gap-1 transition"
-          >
-            <X className="w-3 h-3" />
-            <span>{s.reject}</span>
-          </button>
-          {allowAll && (
-            <button
-              type="button"
-              onClick={() => onResolve(step.step_id, "approve_all_turn")}
-              className="px-2 py-1 rounded-lg bg-sky-500/20 hover:bg-sky-500/35 border border-sky-400/35 text-[10.5px] text-sky-200 transition"
-            >
-              {s.approveAll}
-            </button>
-          )}
-          <button
-            type="button"
-            onClick={() => onResolve(step.step_id, "approve_once")}
-            className="px-2.5 py-1 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-semibold text-[10.5px] flex items-center gap-1 transition"
-          >
-            <Check className="w-3 h-3" />
-            <span>{s.approve}</span>
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  const icon =
-    step.status === "running" ? (
-      <Loader2 className="w-3 h-3 text-sky-300 animate-spin shrink-0" />
-    ) : step.status === "done" ? (
-      <CheckCircle2 className="w-3 h-3 text-emerald-400 shrink-0" />
-    ) : step.status === "rejected" ? (
-      <XCircle className="w-3 h-3 text-amber-300/80 shrink-0" />
-    ) : (
-      <XCircle className="w-3 h-3 text-rose-400 shrink-0" />
-    );
-
-  const hasDetail = Boolean(step.preview || (step.detail && step.detail !== "allow_all"));
-
-  return (
-    <div className="rounded-lg bg-black/30 border border-white/[0.08] px-2 py-1 text-[10.5px]">
-      <div
-        onClick={() => {
-          if (hasDetail) setExpanded((v) => !v);
-        }}
-        className={`flex items-center justify-between gap-1.5 ${
-          hasDetail ? "cursor-pointer" : ""
-        }`}
-      >
-        <div className="flex items-center gap-1.5 min-w-0 flex-1">
-          {icon}
-          <span className="truncate text-white/80 font-mono text-[10.5px]">
-            {step.summary}
-          </span>
-        </div>
-        <div className="flex items-center gap-1 shrink-0 text-[10px] text-white/45">
-          {step.status === "rejected" ? (
-            <span className="text-amber-300/80">{s.rejectedLabel}</span>
-          ) : (
-            step.detail &&
-            step.detail !== "allow_all" && (
-              <span className="max-w-[85px] truncate">{step.detail}</span>
-            )
-          )}
-          {hasDetail &&
-            (expanded ? (
-              <ChevronDown className="w-2.5 h-2.5" />
-            ) : (
-              <ChevronRight className="w-2.5 h-2.5" />
-            ))}
-        </div>
-      </div>
-      {expanded && hasDetail && (
-        <div className="mt-1 pt-1 border-t border-white/[0.06] text-[10px] font-mono text-white/65 whitespace-pre-wrap break-all max-h-20 overflow-y-auto">
-          {step.preview || step.detail}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ThoughtBox({
-  thought,
-  isLive,
-  lang,
-}: {
-  thought?: string;
-  isLive: boolean;
-  lang: UiLang;
-}) {
-  const [open, setOpen] = useState(false);
-  const s = getStrings(lang).chat;
-
-  return (
-    <div className="mb-1">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="inline-flex items-center gap-1.5 py-0.5 text-[11px] text-white/45 hover:text-white/80 transition cursor-pointer select-none"
-      >
-        {isLive ? (
-          <span className="w-1.5 h-1.5 rounded-full bg-white/75 animate-pulse shrink-0" />
-        ) : (
-          <Brain className="w-3 h-3 text-white/40 shrink-0" />
-        )}
-        <span className={isLive ? "text-white/65 animate-pulse" : ""}>
-          {isLive ? s.thinkingActive : s.thoughtSaved}
-        </span>
-        {(thought?.trim() || open) &&
-          (open ? (
-            <ChevronDown className="w-2.5 h-2.5 text-white/40 shrink-0" />
-          ) : (
-            <ChevronRight className="w-2.5 h-2.5 text-white/40 shrink-0" />
-          ))}
-      </button>
-      {open && (
-        <div className="mt-1 mb-1 pl-2.5 border-l border-white/15 text-[11px] text-white/55 whitespace-pre-wrap break-words max-h-36 overflow-y-auto leading-relaxed">
-          {thought?.trim() ? thought : "..."}
-        </div>
-      )}
-    </div>
-  );
-}
-
-export const THINKING_STEPS: ThinkingLevel[] = ALL_THINKING_LEVELS;
-
-const DEFAULT_THINKING_CAP: ModelThinkingCapability = {
-  levels: ALL_THINKING_LEVELS,
-  isNative: false,
-  familyName: "Prompt",
-};
-
-export function getStepDisplay(
-  step: ThinkingLevel,
-  lang: UiLang,
-  cap: ModelThinkingCapability = DEFAULT_THINKING_CAP
-): { short: string; label: string; desc: string } {
-  const s = getStrings(lang).chat;
-  const base = s.thinkLevels[step];
-  const ov = cap.stepOverrides?.[step];
-  if (!ov) return base;
-  return {
-    short: ov.short,
-    label: ov.label,
-    desc: lang === "zh" ? ov.descZh : ov.descEn,
-  };
-}
-
-export function ThinkingSlider({
-  value,
-  lang,
-  capability,
-  disabled,
-  compact,
-  onChange,
-}: {
-  value: ThinkingLevel;
-  lang: UiLang;
-  capability?: ModelThinkingCapability;
-  disabled?: boolean;
-  compact?: boolean;
-  onChange: (next: ThinkingLevel) => void;
-}) {
-  const s = getStrings(lang).chat;
-  const cap = capability ?? DEFAULT_THINKING_CAP;
-  const steps = cap.levels.length > 0 ? cap.levels : THINKING_STEPS;
-  const rawIdx = steps.indexOf(value);
-  const idx = rawIdx >= 0 ? rawIdx : 0;
-  const count = steps.length;
-  const trackRef = useRef<HTMLDivElement | null>(null);
-  const draggingRef = useRef(false);
-
-  const pickByClientX = (clientX: number) => {
-    const el = trackRef.current;
-    if (!el || disabled) return;
-    const rect = el.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const ratio = Math.max(0, Math.min(0.999, (clientX - rect.left) / rect.width));
-    const nextIdx = Math.floor(ratio * count);
-    const next = steps[nextIdx];
-    if (next && next !== value) {
-      onChange(next);
-    }
-  };
-
-  const activeStep = steps[idx] ?? "medium";
-  const accentBar =
-    activeStep === "off"
-      ? "bg-white/25"
-      : activeStep === "low"
-      ? "bg-white/60"
-      : activeStep === "medium"
-      ? "bg-sky-400"
-      : activeStep === "high"
-      ? "bg-indigo-400"
-      : "bg-amber-400 shadow-[0_0_8px_rgba(251,191,36,0.75)]";
-
-  const widthClass = compact
-    ? count <= 2
-      ? "w-[82px] h-[24px]"
-      : count === 3
-      ? "w-[110px] h-[24px]"
-      : count === 4
-      ? "w-[128px] h-[24px]"
-      : "w-[144px] h-[24px]"
-    : count <= 2
-    ? "w-[116px] h-[26px]"
-    : count === 3
-    ? "w-[148px] h-[26px]"
-    : count === 4
-    ? "w-[174px] h-[26px]"
-    : "w-[196px] h-[26px]";
-
-  const badgeText = formatThinkingBadge(cap, lang);
-
-  return (
-    <div
-      ref={trackRef}
-      role="slider"
-      aria-label={s.thinkPrefix}
-      aria-valuemin={0}
-      aria-valuemax={Math.max(0, count - 1)}
-      aria-valuenow={idx}
-      onPointerDown={(e) => {
-        if (disabled) return;
-        draggingRef.current = true;
-        e.currentTarget.setPointerCapture(e.pointerId);
-        pickByClientX(e.clientX);
-      }}
-      onPointerMove={(e) => {
-        if (!draggingRef.current || disabled) return;
-        pickByClientX(e.clientX);
-      }}
-      onPointerUp={(e) => {
-        if (draggingRef.current) {
-          draggingRef.current = false;
-          try {
-            e.currentTarget.releasePointerCapture(e.pointerId);
-          } catch {
-            // ignore
-          }
-        }
-      }}
-      onPointerCancel={() => {
-        draggingRef.current = false;
-      }}
-      style={{ gridTemplateColumns: `repeat(${count}, minmax(0, 1fr))` }}
-      className={`relative grid items-center rounded-lg bg-[#08090d] border border-white/[0.09] p-[2px] select-none touch-none ${widthClass} ${
-        disabled ? "opacity-45 pointer-events-none" : "cursor-pointer"
-      }`}
-    >
-      {/* Smooth Gliding Elevated Thumb (Codex / Claude Code matte glass) */}
-      <div
-        className="pointer-events-none absolute top-[2px] bottom-[2px] left-[2px] rounded-[6px] bg-white/[0.11] border border-white/[0.15] shadow-[0_1px_4px_rgba(0,0,0,0.65)] flex flex-col justify-end items-center pb-[1.5px] transition-transform duration-200 ease-out"
-        style={{
-          width: `calc((100% - 4px) / ${count})`,
-          transform: `translateX(${idx * 100}%)`,
-        }}
-      >
-        <span className={`w-3.5 h-[1.5px] rounded-full transition-colors ${accentBar}`} />
-      </div>
-
-      {steps.map((step, i) => {
-        const active = i === idx;
-        const stepInfo = getStepDisplay(step, lang, cap);
-        return (
-          <div
-            key={step}
-            title={`${badgeText} — ${stepInfo.desc}`}
-            className={`relative z-10 text-center text-[9.5px] tracking-tight transition-colors ${
-              active
-                ? step === "max"
-                  ? "text-amber-200 font-semibold"
-                  : "text-white font-medium"
-                : "text-white/40 hover:text-white/75"
-            }`}
-          >
-            {stepInfo.short}
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
-const PERMISSION_STEPS: AgentPermissionMode[] = ["ask", "default", "auto"];
-
-function PermissionSlider({
-  value,
-  lang,
-  onChange,
-}: {
-  value: AgentPermissionMode;
-  lang: UiLang;
-  onChange: (next: AgentPermissionMode) => void;
-}) {
-  const s = getStrings(lang).chat;
-  const rawIdx = PERMISSION_STEPS.indexOf(value);
-  const idx = rawIdx >= 0 ? rawIdx : 1;
-  const trackRef = useRef<HTMLDivElement | null>(null);
-  const draggingRef = useRef(false);
-
-  const pickByClientX = (clientX: number) => {
-    const el = trackRef.current;
-    if (!el) return;
-    const rect = el.getBoundingClientRect();
-    if (rect.width <= 0) return;
-    const ratio = Math.max(0, Math.min(0.999, (clientX - rect.left) / rect.width));
-    const nextIdx = Math.floor(ratio * PERMISSION_STEPS.length);
-    const next = PERMISSION_STEPS[nextIdx];
-    if (next && next !== value) {
-      onChange(next);
-    }
-  };
-
-  const accentBar =
-    value === "ask"
-      ? "bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.65)]"
-      : value === "auto"
-      ? "bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.75)]"
-      : "bg-blue-400 shadow-[0_0_8px_rgba(96,165,250,0.65)]";
-
-  return (
-    <div
-      ref={trackRef}
-      role="radiogroup"
-      aria-label="Agent permission mode"
-      onPointerDown={(e) => {
-        draggingRef.current = true;
-        e.currentTarget.setPointerCapture(e.pointerId);
-        pickByClientX(e.clientX);
-      }}
-      onPointerMove={(e) => {
-        if (!draggingRef.current) return;
-        pickByClientX(e.clientX);
-      }}
-      onPointerUp={(e) => {
-        if (!draggingRef.current) return;
-        draggingRef.current = false;
-        try {
-          e.currentTarget.releasePointerCapture(e.pointerId);
-        } catch {
-          // ignore
-        }
-      }}
-      onPointerCancel={() => {
-        draggingRef.current = false;
-      }}
-      style={{ gridTemplateColumns: "repeat(3, minmax(0, 1fr))" }}
-      className="relative grid items-center rounded-lg bg-[#08090d] border border-white/[0.09] p-[2px] select-none touch-none w-[168px] h-[24px] cursor-pointer shrink-0"
-    >
-      {/* Smooth Gliding Elevated Thumb matching ThinkingSlider */}
-      <div
-        className="pointer-events-none absolute top-[2px] bottom-[2px] left-[2px] rounded-[6px] bg-white/[0.11] border border-white/[0.15] shadow-[0_1px_4px_rgba(0,0,0,0.65)] flex flex-col justify-end items-center pb-[1.5px] transition-transform duration-200 ease-out"
-        style={{
-          width: "calc((100% - 4px) / 3)",
-          transform: `translateX(${idx * 100}%)`,
-        }}
-      >
-        <span className={`w-4 h-[1.5px] rounded-full transition-colors duration-200 ${accentBar}`} />
-      </div>
-
-      {(
-        [
-          { id: "ask", icon: ShieldAlert, activeText: "text-cyan-200 font-medium" },
-          { id: "default", icon: ShieldCheck, activeText: "text-blue-200 font-medium" },
-          { id: "auto", icon: Zap, activeText: "text-rose-200 font-semibold" },
-        ] as const
-      ).map((item) => {
-        const active = value === item.id;
-        const Icon = item.icon;
-        const info = s.permModes[item.id];
-        return (
-          <div
-            key={item.id}
-            role="radio"
-            aria-checked={active}
-            title={info.desc}
-            className={`relative z-10 flex items-center justify-center gap-0.5 text-[9.5px] tracking-tight transition-colors duration-200 ${
-              active ? item.activeText : "text-white/40 hover:text-white/75"
-            }`}
-          >
-            <Icon className="w-2.5 h-2.5 shrink-0" />
-            <span>{info.label}</span>
-          </div>
-        );
-      })}
-    </div>
-  );
-}
-
 export default function ChatTab({
   lang,
+  isWindowMode = false,
   agentMode,
   permissionMode,
   thinkingLevel,
-  thinkingCapability,
   activeStreamId,
   messages,
   conversations,
@@ -630,16 +131,20 @@ export default function ChatTab({
   attachments,
   recentMemory,
   onDismissRecent,
+  onAddAttachment,
+  onAddAttachments,
   onRemoveAttachment,
   onSend,
+  onRetryMessage,
+  onEditMessage,
   onStopStream,
   onToggleAgentMode,
   onChangePermissionMode,
-  onChangeThinkingLevel,
   onResolveApproval,
   onNewChat,
   onSelectConversation,
   onDeleteConversation,
+  onRenameConversation,
   onOpenSettings,
   enabledPlugins = {},
   installedPlugins = {},
@@ -649,32 +154,68 @@ export default function ChatTab({
   onQuickDownloadUrl,
   pluginProgress = {},
   shareState = null,
+  browserState = null,
+  browserPreview = null,
   modelProfiles = [],
   defaultWatchProfileId = "",
 }: ChatTabProps) {
   const [showHistory, setShowHistory] = useState(false);
-  const [historySearch, setHistorySearch] = useState("");
   const [showSharePanel, setShowSharePanel] = useState(false);
-  const [shareTargets, setShareTargets] = useState<ShareTargetInfo[]>([]);
-  const [selectedTargetId, setSelectedTargetId] = useState("auto_cursor");
-  const [shareGoal, setShareGoal] = useState("");
-  const [shareCadence, setShareCadence] = useState<"quiet" | "balanced" | "active">("balanced");
-  const [shareShowBorder, setShareShowBorder] = useState(true);
-  const [shareWatchId, setShareWatchId] = useState(defaultWatchProfileId || "");
-  const [shareError, setShareError] = useState<string | null>(null);
-  const [shareStarting, setShareStarting] = useState(false);
+  const [showPermMenu, setShowPermMenu] = useState(false);
+  const [bookmarks, setBookmarks] = useState<BrowserBookmark[]>([]);
   const [activeUserIdx, setActiveUserIdx] = useState(0);
   const [slashDismissed, setSlashDismissed] = useState(false);
   const [slashSelIdx, setSlashSelIdx] = useState(0);
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const permMenuRef = useRef<HTMLDivElement | null>(null);
   const scrollBoxRef = useRef<HTMLDivElement | null>(null);
   const msgRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const s = getStrings(lang).chat;
   const sp = getStrings(lang).plugins;
 
+  const refreshBookmarks = useCallback(() => {
+    void invoke<BrowserBookmark[]>("list_browser_bookmarks")
+      .then(setBookmarks)
+      .catch(() => {});
+  }, []);
+
   useEffect(() => {
-    setShareWatchId((cur) => cur || defaultWatchProfileId || "");
-  }, [defaultWatchProfileId]);
+    refreshBookmarks();
+  }, [refreshBookmarks]);
+
+  useEffect(() => {
+    if (!showPermMenu) return;
+    const onDocDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (permMenuRef.current && !permMenuRef.current.contains(target)) {
+        setShowPermMenu(false);
+      }
+    };
+    window.addEventListener("mousedown", onDocDown);
+    return () => window.removeEventListener("mousedown", onDocDown);
+  }, [showPermMenu]);
+
+  const handleToggleBookmark = (url: string, title: string) => {
+    const existing = bookmarks.find((b) => b.url === url);
+    if (existing) {
+      void invoke("delete_browser_bookmark", { id: existing.id })
+        .then(() => setBookmarks((prev) => prev.filter((b) => b.id !== existing.id)))
+        .catch(() => {});
+    } else {
+      void invoke<BrowserBookmark>("add_browser_bookmark", { title, url })
+        .then((created) =>
+          setBookmarks((prev) => [created, ...prev.filter((b) => b.id !== created.id)])
+        )
+        .catch(() => {});
+    }
+  };
+
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(92, Math.max(32, el.scrollHeight))}px`;
+  }, [chatInput]);
 
   useEffect(() => {
     const onFocusInput = () => {
@@ -684,78 +225,17 @@ export default function ChatTab({
     return () => window.removeEventListener("buddy-focus-chat-input", onFocusInput);
   }, []);
 
-  useEffect(() => {
-    if (shareState?.active) {
-      setSelectedTargetId(shareState.target_id || "auto_cursor");
-      setShareGoal(shareState.goal || "");
-      setShareCadence((shareState.cadence as "quiet" | "balanced" | "active") || "balanced");
-      setShareShowBorder(shareState.show_border);
-      if (shareState.watch_profile_id) {
-        setShareWatchId(shareState.watch_profile_id);
-      }
-    }
-  }, [shareState?.active, shareState?.target_id]);
-
-  const loadShareTargets = async () => {
-    try {
-      const list = await invoke<ShareTargetInfo[]>("list_share_targets");
-      setShareTargets(list);
-    } catch {
-      // ignore
-    }
-  };
-
   const handleOpenSharePanel = () => {
     const next = !showSharePanel;
     setShowSharePanel(next);
     if (next) {
       setShowHistory(false);
-      setShareError(null);
-      void loadShareTargets();
     }
   };
 
-  const handleStartShare = async () => {
-    setShareStarting(true);
-    setShareError(null);
-    try {
-      await invoke("start_screen_share", {
-        request: {
-          target_id: selectedTargetId,
-          goal: shareGoal,
-          cadence: shareCadence,
-          show_border: shareShowBorder,
-          watch_profile_id: shareWatchId,
-          window_edge: "top",
-          window_ratio: 0.5,
-        },
-      });
-      setShowSharePanel(false);
-    } catch (err) {
-      setShareError(String(err));
-    } finally {
-      setShareStarting(false);
-    }
-  };
-
-  const syncLiveShareOpt = (patch: {
-    goal?: string;
-    cadence?: string;
-    showBorder?: boolean;
-    watchProfileId?: string;
-  }) => {
-    if (!shareState?.active) return;
-    void invoke("update_screen_share_options", patch).catch(() => {});
-  };
-
-  useEffect(() => {
-    if (!shareState?.active) return;
-    if (shareGoal === (shareState.goal || "")) return;
-    const t = window.setTimeout(() => {
-      void invoke("update_screen_share_options", { goal: shareGoal }).catch(() => {});
-    }, 350);
-    return () => window.clearTimeout(t);
-  }, [shareGoal, shareState?.active, shareState?.goal]);
+  const registerUserRef = useCallback((id: number, el: HTMLDivElement | null) => {
+    msgRefs.current[id] = el;
+  }, []);
 
   const enabledSkills = skills.filter((sk) => sk.enabled);
   const slashMatch = !slashDismissed ? chatInput.match(/^\/([^\s]*)$/) : null;
@@ -902,9 +382,61 @@ export default function ChatTab({
   const activeConv = conversations.find((c) => c.id === activeConversationId);
 
   return (
-    <div className="flex-1 flex flex-col min-h-0">
-      {/* Top Bar: History Toggle + Thinking Effort + New Chat */}
-      <div className="flex items-center justify-between gap-1 pb-1.5 shrink-0 border-b border-white/[0.06] mb-1.5">
+    <div className={`flex-1 flex min-h-0 ${isWindowMode ? "flex-row" : "flex-col"}`}>
+      {/* Permanent Left History Sidebar in Large Window Mode */}
+      {isWindowMode && (
+        <aside className="w-[268px] shrink-0 bg-[#08080b] border-r border-white/[0.08] p-3.5 flex flex-col min-h-0">
+          <div className="flex items-center justify-between gap-2 pb-2.5 mb-2 border-b border-white/[0.07] shrink-0">
+            <span className="text-[12px] font-medium text-white/65 flex items-center gap-1.5">
+              <History className="w-3.5 h-3.5" />
+              <span>
+                {s.history} ({conversations.filter((c) => c.message_count > 0).length})
+              </span>
+            </span>
+            <button
+              type="button"
+              onClick={() => {
+                setShowSharePanel(false);
+                onNewChat();
+              }}
+              disabled={isThinking}
+              title={s.newChatTip}
+              className="px-2.5 py-1 rounded-full bg-white hover:bg-white/90 text-[11px] font-semibold text-black inline-flex items-center gap-1 disabled:opacity-40 transition"
+            >
+              <Plus className="w-3 h-3" />
+              <span>{s.newChat}</span>
+            </button>
+          </div>
+          <ChatHistoryDrawer
+            sidebar
+            lang={lang}
+            conversations={conversations}
+            activeConversationId={activeConversationId}
+            onSelectConversation={(id) => {
+              setShowSharePanel(false);
+              onSelectConversation(id);
+            }}
+            onDeleteConversation={onDeleteConversation}
+            onRenameConversation={onRenameConversation}
+            onClose={() => {}}
+          />
+        </aside>
+      )}
+
+      <div className={`flex-1 flex flex-col min-w-0 min-h-0 ${isWindowMode ? "px-6 py-3" : ""}`}>
+      {/* Top Bar: Aligned to reading column in Window Mode */}
+      <div
+        className={`flex items-center justify-between gap-2 shrink-0 border-b border-white/[0.06] ${
+          isWindowMode
+            ? "max-w-3xl w-full mx-auto pb-2.5 mb-2.5"
+            : "pb-1.5 mb-1.5"
+        }`}
+      >
+        {isWindowMode ? (
+          <div className="text-[13.5px] font-semibold text-white/90 truncate">
+            {activeConv && activeConv.message_count > 0 ? activeConv.title : s.newChat}
+          </div>
+        ) : (
         <button
           onClick={() => {
             const next = !showHistory;
@@ -918,7 +450,7 @@ export default function ChatTab({
           }`}
         >
           <History className="w-3 h-3 shrink-0" />
-          <span className="truncate max-w-[60px]">
+          <span className="truncate max-w-[136px]">
             {showHistory
               ? s.backToChat
               : activeConv && activeConv.message_count > 0
@@ -926,17 +458,90 @@ export default function ChatTab({
               : `${s.history} (${conversations.filter((c) => c.message_count > 0).length})`}
           </span>
         </button>
+        )}
 
-        <div className="flex items-center gap-1 shrink-0">
+        <div className={`flex items-center shrink-0 ${isWindowMode ? "gap-2" : "gap-1"}`}>
+          {agentMode && (
+            <div ref={permMenuRef} className="relative">
+              <button
+                type="button"
+                onClick={() => setShowPermMenu((v) => !v)}
+                title={s.permModes[permissionMode].desc}
+                className={`flex items-center gap-1.5 rounded-lg border transition ${
+                  isWindowMode ? "px-2.5 py-1 text-[11.5px]" : "px-1.5 py-0.5 text-[10px]"
+                } ${
+                  showPermMenu
+                    ? "bg-white/15 border-white/20 text-white"
+                    : "border-white/[0.08] bg-white/[0.03] text-white/70 hover:text-white hover:bg-white/[0.08]"
+                }`}
+              >
+                <Shield
+                  className={`${isWindowMode ? "w-3.5 h-3.5" : "w-2.5 h-2.5"} shrink-0 ${
+                    permissionMode === "ask"
+                      ? "text-white/75"
+                      : permissionMode === "auto"
+                      ? "text-rose-300"
+                      : "text-emerald-300"
+                  }`}
+                />
+                <span className="truncate max-w-[84px] font-medium">
+                  {s.permModes[permissionMode].label}
+                </span>
+                <ChevronDown className="w-3 h-3 opacity-60 shrink-0" />
+              </button>
+              {showPermMenu && (
+                <div className="absolute right-0 top-full mt-1.5 w-56 rounded-xl bg-[#0d0d10]/98 border border-white/15 shadow-2xl backdrop-blur-xl py-1 z-30">
+                  {(["ask", "default", "auto"] as const).map((mode) => {
+                    const isCur = mode === permissionMode;
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => {
+                          setShowPermMenu(false);
+                          if (!isCur) onChangePermissionMode(mode);
+                        }}
+                        className={`w-full px-3 py-2 text-left flex items-center justify-between gap-2 text-[11.5px] transition ${
+                          isCur
+                            ? "bg-white/[0.12] text-white"
+                            : "text-white/75 hover:bg-white/[0.07] hover:text-white"
+                        }`}
+                      >
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1.5 font-medium">
+                            <Shield
+                              className={`w-3 h-3 shrink-0 ${
+                                mode === "ask"
+                                  ? "text-white/75"
+                                  : mode === "auto"
+                                  ? "text-rose-300"
+                                  : "text-emerald-300"
+                              }`}
+                            />
+                            <span className="truncate">{s.permModes[mode].label}</span>
+                          </div>
+                          <div className="text-[10px] text-white/45 truncate mt-0.5">
+                            {s.permModes[mode].desc}
+                          </div>
+                        </div>
+                        {isCur && <Check className="w-3.5 h-3.5 text-white shrink-0" />}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
           {!agentMode && (
             <button
               type="button"
               disabled={isThinking}
               onClick={onToggleAgentMode}
               title={s.agentToggleTip}
-              className="flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium border bg-white/[0.05] border-white/10 text-white/45 hover:text-white/85 transition disabled:opacity-50"
+              className="flex items-center gap-1 px-2 py-0.5 rounded-full text-[10.5px] font-medium border bg-white/[0.05] border-white/10 text-white/45 hover:text-white/85 transition disabled:opacity-50"
             >
-              <Bot className="w-2.5 h-2.5" />
+              <Bot className="w-3 h-3" />
               <span>{s.agentOff}</span>
             </button>
           )}
@@ -945,12 +550,14 @@ export default function ChatTab({
             type="button"
             onClick={handleOpenSharePanel}
             title={s.shareTitle}
-            className={`flex items-center gap-1 px-1.5 py-0.5 rounded-lg text-[10.5px] border transition ${
+            className={`flex items-center gap-1.5 rounded-lg border transition ${
+              isWindowMode ? "px-2.5 py-1 text-[11.5px]" : "px-1.5 py-0.5 text-[10.5px]"
+            } ${
               shareState?.active
                 ? "bg-white/15 border-white/25 text-white"
                 : showSharePanel
                 ? "bg-white/15 border-white/20 text-white"
-                : "border-transparent text-white/60 hover:text-white hover:bg-white/[0.07]"
+                : "border-white/[0.08] bg-white/[0.03] text-white/65 hover:text-white hover:bg-white/[0.08]"
             }`}
           >
             {shareState?.active ? (
@@ -962,20 +569,12 @@ export default function ChatTab({
                 }`}
               />
             ) : (
-              <Monitor className="w-3 h-3 shrink-0" />
+              <Monitor className={isWindowMode ? "w-3.5 h-3.5 shrink-0" : "w-3 h-3 shrink-0"} />
             )}
             <span>{shareState?.active ? (shareState.paused ? s.sharePaused : s.shareLive) : s.shareBtn}</span>
           </button>
 
-          <ThinkingSlider
-            compact
-            value={thinkingLevel}
-            capability={thinkingCapability}
-            lang={lang}
-            disabled={isThinking}
-            onChange={onChangeThinkingLevel}
-          />
-
+          {!isWindowMode && (
           <button
             onClick={() => {
               setShowHistory(false);
@@ -984,384 +583,61 @@ export default function ChatTab({
             }}
             disabled={isThinking}
             title={s.newChatTip}
-            className="flex items-center gap-1 px-1.5 py-0.5 rounded-lg text-[11px] text-sky-300 hover:bg-sky-500/15 disabled:opacity-40 transition"
+            aria-label={s.newChat}
+            className="flex items-center justify-center w-6 h-6 rounded-lg text-white/75 hover:text-white hover:bg-white/[0.1] disabled:opacity-40 transition"
           >
-            <Plus className="w-3 h-3" />
-            <span>{s.newChat}</span>
+            <Plus className="w-3.5 h-3.5" />
           </button>
+          )}
         </div>
       </div>
 
       {/* Screen Share Launcher & Live Controls Panel */}
       {showSharePanel ? (
-        <div className="flex-1 flex flex-col min-h-0 gap-2">
-          <div className="flex-1 overflow-y-auto pr-0.5 space-y-2">
-            {/* Target Selection */}
-            <div className="rounded-xl bg-white/[0.04] border border-white/10 p-2 space-y-1.5">
-              <div className="flex items-center justify-between">
-                <span className="text-[10.5px] font-medium text-white/75">{s.shareTarget}</span>
-                <button
-                  type="button"
-                  onClick={() => void loadShareTargets()}
-                  className="text-[10px] text-white/55 hover:text-white inline-flex items-center gap-1"
-                >
-                  <RefreshCw className="w-2.5 h-2.5" />
-                  <span>{s.shareRefresh}</span>
-                </button>
-              </div>
-
-              <div className="space-y-1 max-h-28 overflow-y-auto pr-0.5">
-                {shareTargets.map((t) => {
-                  const chosen = selectedTargetId === t.id;
-                  return (
-                    <button
-                      key={t.id}
-                      type="button"
-                      onClick={() => setSelectedTargetId(t.id)}
-                      className={`w-full text-left px-2 py-1 rounded-lg border text-[11px] flex items-center justify-between gap-2 transition ${
-                        chosen
-                          ? "bg-white/15 border-white/35 text-white"
-                          : "bg-black/25 border-white/[0.06] text-white/70 hover:text-white hover:bg-white/[0.07]"
-                      }`}
-                    >
-                      <div className="min-w-0 flex items-center gap-1.5">
-                        <span className="text-[9px] font-mono uppercase px-1 py-0.2 rounded bg-white/10 text-white/65 shrink-0">
-                          {t.kind === "window" ? t.app_name || "APP" : "SCR"}
-                        </span>
-                        <span className="truncate">
-                          {t.id === "auto_cursor" ? s.shareMouseScreen : t.title}
-                        </span>
-                      </div>
-                      <span className="text-[9.5px] font-mono text-white/40 shrink-0">
-                        {t.width}×{t.height}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-
-              {shareState?.active && shareState.target_kind === "window" && (
-                <div className="pt-1 border-t border-white/[0.06] flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void invoke("set_window_dock_preset", { edge: "top", ratio: 0.15 }).catch(() => {})
-                    }
-                    className="flex-1 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.14] text-[10px] text-white/80"
-                  >
-                    {s.shareSnapTopLeft}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void invoke("set_window_dock_preset", { edge: "top", ratio: 0.5 }).catch(() => {})
-                    }
-                    className="flex-1 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.14] text-[10px] text-white/80"
-                  >
-                    {s.shareSnapTopCenter}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void invoke("set_window_dock_preset", { edge: "top", ratio: 0.85 }).catch(() => {})
-                    }
-                    className="flex-1 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.14] text-[10px] text-white/80"
-                  >
-                    {s.shareSnapTopRight}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Watch Vision Model + Co-Work Goal */}
-            <div className="rounded-xl bg-white/[0.04] border border-white/10 p-2 space-y-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <label className="text-[10.5px] text-white/65 shrink-0">{s.shareWatchModel}</label>
-                <select
-                  value={shareWatchId || ""}
-                  onChange={(e) => {
-                    setShareWatchId(e.target.value);
-                    syncLiveShareOpt({ watchProfileId: e.target.value });
-                  }}
-                  className="max-w-[190px] rounded-lg bg-[#111319] border border-white/15 px-2 py-0.5 text-[10.5px] text-white outline-none"
-                >
-                  <option value="">{s.shareFollowChat}</option>
-                  {modelProfiles.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name || p.model_id}
-                      {p.supports_vision ? "" : " (Text)"}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1">
-                <label className="text-[10.5px] text-white/65">{s.shareGoal}</label>
-                <input
-                  type="text"
-                  value={shareGoal}
-                  onChange={(e) => {
-                    setShareGoal(e.target.value);
-                  }}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      syncLiveShareOpt({ goal: shareGoal });
-                      (e.currentTarget as HTMLInputElement).blur();
-                    }
-                  }}
-                  onBlur={() => syncLiveShareOpt({ goal: shareGoal })}
-                  placeholder={s.shareGoalPlaceholder}
-                  className="w-full rounded-lg bg-black/30 border border-white/10 focus:border-white/30 outline-none px-2 py-1 text-[11px] text-white placeholder:text-white/30"
-                />
-                <div className="flex flex-wrap gap-1">
-                  {s.shareGoalPresets.map((preset) => (
-                    <button
-                      key={preset}
-                      type="button"
-                      onClick={() => {
-                        setShareGoal(preset);
-                        syncLiveShareOpt({ goal: preset });
-                      }}
-                      className="px-2 py-0.5 rounded-full bg-white/[0.06] hover:bg-white/[0.14] text-[9.5px] text-white/75 transition"
-                    >
-                      {preset}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            {/* Cadence & Border */}
-            <div className="rounded-xl bg-white/[0.04] border border-white/10 p-2 space-y-1.5">
-              <div className="grid grid-cols-3 gap-1">
-                {(["quiet", "balanced", "active"] as const).map((cad) => {
-                  const active = shareCadence === cad;
-                  const meta = s.shareCadences[cad];
-                  return (
-                    <button
-                      key={cad}
-                      type="button"
-                      title={meta.desc}
-                      onClick={() => {
-                        setShareCadence(cad);
-                        syncLiveShareOpt({ cadence: cad });
-                      }}
-                      className={`py-1 px-1.5 rounded-lg border text-[10.5px] transition ${
-                        active
-                          ? "bg-white/15 border-white/35 text-white font-medium"
-                          : "bg-black/20 border-white/[0.06] text-white/55 hover:text-white"
-                      }`}
-                    >
-                      {meta.label}
-                    </button>
-                  );
-                })}
-              </div>
-              <p className="text-[10px] text-white/45 px-0.5">
-                {s.shareCadences[shareCadence].desc}
-              </p>
-
-              <label className="flex items-center justify-between gap-2 pt-0.5 cursor-pointer select-none">
-                <span className="text-[10.5px] text-white/75">{s.shareShowBorder}</span>
-                <input
-                  type="checkbox"
-                  checked={shareShowBorder}
-                  onChange={(e) => {
-                    setShareShowBorder(e.target.checked);
-                    syncLiveShareOpt({ showBorder: e.target.checked });
-                  }}
-                  className="accent-white w-3.5 h-3.5 rounded"
-                />
-              </label>
-            </div>
-
-            {shareError && (
-              <div className="text-[10.5px] text-rose-300 bg-rose-500/10 border border-rose-400/25 rounded-lg px-2 py-1">
-                {shareError}
-              </div>
-            )}
-          </div>
-
-          <div className="pt-1 border-t border-white/[0.08] flex items-center justify-between gap-2 shrink-0">
-            <span className="text-[9.5px] text-white/40 truncate">{s.shareHotkeyHint}</span>
-            <div className="flex items-center gap-1.5 shrink-0">
-              {shareState?.active ? (
-                <>
-                  <button
-                    type="button"
-                    onClick={() => void invoke("toggle_screen_share_pause").catch(() => {})}
-                    className="px-2.5 py-1 rounded-lg bg-white/[0.08] hover:bg-white/[0.16] border border-white/10 text-[11px] text-white flex items-center gap-1"
-                  >
-                    {shareState.paused ? (
-                      <>
-                        <Play className="w-3 h-3" />
-                        <span>{s.shareResume}</span>
-                      </>
-                    ) : (
-                      <>
-                        <Pause className="w-3 h-3" />
-                        <span>{s.sharePause}</span>
-                      </>
-                    )}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      void invoke("stop_screen_share").catch(() => {});
-                      setShowSharePanel(false);
-                    }}
-                    className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/35 border border-rose-400/30 text-[11px] text-rose-200 flex items-center gap-1"
-                  >
-                    <Square className="w-2.5 h-2.5 fill-current" />
-                    <span>{s.shareStop}</span>
-                  </button>
-                </>
-              ) : (
-                <button
-                  type="button"
-                  disabled={shareStarting}
-                  onClick={() => void handleStartShare()}
-                  className="px-3 py-1 rounded-lg bg-white hover:bg-white/90 text-black font-semibold text-[11px] flex items-center gap-1.5 transition"
-                >
-                  {shareStarting ? (
-                    <Loader2 className="w-3 h-3 animate-spin" />
-                  ) : (
-                    <span className="w-2 h-2 rounded-full bg-red-500" />
-                  )}
-                  <span>{s.shareStart}</span>
-                </button>
-              )}
-            </div>
-          </div>
+        <div className={isWindowMode ? "flex-1 flex flex-col min-h-0 max-w-2xl w-full mx-auto" : "flex-1 flex flex-col min-h-0"}>
+          <ScreenSharePanel
+            lang={lang}
+            shareState={shareState}
+            modelProfiles={modelProfiles}
+            defaultWatchProfileId={defaultWatchProfileId}
+            onClose={() => setShowSharePanel(false)}
+          />
         </div>
-      ) : /* Redesigned Past Conversations Panel */ showHistory ? (
-        <div className="flex-1 flex flex-col min-h-0 gap-2">
-          <div className="relative shrink-0">
-            <Search className="w-3 h-3 text-white/35 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-            <input
-              type="text"
-              value={historySearch}
-              onChange={(e) => setHistorySearch(e.target.value)}
-              placeholder={s.searchHistory}
-              className="w-full rounded-xl bg-white/[0.05] border border-white/10 focus:border-sky-400/45 outline-none pl-7 pr-7 py-1 text-[11px] text-white placeholder:text-white/35"
-            />
-            {historySearch && (
-              <button
-                type="button"
-                onClick={() => setHistorySearch("")}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-white/40 hover:text-white"
-              >
-                <X className="w-3 h-3" />
-              </button>
-            )}
-          </div>
-
-          <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
-            {(() => {
-              const q = historySearch.trim().toLowerCase();
-              const nonEmpty = conversations.filter((c) => c.message_count > 0);
-              const filtered = nonEmpty.filter((c) =>
-                !q ? true : c.title.toLowerCase().includes(q)
-              );
-              if (nonEmpty.length === 0) {
-                return (
-                  <div className="h-full flex items-center justify-center text-[11.5px] text-white/40">
-                    {s.noConversations}
-                  </div>
-                );
-              }
-              if (filtered.length === 0) {
-                return (
-                  <div className="h-full flex items-center justify-center text-[11.5px] text-white/40">
-                    {s.noHistoryMatches}
-                  </div>
-                );
-              }
-
-              const startOfToday = new Date();
-              startOfToday.setHours(0, 0, 0, 0);
-              const todayMs = startOfToday.getTime();
-              const yesterdayMs = todayMs - 86_400_000;
-
-              const groups: { label: string; items: ConversationSummary[] }[] = [
-                { label: s.today, items: filtered.filter((c) => c.updated_at >= todayMs) },
-                {
-                  label: s.yesterday,
-                  items: filtered.filter(
-                    (c) => c.updated_at >= yesterdayMs && c.updated_at < todayMs
-                  ),
-                },
-                { label: s.earlier, items: filtered.filter((c) => c.updated_at < yesterdayMs) },
-              ].filter((g) => g.items.length > 0);
-
-              return groups.map((group) => (
-                <div key={group.label} className="space-y-1">
-                  <div className="px-1 text-[10px] font-medium tracking-wider uppercase text-white/35">
-                    {group.label}
-                  </div>
-                  {group.items.map((conv) => {
-                    const isCurrent = conv.id === activeConversationId;
-                    return (
-                      <div
-                        key={conv.id}
-                        onClick={() => {
-                          onSelectConversation(conv.id);
-                          setShowHistory(false);
-                        }}
-                        className={`group relative rounded-xl px-2.5 py-2 border cursor-pointer flex items-center gap-2.5 transition ${
-                          isCurrent
-                            ? "bg-white/[0.09] border-sky-400/35 text-white"
-                            : "bg-white/[0.03] hover:bg-white/[0.06] border-white/[0.07] text-white/80"
-                        }`}
-                      >
-                        <div
-                          className={`w-6 h-6 rounded-lg flex items-center justify-center shrink-0 ${
-                            isCurrent
-                              ? "bg-sky-500/20 text-sky-300"
-                              : "bg-white/[0.05] text-white/40 group-hover:text-white/70"
-                          }`}
-                        >
-                          <MessageSquare className="w-3 h-3" />
-                        </div>
-
-                        <div className="min-w-0 flex-1">
-                          <div className="flex items-center gap-1.5">
-                            {isCurrent && (
-                              <span className="w-1.5 h-1.5 rounded-full bg-sky-400 shrink-0" />
-                            )}
-                            <span className="text-[11.5px] font-medium truncate">
-                              {conv.title}
-                            </span>
-                          </div>
-                          <div className="flex items-center gap-1.5 text-[10px] text-white/40 mt-0.5">
-                            <span>
-                              {conv.message_count} {s.messagesUnit}
-                            </span>
-                            <span>·</span>
-                            <span>{formatRelativeTime(conv.updated_at, lang)}</span>
-                          </div>
-                        </div>
-
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            onDeleteConversation(conv.id);
-                          }}
-                          title={s.deleteConv}
-                          className="p-1.5 rounded-lg opacity-0 group-hover:opacity-100 text-white/40 hover:text-rose-300 hover:bg-rose-500/20 transition shrink-0"
-                        >
-                          <Trash2 className="w-3 h-3" />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              ));
-            })()}
-          </div>
-        </div>
+      ) : /* Past Conversations Drawer (compact island mode only) */ !isWindowMode && showHistory ? (
+        <ChatHistoryDrawer
+          lang={lang}
+          conversations={conversations}
+          activeConversationId={activeConversationId}
+          onSelectConversation={onSelectConversation}
+          onDeleteConversation={onDeleteConversation}
+          onRenameConversation={onRenameConversation}
+          onClose={() => setShowHistory(false)}
+        />
       ) : (
-        <>
+        <div
+          className={`flex-1 flex flex-col min-h-0 ${
+            isWindowMode ? "max-w-3xl w-full mx-auto" : ""
+          }`}
+        >
+          {browserState?.active && (
+            <BrowserWatchCard
+              lang={lang}
+              browserState={browserState}
+              preview={browserPreview}
+              isThinking={isThinking}
+              mediaDownloadReady={Boolean(installedPlugins.media_downloader)}
+              isBookmarked={bookmarks.some((b) => b.url === browserState.url)}
+              onToggleBookmark={handleToggleBookmark}
+              onSummarizePage={(url, title) =>
+                onSend(
+                  lang === "zh"
+                    ? `请读取并帮我总结当前内置浏览器打开的网页内容：${title} (${url})`
+                    : `Please read and summarize the webpage currently open in the built-in browser: ${title} (${url})`
+                )
+              }
+              onQuickDownloadUrl={onQuickDownloadUrl}
+            />
+          )}
           {shareState?.active && (
             <div className="mb-1.5 px-2 py-1 rounded-xl bg-white/[0.05] border border-white/15 flex items-center justify-between gap-2 shrink-0">
               <button
@@ -1419,117 +695,34 @@ export default function ChatTab({
             <div
               ref={scrollBoxRef}
               onScroll={handleChatScroll}
-              className="flex-1 overflow-y-auto space-y-2 pr-1 text-[12.5px] leading-relaxed select-text"
+              className={`flex-1 overflow-y-auto space-y-2 pr-1 leading-relaxed select-text ${
+                isWindowMode ? "text-[13.5px] space-y-3 py-1" : "text-[12.5px]"
+              }`}
             >
-              {messages.map((m) => (
-                <div
-                  key={m.id}
-                  ref={(el) => {
-                    if (m.role === "user") msgRefs.current[m.id] = el;
-                  }}
-                  className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
-                >
-                <div
-                  className={`max-w-[90%] rounded-2xl px-3 py-2 ${
-                    m.role === "user"
-                      ? "rounded-tr-sm bg-sky-500/20 border border-sky-400/25 text-white"
-                      : m.isError
-                      ? "rounded-tl-sm bg-rose-500/15 border border-rose-400/30 text-rose-200"
-                      : "rounded-tl-sm bg-white/[0.07] border border-white/10 text-white/90"
-                  }`}
-                >
-                  {m.attachments && m.attachments.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mb-1.5">
-                      {m.attachments.map((a, idx) => (
-                        <span
-                          key={idx}
-                          title={a.file_path ?? a.label}
-                          className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-black/35 text-[10px] text-sky-300 font-mono max-w-[185px]"
-                        >
-                          <AttachmentIcon kind={a.kind} />
-                          <span className="truncate">{a.label}</span>
-                        </span>
-                      ))}
-                    </div>
-                  )}
-
-                  {m.steps && m.steps.length > 0 && (
-                    <div className="space-y-1.5 mb-1.5">
-                      {m.steps.map((step) => (
-                        <AgentStepCard
-                          key={step.step_id}
-                          step={step}
-                          lang={lang}
-                          onResolve={onResolveApproval}
-                        />
-                      ))}
-                    </div>
-                  )}
-
-                  {m.role === "assistant" &&
-                    ((isThinking &&
-                      activeStreamId === m.id.toString() &&
-                      thinkingLevel !== "off" &&
-                      !m.text) ||
-                      Boolean(m.thought)) && (
-                      <ThoughtBox
-                        thought={m.thought}
-                        isLive={isThinking && activeStreamId === m.id.toString() && !m.text}
-                        lang={lang}
-                      />
-                    )}
-
-                  {m.role === "assistant" ? (
-                    <div className="prose prose-invert prose-xs max-w-none [&_code]:text-sky-300 [&_code]:font-mono [&_code]:text-[11px] [&_p]:my-1 [&_ul]:pl-4 [&_ul]:list-disc [&_ol]:pl-4 [&_ol]:list-decimal">
-                      {m.text ? (
-                        <Markdown
-                          components={{
-                            pre: ({ children }) => (
-                              <MarkdownCodePre copyLabel={s.copyCode} copiedLabel={s.copiedCode}>
-                                {children}
-                              </MarkdownCodePre>
-                            ),
-                          }}
-                        >
-                          {m.text}
-                        </Markdown>
-                      ) : m.steps && m.steps.length > 0 ? (
-                        <span className="text-[11px] text-white/45">{s.workingTools}</span>
-                      ) : isThinking &&
-                        activeStreamId === m.id.toString() &&
-                        thinkingLevel !== "off" ? null : (
-                        <Markdown>...</Markdown>
-                      )}
-                      {m.isError && m.text.includes("Settings") && (
-                        <button
-                          onClick={onOpenSettings}
-                          className="mt-1.5 px-2.5 py-1 rounded-lg bg-white/15 hover:bg-white/25 text-[11px] text-white font-medium transition"
-                        >
-                          {s.openSettings}
-                        </button>
-                      )}
-                      {m.outputPaths && m.outputPaths.length > 0 && (
-                        <div className="mt-1.5 flex flex-wrap gap-1.5">
-                          {m.outputPaths.map((fp, idx) => (
-                            <button
-                              key={idx}
-                              type="button"
-                              onClick={() => void invoke("plugin_open_folder", { path: fp })}
-                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/30 border border-emerald-400/25 text-[10.5px] text-emerald-200 transition"
-                            >
-                              <FolderOpen className="w-3 h-3" />
-                              <span>{sp.openFolder}</span>
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="whitespace-pre-wrap">{m.text}</div>
-                  )}
-                </div>
-              </div>
-            ))}
+              {(() => {
+                const lastAssistant = [...messages]
+                  .reverse()
+                  .find((msg) => msg.role === "assistant" && msg.id !== 0);
+                const lastAssistantId = lastAssistant?.id ?? -1;
+                return messages.map((m) => (
+                  <ChatMessageItem
+                    key={m.id}
+                    message={m}
+                    lang={lang}
+                    isLiveStream={isThinking && activeStreamId === m.id.toString()}
+                    thinkingLevel={thinkingLevel}
+                    canRetry={!isThinking && (Boolean(m.isError) || m.id === lastAssistantId)}
+                    onRetry={onRetryMessage ? () => onRetryMessage(m.id) : undefined}
+                    canEdit={!isThinking && m.role === "user"}
+                    onEditMessage={
+                      onEditMessage ? (newText) => onEditMessage(m.id, newText) : undefined
+                    }
+                    onResolveApproval={onResolveApproval}
+                    onOpenSettings={onOpenSettings}
+                    onRegisterUserRef={registerUserRef}
+                  />
+                ));
+              })()}
             </div>
 
             {userMessages.length >= 2 && (
@@ -1641,13 +834,13 @@ export default function ChatTab({
 
           {/* Pending Multi-Attachments Strip + Drop-to-Utility Plugin Bar */}
           {attachments.length > 0 && (
-            <div className="mt-2 space-y-1 shrink-0">
-              <div className="flex flex-wrap gap-1.5">
+            <div className="mt-1.5 space-y-1 shrink-0">
+              <div className="flex items-center gap-1.5 overflow-x-auto flex-nowrap pb-0.5">
                 {attachments.map((att, idx) => (
                   <div
                     key={idx}
                     title={att.file_path ?? att.label}
-                    className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-sky-500/15 border border-sky-400/25 text-[11px] text-sky-200 max-w-[180px]"
+                    className="shrink-0 flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-sky-500/15 border border-sky-400/25 text-[10.5px] text-sky-200 max-w-[165px]"
                   >
                     <AttachmentIcon kind={att.kind} />
                     <span className="truncate font-mono">{att.label}</span>
@@ -1655,7 +848,7 @@ export default function ChatTab({
                       onClick={() => onRemoveAttachment(idx)}
                       className="text-white/60 hover:text-white shrink-0"
                     >
-                      <X className="w-3 h-3" />
+                      <X className="w-2.5 h-2.5" />
                     </button>
                   </div>
                 ))}
@@ -1672,7 +865,7 @@ export default function ChatTab({
                   attachments.some((a) => a.kind === "folder") ||
                   filePaths.some((p) => /\.(zip)$/i.test(p) || /skill\.md$/i.test(p));
                 return (
-                  <div className="flex flex-wrap gap-1">
+                  <div className="flex items-center gap-1 overflow-x-auto flex-nowrap pb-0.5 [&>*]:shrink-0">
                     {hasSkillCand && (
                       <button
                         type="button"
@@ -1831,14 +1024,18 @@ export default function ChatTab({
               </div>
             )}
 
-            {installedPlugins.media_downloader &&
-              enabledPlugins.media_downloader &&
-              !slashMenuOpen &&
+            {!slashMenuOpen &&
               (() => {
+                const dlReady =
+                  Boolean(installedPlugins.media_downloader) &&
+                  Boolean(enabledPlugins.media_downloader);
                 const dlProg = pluginProgress.media_downloader;
-                const isDlRunning = dlProg?.stage === "running";
-                const urlMatch = /(https?:\/\/[^\s]+)/i.exec(chatInput);
-                if (!isDlRunning && !urlMatch) return null;
+                const isDlRunning = dlReady && dlProg?.stage === "running";
+                const urlMatch =
+                  /((?:https?|file):\/\/[^\s]+|\b(?:localhost|127\.0\.0\.1)(?::\d+)?(?:\/[^\s]*)?)/i.exec(
+                    chatInput
+                  );
+                if (!isDlRunning && !(urlMatch && dlReady)) return null;
                 if (isDlRunning) {
                   return (
                     <div className="mb-1.5 flex items-center justify-between gap-2 rounded-lg bg-emerald-500/10 border border-emerald-400/25 px-2 py-1 text-[10px] text-emerald-200">
@@ -1861,122 +1058,168 @@ export default function ChatTab({
                 const detectedUrl = urlMatch![1];
                 return (
                   <div className="mb-1.5 flex flex-wrap items-center gap-1 px-0.5">
-                    <span className="text-[10px] text-emerald-300/90 flex items-center gap-1 mr-0.5">
-                      <Music className="w-2.5 h-2.5" />
-                      <span>{sp.dlLinkDetected}</span>
-                    </span>
-                    {(
-                      [
-                        { id: "audio_best", label: sp.dlFmtAudioBest },
-                        { id: "mp4_lossless", label: sp.dlFmtMp4 },
-                        { id: "audio_flac", label: sp.dlFmtFlac },
-                        { id: "audio_mp3", label: sp.dlFmtMp3 },
-                      ] as const
-                    ).map((opt) => (
-                      <button
-                        key={opt.id}
-                        type="button"
-                        onClick={() => onQuickDownloadUrl?.(detectedUrl, opt.id)}
-                        className="px-2 py-0.5 rounded-full bg-emerald-500/15 hover:bg-emerald-500/30 border border-emerald-400/25 text-[10px] text-emerald-200 flex items-center gap-1 transition"
-                      >
-                        <Download className="w-2.5 h-2.5" />
-                        <span>{opt.label}</span>
-                      </button>
-                    ))}
-                    {onOpenPlugin && (
-                      <button
-                        type="button"
-                        onClick={() => onOpenPlugin("media_downloader", [detectedUrl])}
-                        className="px-2 py-0.5 rounded-full bg-white/[0.06] hover:bg-white/[0.14] text-[10px] text-white/65 hover:text-white transition"
-                      >
-                        {sp.dlInPlugins}
-                      </button>
+                    {dlReady && (
+                      <>
+                        <span className="text-[10px] text-emerald-300/90 flex items-center gap-1 ml-0.5">
+                          <Music className="w-2.5 h-2.5" />
+                          <span>{sp.dlLinkDetected}</span>
+                        </span>
+                        {(
+                          [
+                            { id: "audio_best", label: sp.dlFmtAudioBest },
+                            { id: "mp4_lossless", label: sp.dlFmtMp4 },
+                            { id: "audio_flac", label: sp.dlFmtFlac },
+                            { id: "audio_mp3", label: sp.dlFmtMp3 },
+                          ] as const
+                        ).map((opt) => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => onQuickDownloadUrl?.(detectedUrl, opt.id)}
+                            className="px-2 py-0.5 rounded-full bg-emerald-500/15 hover:bg-emerald-500/30 border border-emerald-400/25 text-[10px] text-emerald-200 flex items-center gap-1 transition"
+                          >
+                            <Download className="w-2.5 h-2.5" />
+                            <span>{opt.label}</span>
+                          </button>
+                        ))}
+                        {onOpenPlugin && (
+                          <button
+                            type="button"
+                            onClick={() => onOpenPlugin("media_downloader", [detectedUrl])}
+                            className="px-2 py-0.5 rounded-full bg-white/[0.06] hover:bg-white/[0.14] text-[10px] text-white/65 hover:text-white transition"
+                          >
+                            {sp.dlInPlugins}
+                          </button>
+                        )}
+                      </>
                     )}
                   </div>
                 );
               })()}
 
-            {agentMode && (
-              <div className="mb-1.5 flex items-center justify-between gap-2 px-0.5">
-                <PermissionSlider
-                  value={permissionMode}
-                  lang={lang}
-                  onChange={onChangePermissionMode}
-                />
-                <span className="text-[10px] text-white/40 truncate text-right flex items-center gap-1 min-w-0">
-                  <Shield
-                    className={`w-2.5 h-2.5 shrink-0 transition-colors duration-200 ${
-                      permissionMode === "ask"
-                        ? "text-cyan-300/75"
-                        : permissionMode === "auto"
-                        ? "text-rose-300/80"
-                        : "text-blue-300/75"
-                    }`}
-                  />
-                  <span className="truncate">{s.permModes[permissionMode].desc}</span>
-                </span>
-              </div>
-            )}
-
-            <form onSubmit={handleSubmit} className="flex items-center gap-2">
-              <input
+            <form onSubmit={handleSubmit} className="flex items-end gap-1.5">
+              {onAddAttachments && !isThinking && (
+                <button
+                  type="button"
+                  title={s.attachFileTip}
+                  onClick={() => {
+                    void invoke<AttachmentPayload[]>("pick_chat_attachments")
+                      .then((picked) => {
+                        if (picked && picked.length > 0) onAddAttachments(picked);
+                      })
+                      .catch(() => {});
+                  }}
+                  className="w-8 h-8 rounded-xl bg-white/[0.06] hover:bg-white/[0.14] border border-white/12 text-white/60 hover:text-white flex items-center justify-center shrink-0 transition"
+                >
+                  <Paperclip className="w-3.5 h-3.5" />
+                </button>
+              )}
+              <textarea
                 ref={inputRef}
-                type="text"
+                rows={1}
                 value={chatInput}
                 onChange={(e) => {
                   setSlashDismissed(false);
                   setSlashSelIdx(0);
                   onChangeInput(e.target.value);
                 }}
-                onKeyDown={(e) => {
-                  if (!slashMenuOpen || slashMatches.length === 0) return;
-                  const safeIdx = Math.min(slashSelIdx, slashMatches.length - 1);
-                  if (e.key === "ArrowDown") {
-                    e.preventDefault();
-                    setSlashSelIdx((safeIdx + 1) % slashMatches.length);
-                  } else if (e.key === "ArrowUp") {
-                    e.preventDefault();
-                    setSlashSelIdx((safeIdx - 1 + slashMatches.length) % slashMatches.length);
-                  } else if (e.key === "Tab") {
-                    e.preventDefault();
-                    applySlashSkill(slashMatches[safeIdx]);
-                  } else if (e.key === "Enter") {
-                    const picked = slashMatches[safeIdx];
-                    if (chatInput.trim().toLowerCase() !== `/${picked.id.toLowerCase()}`) {
+                onPaste={(e) => {
+                  const items = e.clipboardData?.items;
+                  if (!items || !onAddAttachment) return;
+                  for (let i = 0; i < items.length; i++) {
+                    const item = items[i];
+                    if (item.type.startsWith("image/")) {
+                      const file = item.getAsFile();
+                      if (!file) continue;
                       e.preventDefault();
-                      applySlashSkill(picked);
+                      const reader = new FileReader();
+                      reader.onload = () => {
+                        const result = typeof reader.result === "string" ? reader.result : "";
+                        if (!result) return;
+                        void invoke<AttachmentPayload>("save_pasted_image_attachment", {
+                          dataBase64: result,
+                          mimeType: item.type,
+                        })
+                          .then((att) => onAddAttachment(att))
+                          .catch(() => {});
+                      };
+                      reader.readAsDataURL(file);
+                      return;
                     }
-                  } else if (e.key === "Escape") {
+                  }
+                }}
+                onKeyDown={(e) => {
+                  if (slashMenuOpen && slashMatches.length > 0) {
+                    const safeIdx = Math.min(slashSelIdx, slashMatches.length - 1);
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setSlashSelIdx((safeIdx + 1) % slashMatches.length);
+                      return;
+                    } else if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setSlashSelIdx((safeIdx - 1 + slashMatches.length) % slashMatches.length);
+                      return;
+                    } else if (e.key === "Tab") {
+                      e.preventDefault();
+                      applySlashSkill(slashMatches[safeIdx]);
+                      return;
+                    } else if (e.key === "Enter") {
+                      const picked = slashMatches[safeIdx];
+                      if (chatInput.trim().toLowerCase() !== `/${picked.id.toLowerCase()}`) {
+                        e.preventDefault();
+                        applySlashSkill(picked);
+                        return;
+                      }
+                    } else if (e.key === "Escape") {
+                      e.preventDefault();
+                      setSlashDismissed(true);
+                      return;
+                    }
+                  }
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                     e.preventDefault();
-                    setSlashDismissed(true);
+                    handleSubmit(e);
                   }
                 }}
                 onFocus={() => onFocusInput(true)}
                 onBlur={() => onFocusInput(false)}
-                placeholder={s.inputPlaceholder}
-                className="flex-1 rounded-xl bg-white/[0.07] border border-white/15 focus:border-sky-400/60 outline-none px-3 py-1.5 text-[12.5px] text-white placeholder:text-white/40"
+                placeholder={isThinking ? s.steerPlaceholder : s.inputPlaceholder}
+                className={`flex-1 rounded-xl bg-white/[0.07] border border-white/15 focus:border-white/40 outline-none px-3 text-white placeholder:text-white/40 resize-none max-h-[120px] overflow-y-auto ${
+                  isWindowMode ? "py-2 text-[13.5px] leading-[1.45]" : "py-1.5 text-[12.5px] leading-[1.4]"
+                }`}
               />
               {isThinking ? (
-                <button
-                  type="button"
-                  onClick={onStopStream}
-                  className="px-3 py-1.5 rounded-xl bg-rose-500/80 hover:bg-rose-500 text-white font-semibold text-[12px] flex items-center gap-1 transition"
-                >
-                  <Square className="w-3 h-3 fill-current" />
-                  <span>{s.stop}</span>
-                </button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {chatInput.trim().length > 0 && (
+                    <button
+                      type="submit"
+                      className="px-2.5 py-1.5 rounded-xl bg-white hover:bg-white/90 text-black font-semibold text-[11.5px] transition"
+                    >
+                      {s.steerBtn}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={onStopStream}
+                    className="px-3 py-1.5 rounded-xl bg-rose-500/80 hover:bg-rose-500 text-white font-semibold text-[12px] flex items-center gap-1 transition"
+                  >
+                    <Square className="w-3 h-3 fill-current" />
+                    <span>{s.stop}</span>
+                  </button>
+                </div>
               ) : (
                 <button
                   type="submit"
-                  className="px-3 py-1.5 rounded-xl bg-sky-500 hover:bg-sky-400 text-slate-950 font-semibold text-[12px] transition"
+                  className="px-3 py-1.5 rounded-xl bg-white hover:bg-white/90 text-black font-semibold text-[12px] transition"
                 >
                   {s.send}
                 </button>
               )}
             </form>
           </div>
-        </>
+        </div>
       )}
+      </div>
     </div>
   );
 }

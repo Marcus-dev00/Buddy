@@ -1,0 +1,9 @@
+{
+  "name": "Buddy Mobile",
+  "short_name": "Buddy",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "description": "Control your Windows Buddy AI Companion from anywhere."
+}

@@ -4,10 +4,17 @@ dist/
 dist-ssr/
 *.local
 src-tauri/target/
+mobile-android/.gradle/
+mobile-android/build/
+mobile-android/app/build/
+mobile-android/local.properties
+website/public/app/
 
-# Compiled Binaries & Installer Artifacts (publish via GitHub Releases instead)
+# Compiled Binaries & Installer Artifacts (publish via GitHub Releases / Cloudflare instead)
 Buddy.exe
+BuddyMobile.apk
 *.exe
+*.apk
 *.dll
 *.msi
 *.nsis

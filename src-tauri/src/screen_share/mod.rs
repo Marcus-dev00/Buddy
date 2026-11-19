@@ -1,20 +1,35 @@
 //! Live Screen & Target-Window Sharing engine:
-//! - Enumerates cursor-following monitor, physical displays, and visible application windows.
-//! - Captures monitors via BitBlt and GPU/browser windows via PrintWindow(PW_RENDERFULLCONTENT) with BitBlt fallback.
+//! - Enumerates cursor-following monitor, physical displays, and visible application windows (`capture`).
+//! - Captures monitors via BitBlt and GPU/browser windows via PrintWindow with BitBlt fallback (`capture`).
 //! - Maintains an in-memory sliding frame buffer (latest + recent comparison frame) with zero disk clutter.
 //! - Drives a quiet, settle-debounced proactive sentinel using the configured Watch Vision model (`[SILENT]` when calm).
-//! - Renders a click-through, capture-excluded Win32 soft-border overlay around the shared monitor or window.
+//! - Renders a click-through, capture-excluded Win32 soft-border overlay around the shared target (`border`).
 
-use crate::ai_client::{
-    encode_dynamic_image_jpeg_base64, run_screen_watch_check, AiStreamController, InlineImageFrame,
+mod border;
+mod capture;
+
+pub use capture::{capture_primary_desktop_jpeg_b64, enumerate_share_targets};
+
+#[cfg(windows)]
+use border::spawn_border_overlay_thread;
+use border::BorderSpec;
+#[cfg(windows)]
+use capture::{
+    bitblt_rect_image, capture_hwnd_image, compute_luma_thumb, resolve_monitor_rect,
 };
+use capture::{luma_change_ratio, update_settle_and_should_trigger};
+
+#[cfg(windows)]
+use crate::ai_client::encode_dynamic_image_jpeg_base64;
+use crate::ai_client::{run_screen_watch_check, AiStreamController, InlineImageFrame};
 use crate::settings::SettingsManager;
+#[cfg(windows)]
+use crate::win32_sensors::get_window_visible_rect;
 use crate::win32_sensors::{
-    attach_dock_to_window, detach_dock_from_window, get_window_visible_rect,
-    set_hwnd_capture_excluded, set_main_capture_excluded, AppSensorState,
+    attach_dock_to_window, detach_dock_from_window, set_main_capture_excluded, AppSensorState,
 };
-use image::{DynamicImage, RgbaImage};
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,44 +37,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[cfg(windows)]
-use windows::core::PCWSTR;
-#[cfg(windows)]
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-#[cfg(windows)]
-use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
-#[cfg(windows)]
-use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject,
-    EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, MonitorFromPoint, ReleaseDC,
-    SelectObject, AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION,
-    DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST, SRCCOPY,
-};
-#[cfg(windows)]
-use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
-#[cfg(windows)]
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-#[cfg(windows)]
-use windows::Win32::System::Threading::{
-    OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-};
+use windows::Win32::Foundation::HWND;
 #[cfg(windows)]
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT, MOD_SHIFT,
 };
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindow, GetWindowLongW, GetWindowRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, PeekMessageW, RegisterClassW, SetWindowPos, ShowWindow, TranslateMessage,
-    UpdateLayeredWindow, GWL_EXSTYLE, GW_OWNER, HWND_TOPMOST, MSG, PM_REMOVE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, WM_HOTKEY, WNDCLASSW,
-    WS_EX_APPWINDOW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_POPUP,
+    GetForegroundWindow, GetMessageW, IsIconic, IsWindow, MSG, WM_HOTKEY,
 };
-
-const LUMA_W: u32 = 48;
-const LUMA_H: u32 = 27;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -141,27 +127,6 @@ struct CapturedFrame {
     captured_at_ms: u64,
 }
 
-#[derive(Clone, PartialEq)]
-struct BorderSpec {
-    visible: bool,
-    is_window_mode: bool,
-    target_hwnd: isize,
-    rect: (i32, i32, i32, i32), // (left, top, width, height) of target monitor or target window
-    dimmed: bool,               // true when target window is not foreground
-}
-
-impl Default for BorderSpec {
-    fn default() -> Self {
-        Self {
-            visible: false,
-            is_window_mode: false,
-            target_hwnd: 0,
-            rect: (0, 0, 0, 0),
-            dimmed: false,
-        }
-    }
-}
-
 struct ShareSessionRuntime {
     active: bool,
     paused: bool,
@@ -241,454 +206,6 @@ impl Default for ScreenShareManager {
             session_counter: AtomicU64::new(0),
         }
     }
-}
-
-#[cfg(windows)]
-#[derive(Clone)]
-struct MonitorRectEntry {
-    device_name: String,
-    rect: (i32, i32, i32, i32), // left, top, width, height
-    is_primary: bool,
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn enum_monitors_proc(
-    hmon: HMONITOR,
-    _hdc: HDC,
-    _lprc: *mut RECT,
-    lparam: LPARAM,
-) -> BOOL {
-    let list = &mut *(lparam.0 as *mut Vec<MonitorRectEntry>);
-    let mut mi = MONITORINFOEXW::default();
-    mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-    if GetMonitorInfoW(hmon, &mut mi.monitorInfo as *mut _).as_bool() {
-        let r = mi.monitorInfo.rcMonitor;
-        let is_primary = (mi.monitorInfo.dwFlags & 1) != 0; // MONITORINFOF_PRIMARY
-        let nul = mi
-            .szDevice
-            .iter()
-            .position(|&c| c == 0)
-            .unwrap_or(mi.szDevice.len());
-        let dev = String::from_utf16_lossy(&mi.szDevice[..nul]);
-        list.push(MonitorRectEntry {
-            device_name: dev,
-            rect: (r.left, r.top, r.right - r.left, r.bottom - r.top),
-            is_primary,
-        });
-    }
-    BOOL(1)
-}
-
-#[cfg(windows)]
-fn enumerate_monitors() -> Vec<MonitorRectEntry> {
-    let mut list: Vec<MonitorRectEntry> = Vec::new();
-    unsafe {
-        let ptr = &mut list as *mut Vec<MonitorRectEntry> as isize;
-        let _ = EnumDisplayMonitors(None, None, Some(enum_monitors_proc), LPARAM(ptr));
-    }
-    list
-}
-
-#[cfg(windows)]
-fn get_monitor_at_cursor() -> (i32, i32, i32, i32) {
-    unsafe {
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFOEXW::default();
-        mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
-        if GetMonitorInfoW(hmon, &mut mi.monitorInfo as *mut _).as_bool() {
-            let r = mi.monitorInfo.rcMonitor;
-            return (r.left, r.top, r.right - r.left, r.bottom - r.top);
-        }
-    }
-    (0, 0, 1920, 1080)
-}
-
-#[cfg(windows)]
-fn process_exe_name_for_pid(pid: u32) -> String {
-    unsafe {
-        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
-            return String::new();
-        };
-        let mut buf = [0u16; 260];
-        let mut len = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(
-            handle,
-            PROCESS_NAME_WIN32,
-            windows::core::PWSTR(buf.as_mut_ptr()),
-            &mut len,
-        )
-        .is_ok();
-        let _ = windows::Win32::Foundation::CloseHandle(handle);
-        if ok && len > 0 {
-            let full = String::from_utf16_lossy(&buf[..len as usize]);
-            return std::path::Path::new(&full)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(&full)
-                .to_string();
-        }
-    }
-    String::new()
-}
-
-#[cfg(windows)]
-unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let ctx = &mut *(lparam.0 as *mut (u32, Vec<ShareTargetInfo>));
-    let own_pid = ctx.0;
-
-    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-        return BOOL(1);
-    }
-
-    let mut pid = 0u32;
-    GetWindowThreadProcessId(hwnd, Some(&mut pid));
-    if pid == 0 || pid == own_pid {
-        return BOOL(1);
-    }
-
-    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-    if (ex_style & WS_EX_TOOLWINDOW.0) != 0 && (ex_style & WS_EX_APPWINDOW.0) == 0 {
-        return BOOL(1);
-    }
-    if let Ok(owner) = GetWindow(hwnd, GW_OWNER) {
-        if !owner.0.is_null() && (ex_style & WS_EX_APPWINDOW.0) == 0 {
-            return BOOL(1);
-        }
-    }
-
-    // Skip cloaked UWP background frames
-    let mut cloaked: u32 = 0;
-    if DwmGetWindowAttribute(
-        hwnd,
-        DWMWA_CLOAKED,
-        &mut cloaked as *mut u32 as *mut c_void,
-        std::mem::size_of::<u32>() as u32,
-    )
-    .is_ok()
-        && cloaked != 0
-    {
-        return BOOL(1);
-    }
-
-    let len = GetWindowTextLengthW(hwnd);
-    if len <= 0 {
-        return BOOL(1);
-    }
-    let mut buf = vec![0u16; (len as usize) + 1];
-    let read_len = GetWindowTextW(hwnd, &mut buf);
-    if read_len <= 0 {
-        return BOOL(1);
-    }
-    let title = String::from_utf16_lossy(&buf[..read_len as usize])
-        .trim()
-        .to_string();
-    if title.is_empty()
-        || matches!(
-            title.as_str(),
-            "Program Manager"
-                | "Windows Input Experience"
-                | "Default IME"
-                | "MSCTFIME UI"
-                | "Settings"
-        )
-    {
-        return BOOL(1);
-    }
-
-    let Some((_, _, w, h)) = get_window_visible_rect(hwnd) else {
-        return BOOL(1);
-    };
-    if w < 140 || h < 100 {
-        return BOOL(1);
-    }
-
-    let app_name = process_exe_name_for_pid(pid);
-    ctx.1.push(ShareTargetInfo {
-        id: format!("window:{}", hwnd.0 as isize),
-        kind: "window".to_string(),
-        title,
-        app_name,
-        width: w,
-        height: h,
-        is_primary: false,
-        hwnd: hwnd.0 as isize,
-    });
-
-    BOOL(1)
-}
-
-pub fn enumerate_share_targets() -> Vec<ShareTargetInfo> {
-    let mut out = Vec::new();
-    #[cfg(windows)]
-    {
-        let (cw, ch) = {
-            let r = get_monitor_at_cursor();
-            (r.2, r.3)
-        };
-        out.push(ShareTargetInfo {
-            id: "auto_cursor".to_string(),
-            kind: "auto_cursor".to_string(),
-            title: "Mouse Screen (Auto)".to_string(),
-            app_name: "Monitor".to_string(),
-            width: cw,
-            height: ch,
-            is_primary: true,
-            hwnd: 0,
-        });
-
-        let mons = enumerate_monitors();
-        for (idx, m) in mons.into_iter().enumerate() {
-            let short_dev = m
-                .device_name
-                .trim_start_matches("\\\\.\\")
-                .to_string();
-            out.push(ShareTargetInfo {
-                id: format!("monitor:{idx}"),
-                kind: "monitor".to_string(),
-                title: format!(
-                    "Display {} ({})",
-                    idx + 1,
-                    if short_dev.is_empty() {
-                        "Screen"
-                    } else {
-                        &short_dev
-                    }
-                ),
-                app_name: "Monitor".to_string(),
-                width: m.rect.2,
-                height: m.rect.3,
-                is_primary: m.is_primary,
-                hwnd: 0,
-            });
-        }
-
-        let mut win_ctx = (std::process::id(), Vec::<ShareTargetInfo>::new());
-        unsafe {
-            let ptr = &mut win_ctx as *mut (u32, Vec<ShareTargetInfo>) as isize;
-            let _ = EnumWindows(Some(enum_windows_proc), LPARAM(ptr));
-        }
-        out.extend(win_ctx.1);
-    }
-    out
-}
-
-#[cfg(windows)]
-fn bitblt_rect_image(vx: i32, vy: i32, vw: i32, vh: i32) -> Option<DynamicImage> {
-    if vw <= 0 || vh <= 0 {
-        return None;
-    }
-    unsafe {
-        let hdc_screen = GetDC(None);
-        if hdc_screen.is_invalid() {
-            return None;
-        }
-        let hdc_mem = CreateCompatibleDC(hdc_screen);
-        let hbm = CreateCompatibleBitmap(hdc_screen, vw, vh);
-        let old = SelectObject(hdc_mem, hbm);
-
-        let blt_ok = BitBlt(hdc_mem, 0, 0, vw, vh, hdc_screen, vx, vy, SRCCOPY).is_ok();
-        let img = if blt_ok {
-            read_hbitmap_to_dynamic(hdc_mem, hbm, vw, vh)
-        } else {
-            None
-        };
-
-        SelectObject(hdc_mem, old);
-        let _ = DeleteObject(hbm);
-        let _ = DeleteDC(hdc_mem);
-        ReleaseDC(None, hdc_screen);
-        img
-    }
-}
-
-#[cfg(windows)]
-unsafe fn read_hbitmap_to_dynamic(hdc: HDC, hbm: windows::Win32::Graphics::Gdi::HBITMAP, w: i32, h: i32) -> Option<DynamicImage> {
-    if w <= 0 || h <= 0 {
-        return None;
-    }
-    let mut bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            biHeight: -h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bgra = vec![0u8; (w as usize) * (h as usize) * 4];
-    let lines = GetDIBits(
-        hdc,
-        hbm,
-        0,
-        h as u32,
-        Some(bgra.as_mut_ptr() as *mut _),
-        &mut bmi,
-        DIB_RGB_COLORS,
-    );
-    if lines == 0 {
-        return None;
-    }
-    for px in bgra.chunks_exact_mut(4) {
-        px.swap(0, 2);
-        px[3] = 255;
-    }
-    let rgba = RgbaImage::from_raw(w as u32, h as u32, bgra)?;
-    Some(DynamicImage::ImageRgba8(rgba))
-}
-
-#[cfg(windows)]
-fn is_image_mostly_blank(img: &DynamicImage) -> bool {
-    let rgb = img.to_rgb8();
-    let (w, h) = (rgb.width(), rgb.height());
-    if w < 8 || h < 8 {
-        return true;
-    }
-    let mut non_black = 0usize;
-    for sy in 1..9 {
-        for sx in 1..9 {
-            let x = (sx * w) / 10;
-            let y = (sy * h) / 10;
-            let p = rgb.get_pixel(x, y);
-            if p[0] > 3 || p[1] > 3 || p[2] > 3 {
-                non_black += 1;
-            }
-        }
-    }
-    non_black < 2
-}
-
-#[cfg(windows)]
-fn capture_hwnd_image(hwnd: HWND) -> Option<DynamicImage> {
-    unsafe {
-        if !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-            return None;
-        }
-        let mut full_r = RECT::default();
-        if GetWindowRect(hwnd, &mut full_r).is_err() {
-            return None;
-        }
-        let fw = full_r.right - full_r.left;
-        let fh = full_r.bottom - full_r.top;
-        if fw <= 0 || fh <= 0 {
-            return None;
-        }
-
-        let vis_r = get_window_visible_rect(hwnd).unwrap_or((full_r.left, full_r.top, fw, fh));
-
-        // 1. Try offscreen PrintWindow(PW_RENDERFULLCONTENT = 2) so even occluded Chrome/Canva captures cleanly
-        let hdc_screen = GetDC(None);
-        let mut captured: Option<DynamicImage> = None;
-        if !hdc_screen.is_invalid() {
-            let hdc_mem = CreateCompatibleDC(hdc_screen);
-            let hbm = CreateCompatibleBitmap(hdc_screen, fw, fh);
-            let old = SelectObject(hdc_mem, hbm);
-
-            // PW_RENDERFULLCONTENT = 2
-            let pw_ok = PrintWindow(hwnd, hdc_mem, PRINT_WINDOW_FLAGS(2)).as_bool();
-            if pw_ok {
-                if let Some(full_img) = read_hbitmap_to_dynamic(hdc_mem, hbm, fw, fh) {
-                    let crop_x = (vis_r.0 - full_r.left).max(0) as u32;
-                    let crop_y = (vis_r.1 - full_r.top).max(0) as u32;
-                    let crop_w = (vis_r.2.max(1) as u32).min(full_img.width().saturating_sub(crop_x));
-                    let crop_h = (vis_r.3.max(1) as u32).min(full_img.height().saturating_sub(crop_y));
-                    let cropped = if crop_w > 16 && crop_h > 16 {
-                        full_img.crop_imm(crop_x, crop_y, crop_w, crop_h)
-                    } else {
-                        full_img
-                    };
-                    if !is_image_mostly_blank(&cropped) {
-                        captured = Some(cropped);
-                    }
-                }
-            }
-
-            SelectObject(hdc_mem, old);
-            let _ = DeleteObject(hbm);
-            let _ = DeleteDC(hdc_mem);
-            ReleaseDC(None, hdc_screen);
-        }
-
-        // 2. Fallback to desktop region BitBlt over the visible window rectangle
-        if captured.is_none() {
-            captured = bitblt_rect_image(vis_r.0, vis_r.1, vis_r.2, vis_r.3);
-        }
-        captured
-    }
-}
-
-fn compute_luma_thumb(img: &DynamicImage) -> Vec<u8> {
-    let tiny = img
-        .resize_exact(LUMA_W, LUMA_H, image::imageops::FilterType::Triangle)
-        .to_luma8();
-    tiny.into_raw()
-}
-
-/// Returns fraction of pixels changed significantly (0.0..=1.0).
-fn luma_change_ratio(a: &[u8], b: &[u8]) -> f32 {
-    if a.len() != b.len() || a.is_empty() {
-        return 1.0;
-    }
-    let mut changed = 0usize;
-    let mut sum_diff = 0u64;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        let d = x.abs_diff(y);
-        sum_diff += d as u64;
-        if d > 11 {
-            changed += 1;
-        }
-    }
-    let pct = (changed as f32) / (a.len() as f32);
-    let mean = (sum_diff as f32) / (a.len() as f32) / 255.0;
-    pct.max(mean * 2.5)
-}
-
-fn resolve_cadence_timings(cadence: &str) -> (u64, u64) {
-    match cadence {
-        "active" => (1500, 10_000),
-        "quiet" => (u64::MAX, u64::MAX),
-        _ => (2800, 35_000), // balanced default
-    }
-}
-
-/// Computes whether live screen motion has settled and whether an AI watch check should trigger.
-fn update_settle_and_should_trigger(
-    cadence: &str,
-    prev_live_luma: &mut Option<Vec<u8>>,
-    last_watched_luma: Option<&[u8]>,
-    new_luma: &[u8],
-    last_change_ms: &mut u64,
-    pending_settle: &mut bool,
-    last_ai_check_ms: u64,
-    analyzing: bool,
-    busy_chatting: bool,
-    now_ms: u64,
-) -> bool {
-    if let Some(prev) = prev_live_luma.as_deref() {
-        if luma_change_ratio(prev, new_luma) >= 0.015 {
-            *last_change_ms = now_ms;
-            *pending_settle = true;
-        }
-    } else {
-        // First captured frame initiates the settle clock once
-        *last_change_ms = now_ms;
-        *pending_settle = true;
-    }
-    *prev_live_luma = Some(new_luma.to_vec());
-
-    let unseen_vs_watched = last_watched_luma
-        .map(|wl| luma_change_ratio(wl, new_luma) >= 0.020)
-        .unwrap_or(true);
-
-    let (settle_ms, cooldown_ms) = resolve_cadence_timings(cadence);
-    let settled = *pending_settle && now_ms.saturating_sub(*last_change_ms) >= settle_ms;
-    let cooled_down = last_ai_check_ms == 0 || now_ms.saturating_sub(last_ai_check_ms) >= cooldown_ms;
-
-    cadence != "quiet" && !analyzing && !busy_chatting && unseen_vs_watched && settled && cooled_down
 }
 
 impl ScreenShareManager {
@@ -821,7 +338,6 @@ impl ScreenShareManager {
         ai_ctrl: Arc<AiStreamController>,
         req: StartShareRequest,
     ) -> Result<ShareStatePayload, String> {
-        // Resolve requested target
         let targets = enumerate_share_targets();
         let (kind, hwnd, mon_idx, label) = if let Some(rest) = req.target_id.strip_prefix("window:") {
             let parsed_hwnd: isize = rest
@@ -913,7 +429,6 @@ impl ScreenShareManager {
         self.emit_state(&app, &sensor_state, "started");
         let snapshot = self.get_state(&sensor_state);
 
-        // Spawn dedicated session worker thread
         let mgr = Arc::clone(self);
         std::thread::spawn(move || {
             mgr.run_session_loop(gen, app, sensor_state, settings_mgr, ai_ctrl);
@@ -960,14 +475,7 @@ impl ScreenShareManager {
                 }
                 return Ok(None);
             } else {
-                let rect = if let Some(idx) = mon_idx {
-                    let mons = enumerate_monitors();
-                    mons.get(idx)
-                        .map(|m| m.rect)
-                        .unwrap_or_else(get_monitor_at_cursor)
-                } else {
-                    get_monitor_at_cursor()
-                };
+                let rect = resolve_monitor_rect(mon_idx);
                 if let Some(img) = bitblt_rect_image(rect.0, rect.1, rect.2, rect.3) {
                     let b64 = encode_dynamic_image_jpeg_base64(&img, max_dim, quality)?;
                     let luma = compute_luma_thumb(&img);
@@ -1157,14 +665,7 @@ impl ScreenShareManager {
                     self.set_border(BorderSpec::default());
                 }
             } else if show_border && !paused {
-                let rect = if let Some(idx) = mon_idx {
-                    let mons = enumerate_monitors();
-                    mons.get(idx)
-                        .map(|m| m.rect)
-                        .unwrap_or_else(get_monitor_at_cursor)
-                } else {
-                    get_monitor_at_cursor()
-                };
+                let rect = resolve_monitor_rect(mon_idx);
                 self.set_border(BorderSpec {
                     visible: true,
                     is_window_mode: false,
@@ -1339,330 +840,6 @@ impl ScreenShareManager {
     }
 }
 
-/// Renders one unified hollow-center feathered ARGB perimeter overlay (`WS_EX_LAYERED | WS_EX_TRANSPARENT`)
-/// excluded from screen capture (`WDA_EXCLUDEFROMCAPTURE`) with synchronous 140Hz target-window tracking.
-#[cfg(windows)]
-fn spawn_border_overlay_thread(desired: Arc<Mutex<BorderSpec>>) {
-    std::thread::spawn(move || unsafe {
-        let class_name: Vec<u16> = "BuddyShareBorderOverlay\0".encode_utf16().collect();
-        let hinst = GetModuleHandleW(None).unwrap_or_default();
-
-        unsafe extern "system" fn border_wndproc(
-            hwnd: HWND,
-            msg: u32,
-            wparam: WPARAM,
-            lparam: LPARAM,
-        ) -> LRESULT {
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(border_wndproc),
-            hInstance: hinst.into(),
-            lpszClassName: PCWSTR(class_name.as_ptr()),
-            ..Default::default()
-        };
-        let _ = RegisterClassW(&wc);
-
-        let mut overlay_hwnd: Option<HWND> = None;
-        let mut last_spec = BorderSpec::default();
-        let mut last_motion: Option<std::time::Instant> = None;
-        let mut msg = MSG::default();
-
-        loop {
-            while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
-
-            let mut cur = desired
-                .lock()
-                .ok()
-                .map(|g| g.clone())
-                .unwrap_or_default();
-
-            // Sample live target_hwnd rect directly on this GUI thread at up to 140Hz so the border stays locked to drags.
-            if cur.visible && cur.is_window_mode && cur.target_hwnd != 0 {
-                let th = HWND(cur.target_hwnd as *mut c_void);
-                if !IsWindow(th).as_bool() || IsIconic(th).as_bool() {
-                    cur.visible = false;
-                } else if let Some(vr) = get_window_visible_rect(th) {
-                    cur.rect = vr;
-                    cur.dimmed = GetForegroundWindow().0 != th.0;
-                }
-            }
-
-            if cur != last_spec {
-                if cur.rect != last_spec.rect {
-                    last_motion = Some(std::time::Instant::now());
-                }
-                apply_border_overlay(
-                    &mut overlay_hwnd,
-                    hinst.into(),
-                    &class_name,
-                    &last_spec,
-                    &cur,
-                );
-                last_spec = cur;
-            }
-
-            let moving = last_motion
-                .map(|m| m.elapsed() < Duration::from_millis(260))
-                .unwrap_or(false);
-            let sleep_ms = if moving {
-                7
-            } else if last_spec.visible {
-                24
-            } else {
-                45
-            };
-            std::thread::sleep(Duration::from_millis(sleep_ms));
-        }
-
-        #[allow(unreachable_code)]
-        if let Some(hwnd) = overlay_hwnd {
-            if !hwnd.0.is_null() {
-                let _ = DestroyWindow(hwnd);
-            }
-        }
-    });
-}
-
-#[cfg(windows)]
-unsafe fn ensure_border_overlay_hwnd(
-    slot: &mut Option<HWND>,
-    hinst: windows::Win32::Foundation::HINSTANCE,
-    class_name: &[u16],
-) -> Option<HWND> {
-    if let Some(h) = *slot {
-        if !h.0.is_null() && IsWindow(h).as_bool() {
-            return Some(h);
-        }
-    }
-    let ex = WS_EX_LAYERED
-        | WS_EX_TRANSPARENT
-        | WS_EX_TOOLWINDOW
-        | WS_EX_NOACTIVATE
-        | WS_EX_TOPMOST;
-    let Ok(hwnd) = CreateWindowExW(
-        ex,
-        PCWSTR(class_name.as_ptr()),
-        PCWSTR::null(),
-        WS_POPUP,
-        0,
-        0,
-        10,
-        10,
-        None,
-        None,
-        hinst,
-        None,
-    ) else {
-        return None;
-    };
-    set_hwnd_capture_excluded(hwnd, true);
-    *slot = Some(hwnd);
-    Some(hwnd)
-}
-
-#[cfg(windows)]
-unsafe fn apply_border_overlay(
-    hwnd_slot: &mut Option<HWND>,
-    hinst: windows::Win32::Foundation::HINSTANCE,
-    class_name: &[u16],
-    prev: &BorderSpec,
-    cur: &BorderSpec,
-) {
-    if !cur.visible || cur.rect.2 <= 0 || cur.rect.3 <= 0 {
-        if prev.visible {
-            if let Some(hwnd) = *hwnd_slot {
-                if !hwnd.0.is_null() {
-                    let _ = ShowWindow(hwnd, SW_HIDE);
-                }
-            }
-        }
-        return;
-    }
-
-    let Some(hwnd) = ensure_border_overlay_hwnd(hwnd_slot, hinst, class_name) else {
-        return;
-    };
-
-    let (x, y, w, h) = cur.rect;
-    let alpha_scale = if cur.dimmed { 0.42f32 } else { 1.0f32 };
-
-    let needs_redraw = !prev.visible
-        || prev.is_window_mode != cur.is_window_mode
-        || prev.dimmed != cur.dimmed
-        || prev.rect.2 != w
-        || prev.rect.3 != h;
-
-    if !needs_redraw && prev.visible {
-        // Synchronous translation on this overlay's owning GUI thread keeps drags locked with zero async drops.
-        let _ = SetWindowPos(
-            hwnd,
-            HWND_TOPMOST,
-            x,
-            y,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        return;
-    }
-
-    paint_hollow_border(hwnd, x, y, w.max(1), h.max(1), cur.is_window_mode, alpha_scale);
-    if !prev.visible {
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-    }
-    let _ = SetWindowPos(
-        hwnd,
-        HWND_TOPMOST,
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-    );
-}
-
-#[inline]
-fn compute_border_pixel(
-    px: i32,
-    py: i32,
-    w: i32,
-    h: i32,
-    thick: i32,
-    window_mode: bool,
-    alpha_scale: f32,
-) -> u32 {
-    let edge_px = px.min(w - 1 - px).min(py.min(h - 1 - py));
-    if edge_px < 0 || edge_px >= thick {
-        return 0;
-    }
-    let d_from_edge = edge_px as f32 / (thick.max(1) as f32);
-    let base_a = if window_mode {
-        if d_from_edge < 0.14 {
-            0.82
-        } else {
-            let t = (1.0 - (d_from_edge - 0.14) / 0.86).clamp(0.0, 1.0);
-            t.powf(1.35) * 0.62
-        }
-    } else if d_from_edge < 0.10 {
-        0.74
-    } else {
-        let t = (1.0 - (d_from_edge - 0.10) / 0.90).clamp(0.0, 1.0);
-        t.powf(1.30) * 0.60
-    };
-
-    let alpha = ((base_a * alpha_scale).clamp(0.0, 1.0) * 255.0).round() as u8;
-    let (r, g, b): (u8, u8, u8) = (6, 8, 12);
-    let pr = ((r as u16 * alpha as u16) / 255) as u32;
-    let pg = ((g as u16 * alpha as u16) / 255) as u32;
-    let pb = ((b as u16 * alpha as u16) / 255) as u32;
-    ((alpha as u32) << 24) | (pr << 16) | (pg << 8) | pb
-}
-
-#[cfg(windows)]
-unsafe fn paint_hollow_border(
-    hwnd: HWND,
-    wx: i32,
-    wy: i32,
-    w: i32,
-    h: i32,
-    window_mode: bool,
-    alpha_scale: f32,
-) {
-    let hdc_screen = GetDC(None);
-    let hdc_mem = CreateCompatibleDC(hdc_screen);
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: w,
-            biHeight: -h,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits_ptr: *mut c_void = std::ptr::null_mut();
-    let Ok(hbm) = CreateDIBSection(hdc_mem, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
-    else {
-        let _ = DeleteDC(hdc_mem);
-        ReleaseDC(None, hdc_screen);
-        return;
-    };
-
-    if !bits_ptr.is_null() {
-        let px_count = (w as usize) * (h as usize);
-        let slice = std::slice::from_raw_parts_mut(bits_ptr as *mut u32, px_count);
-        slice.fill(0);
-
-        let thick = if window_mode { 22 } else { 28 };
-        let stride = w as usize;
-        let top_end = thick.min(h);
-        let bot_start = (h - thick).max(top_end);
-        let left_end = thick.min(w);
-        let right_start = (w - thick).max(left_end);
-
-        for py in 0..top_end {
-            let row = (py as usize) * stride;
-            for px in 0..w {
-                slice[row + (px as usize)] =
-                    compute_border_pixel(px, py, w, h, thick, window_mode, alpha_scale);
-            }
-        }
-        for py in bot_start..h {
-            let row = (py as usize) * stride;
-            for px in 0..w {
-                slice[row + (px as usize)] =
-                    compute_border_pixel(px, py, w, h, thick, window_mode, alpha_scale);
-            }
-        }
-        for py in top_end..bot_start {
-            let row = (py as usize) * stride;
-            for px in 0..left_end {
-                slice[row + (px as usize)] =
-                    compute_border_pixel(px, py, w, h, thick, window_mode, alpha_scale);
-            }
-            for px in right_start..w {
-                slice[row + (px as usize)] =
-                    compute_border_pixel(px, py, w, h, thick, window_mode, alpha_scale);
-            }
-        }
-    }
-
-    let old = SelectObject(hdc_mem, hbm);
-    let pt_src = POINT { x: 0, y: 0 };
-    let pt_dst = POINT { x: wx, y: wy };
-    let size = SIZE { cx: w, cy: h };
-    let blend = BLENDFUNCTION {
-        BlendOp: AC_SRC_OVER as u8,
-        BlendFlags: 0,
-        SourceConstantAlpha: 255,
-        AlphaFormat: AC_SRC_ALPHA as u8,
-    };
-
-    let _ = UpdateLayeredWindow(
-        hwnd,
-        hdc_screen,
-        Some(&pt_dst),
-        Some(&size),
-        hdc_mem,
-        Some(&pt_src),
-        windows::Win32::Foundation::COLORREF(0),
-        Some(&blend),
-        ULW_ALPHA,
-    );
-
-    SelectObject(hdc_mem, old);
-    let _ = DeleteObject(hbm);
-    let _ = DeleteDC(hdc_mem);
-    ReleaseDC(None, hdc_screen);
-}
-
 /// Registers global Alt + Shift + P hotkey to toggle Screen Share privacy pause/resume.
 pub fn start_share_hotkey_listener(
     app: AppHandle,
@@ -1684,125 +861,4 @@ pub fn start_share_hotkey_listener(
         }
         let _ = UnregisterHotKey(None, HOTKEY_PAUSE_ID);
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn luma_diff_detects_static_vs_changed_frames() {
-        let a = vec![100u8; (LUMA_W * LUMA_H) as usize];
-        let b = vec![100u8; (LUMA_W * LUMA_H) as usize];
-        assert!(luma_change_ratio(&a, &b) < 0.001);
-
-        let mut c = a.clone();
-        for px in c.iter_mut().take(300) {
-            *px = 200;
-        }
-        assert!(luma_change_ratio(&a, &c) > 0.20);
-    }
-
-    #[test]
-    fn cadence_timings_match_modes() {
-        assert_eq!(resolve_cadence_timings("balanced"), (2800, 35_000));
-        assert_eq!(resolve_cadence_timings("active"), (1500, 10_000));
-        assert_eq!(resolve_cadence_timings("quiet").0, u64::MAX);
-    }
-
-    #[test]
-    fn settle_state_machine_fires_without_deadlocking() {
-        let frame_a = vec![90u8; (LUMA_W * LUMA_H) as usize];
-        let mut frame_b = frame_a.clone();
-        for px in frame_b.iter_mut().take(300) {
-            *px = 210;
-        }
-
-        let mut prev_live: Option<Vec<u8>> = None;
-        let mut last_chg = 0u64;
-        let mut pend = false;
-
-        // First captured frame initiates settle clock cleanly
-        assert!(!update_settle_and_should_trigger(
-            "active",
-            &mut prev_live,
-            None,
-            &frame_a,
-            &mut last_chg,
-            &mut pend,
-            0,
-            false,
-            false,
-            10_000,
-        ));
-        assert!(pend);
-        assert_eq!(last_chg, 10_000);
-
-        // Static frames advance past 1500ms settle and trigger!
-        assert!(update_settle_and_should_trigger(
-            "active",
-            &mut prev_live,
-            None,
-            &frame_a,
-            &mut last_chg,
-            &mut pend,
-            0,
-            false,
-            false,
-            12_000,
-        ));
-
-        // After first AI check watched frame_a, moving to frame_b starts new settle
-        assert!(!update_settle_and_should_trigger(
-            "active",
-            &mut prev_live,
-            Some(&frame_a),
-            &frame_b,
-            &mut last_chg,
-            &mut pend,
-            12_000,
-            false,
-            false,
-            23_000,
-        ));
-        assert_eq!(last_chg, 23_000);
-
-        // Holding steady on frame_b DOES NOT reset last_chg and triggers cleanly once settled!
-        assert!(update_settle_and_should_trigger(
-            "active",
-            &mut prev_live,
-            Some(&frame_a),
-            &frame_b,
-            &mut last_chg,
-            &mut pend,
-            12_000,
-            false,
-            false,
-            25_000,
-        ));
-    }
-
-    #[test]
-    fn hollow_border_covers_full_perimeter_and_corners_seamlessly() {
-        let (w, h, thick) = (400, 300, 22);
-        let alpha = |px: i32, py: i32| -> u8 {
-            (compute_border_pixel(px, py, w, h, thick, true, 1.0) >> 24) as u8
-        };
-
-        // Every single outer edge pixel (including corners and near-corner transitions) has equal full alpha
-        let corner_a = alpha(0, 0);
-        assert!(corner_a > 190);
-        for px in 0..w {
-            assert_eq!(alpha(px, 0), corner_a);
-            assert_eq!(alpha(px, h - 1), corner_a);
-        }
-        for py in 0..h {
-            assert_eq!(alpha(0, py), corner_a);
-            assert_eq!(alpha(w - 1, py), corner_a);
-        }
-
-        // Interior beyond `thick` stays completely transparent
-        assert_eq!(alpha(w / 2, h / 2), 0);
-        assert_eq!(alpha(thick, thick), 0);
-    }
 }
