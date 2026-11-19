@@ -41,6 +41,7 @@ interface SettingsTabProps {
   onTestInhale: () => void;
   onCheckUpdate: () => Promise<{ info: UpdateInfo | null; error?: string }>;
   onInstallUpdate: () => void;
+  onShowWhatsNew: () => void;
   onResetDock: () => void;
 }
 
@@ -59,6 +60,7 @@ export default function SettingsTab({
   onTestInhale,
   onCheckUpdate,
   onInstallUpdate,
+  onShowWhatsNew,
   onResetDock,
 }: SettingsTabProps) {
   const [section, setSection] = useState<SettingsSection>("model");
@@ -417,8 +419,17 @@ export default function SettingsTab({
             <div className="flex items-center justify-between gap-2">
               <div className="min-w-0">
                 <div className="text-[11.5px] font-medium text-white">{s.updatesTitle}</div>
-                <div className="text-[10px] text-white/45 font-mono">
-                  {s.currentVersion}: v{appVersion}
+                <div className="text-[10px] text-white/45 font-mono flex items-center gap-2">
+                  <span>
+                    {s.currentVersion}: v{appVersion}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onShowWhatsNew}
+                    className="font-sans text-white/65 hover:text-white underline underline-offset-2 transition"
+                  >
+                    {lang === "zh" ? "更新亮点" : "What's New"}
+                  </button>
                 </div>
               </div>
               {availableUpdate ? (

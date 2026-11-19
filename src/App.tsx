@@ -20,6 +20,11 @@ import {
   FloatingBubbleOverlay,
   type FloatingBubble,
 } from "./components/FloatingBubbleOverlay";
+import {
+  WhatsNewModal,
+  checkShouldShowWhatsNew,
+  markWhatsNewSeen,
+} from "./components/WhatsNewModal";
 import { useBuddyEvents } from "./hooks/useBuddyEvents";
 import { isSideDock, useBuddyMotion } from "./hooks/useBuddyMotion";
 const MemoryTab = lazy(() => import("./components/MemoryTab"));
@@ -116,6 +121,8 @@ export default function App() {
   const [dockEdge, setDockEdge] = useState<DockEdge>("top");
   const [snapPreview, setSnapPreview] = useState<DockEdge | null>(null);
   const [appVersion, setAppVersion] = useState<string>("0.1.0");
+  const [showWhatsNew, setShowWhatsNew] = useState(false);
+  const whatsNewCheckedRef = useRef(false);
   const [availableUpdate, setAvailableUpdate] = useState<UpdateInfo | null>(null);
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [pluginsData, setPluginsData] = useState<PluginListResponse>({
@@ -694,6 +701,32 @@ export default function App() {
       setIsWindowMaximized(false);
     }
   }, [buddyState, isWindowMode]);
+
+  // Option A: Show concise one-time What's New card on first expand after an upgrade
+  useEffect(() => {
+    if (whatsNewCheckedRef.current) return;
+    if (buddyState !== "expanded") return;
+    if (!appVersion || appVersion === "0.1.0") return;
+    whatsNewCheckedRef.current = true;
+    const hasPriorUsage =
+      conversations.some((c) => c.message_count > 0) ||
+      Boolean(settings.has_api_key) ||
+      (() => {
+        try {
+          return localStorage.getItem("buddy_active_tab") !== null;
+        } catch {
+          return false;
+        }
+      })();
+    if (checkShouldShowWhatsNew(appVersion, hasPriorUsage)) {
+      setShowWhatsNew(true);
+    }
+  }, [buddyState, appVersion, conversations, settings.has_api_key]);
+
+  const handleCloseWhatsNew = () => {
+    markWhatsNewSeen(appVersion);
+    setShowWhatsNew(false);
+  };
 
   const handleSelectChatModel = async (profileId: string) => {
     if (isThinking) return;
@@ -1282,10 +1315,19 @@ export default function App() {
               }}
               onCheckUpdate={handleCheckUpdate}
               onInstallUpdate={handleInstallUpdate}
+              onShowWhatsNew={() => setShowWhatsNew(true)}
               onResetDock={handleResetDock}
             />
           )}
         </Suspense>
+      )}
+      {showWhatsNew && (
+        <WhatsNewModal
+          version={appVersion}
+          lang={lang}
+          isWindowMode={isWindowMode}
+          onClose={handleCloseWhatsNew}
+        />
       )}
     </>
   );

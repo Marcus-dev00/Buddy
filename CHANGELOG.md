@@ -2,6 +2,12 @@
 
 All notable changes to **Buddy** are documented in this file.
 
+## [0.3.1] - 2026-11-20
+
+### Added
+- **One-Time Post-Update "What's New" Card**: After upgrading Buddy to a newer version, Buddy stays quietly collapsed in the Dynamic Island on startup and shows a clean, one-time frosted dark **What's New** highlights card the first time you expand it (never interrupting brand-new installs). Supports both Compact Dynamic Island mode and Full Window / Fullscreen mode, plus `Esc` quick dismissal.
+- **Anytime Release Notes Entry**: Added a **"What's New / 更新亮点"** button next to the version badge under **Settings → General → Updates** so you can revisit current release highlights anytime.
+
 ## [0.3.0] - 2026-11-20
 
 ### Added
